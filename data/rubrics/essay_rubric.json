@@ -1,0 +1,36 @@
+{
+  "id": "essay_default",
+  "name": "Academic Essay Rubric",
+  "criteria": [
+    {
+      "name": "Thesis & Argument",
+      "description": "Clear thesis statement, logical argument development, persuasive reasoning",
+      "max_score": 25,
+      "weight": 0.25
+    },
+    {
+      "name": "Evidence & Support",
+      "description": "Use of relevant evidence, proper citations, integration of sources",
+      "max_score": 25,
+      "weight": 0.25
+    },
+    {
+      "name": "Structure & Organization",
+      "description": "Logical flow, clear paragraphs, effective transitions, introduction and conclusion",
+      "max_score": 20,
+      "weight": 0.20
+    },
+    {
+      "name": "Critical Thinking",
+      "description": "Depth of analysis, consideration of counterarguments, original insights",
+      "max_score": 20,
+      "weight": 0.20
+    },
+    {
+      "name": "Language & Style",
+      "description": "Grammar, vocabulary, academic tone, clarity of expression",
+      "max_score": 10,
+      "weight": 0.10
+    }
+  ]
+}
