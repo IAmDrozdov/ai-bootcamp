@@ -7,16 +7,18 @@
 
 ## Содержание
 
-1. [Промпт-инжиниринг](#тема-1-промпт-инжиниринг) — как разговаривать с LLM
-2. [LangChain Core + LCEL](#тема-2-langchain-core--lcel) — как строить пайплайны
-3. [Structured Output](#тема-3-structured-output) — как получать типизированные данные
-4. [Streaming](#тема-4-streaming) — как отдавать ответ в реальном времени
-5. [RAG](#тема-5-rag-retrieval-augmented-generation) — как давать LLM контекст из документов
-6. [LangGraph + Agents](#тема-6-langgraph--agents) — как строить многошаговые агенты
-7. [Conversational AI](#тема-7-conversational-ai) — как вести диалог с памятью
-8. [Observability](#тема-8-observability) — как наблюдать за LLM в production
-9. [Evaluation](#тема-9-evaluation) — как измерять качество LLM
-10. [Production-паттерны](#тема-10-production-паттерны) — как оптимизировать и защищать
+| # | Тема | Урок |
+|---|------|------|
+| 1 | [Промпт-инжиниринг](#тема-1-промпт-инжиниринг) — как разговаривать с LLM | [Урок](lessons/topic_01_prompt_engineering.md) |
+| 2 | [LangChain Core + LCEL](#тема-2-langchain-core--lcel) — как строить пайплайны | [Урок](lessons/topic_02_langchain_lcel.md) |
+| 3 | [Structured Output](#тема-3-structured-output) — как получать типизированные данные | [Урок](lessons/topic_03_structured_output.md) |
+| 4 | [Streaming](#тема-4-streaming) — как отдавать ответ в реальном времени | [Урок](lessons/topic_04_streaming.md) |
+| 5 | [RAG](#тема-5-rag-retrieval-augmented-generation) — как давать LLM контекст из документов | [Урок](lessons/topic_05_rag.md) |
+| 6 | [LangGraph + Agents](#тема-6-langgraph--agents) — как строить многошаговые агенты | [Урок](lessons/topic_06_langgraph_agents.md) |
+| 7 | [Conversational AI](#тема-7-conversational-ai) — как вести диалог с памятью | [Урок](lessons/topic_07_conversational_ai.md) |
+| 8 | [Observability](#тема-8-observability) — как наблюдать за LLM в production | [Урок](lessons/topic_08_observability.md) |
+| 9 | [Evaluation](#тема-9-evaluation) — как измерять качество LLM | [Урок](lessons/topic_09_evaluation.md) |
+| 10 | [Production-паттерны](#тема-10-production-паттерны) — как оптимизировать и защищать | [Урок](lessons/topic_10_production_patterns.md) |
 
 ---
 
