@@ -19,6 +19,11 @@
 | 8 | [Observability](#тема-8-observability) — как наблюдать за LLM в production | [Урок](lessons/topic_08_observability.md) |
 | 9 | [Evaluation](#тема-9-evaluation) — как измерять качество LLM | [Урок](lessons/topic_09_evaluation.md) |
 | 10 | [Production-паттерны](#тема-10-production-паттерны) — как оптимизировать и защищать | [Урок](lessons/topic_10_production_patterns.md) |
+| 11 | [Tool Use / Function Calling](#тема-11-tool-use--function-calling) — как давать LLM инструменты | [Урок](lessons/topic_11_tool_use.md) |
+| 12 | [Multimodal AI](#тема-12-multimodal-ai) — как работать с изображениями и аудио | [Урок](lessons/topic_12_multimodal.md) |
+| 13 | [Advanced Agentic Patterns](#тема-13-advanced-agentic-patterns) — ReAct, reflection, plan-execute | [Урок](lessons/topic_13_agentic_patterns.md) |
+| 14 | [Multi-Agent Systems](#тема-14-multi-agent-systems) — как строить команды агентов | [Урок](lessons/topic_14_multi_agent.md) |
+| 15 | [MCP (Model Context Protocol)](#тема-15-mcp-model-context-protocol) — стандарт интеграции LLM с инструментами | [Урок](lessons/topic_15_mcp.md) |
 
 ---
 
@@ -273,6 +278,123 @@
 
 ---
 
+## Тема 11: Tool Use / Function Calling
+
+### Что изучить
+- `@tool` декоратор — глубокое погружение: args_schema, return_direct, error handling
+- `BaseTool` и `StructuredTool` — создание сложных инструментов с Pydantic-схемами
+- `bind_tools()` — как LLM получает JSON Schema инструментов
+- Параллельный вызов tools — LLM вызывает несколько tools за один ход
+- Tool error handling — `ToolException`, fallback_on_error, retry
+- API wrapper tools — обёртки над HTTP, базами данных, файлами
+- Динамический выбор tools — разные наборы tools для разных задач
+
+### Практические задания в проекте
+1. **Pydantic args.** Создать tool с `args_schema` — Pydantic-модель для валидации входных параметров.
+2. **Параллельные tools.** Настроить агент, который за один ход вызывает `count_words`, `check_structure` и `check_citations` параллельно.
+3. **Error handling.** Реализовать tool, который обращается к внешнему API. Обработать ошибки: timeout, невалидный ответ, rate limit.
+4. **Dynamic tools.** В зависимости от типа работы (эссе, код, математика) подключать разный набор tools.
+
+### Где в проекте
+- `app/api/v1/tools.py` — роутер
+- `app/tools/` — инструменты
+- `app/schemas/tools.py` — схемы
+
+---
+
+## Тема 12: Multimodal AI
+
+### Что изучить
+- Vision — отправка изображений в LLM (Claude, GPT-4V)
+- `HumanMessage` с `content=[{"type": "image", ...}]` — формат мультимодальных сообщений
+- Base64 vs URL — два способа передать изображение
+- Vision + Structured Output — извлечение типизированных данных из изображений
+- Multi-image input — несколько изображений в одном запросе
+- PDF analysis — извлечение текста и структуры из PDF
+- Ограничения vision — что LLM не может (мелкий текст, точный подсчёт, пространственные координаты)
+
+### Практические задания в проекте
+1. **OCR домашних работ.** Отправить скан рукописной работы → LLM извлекает текст.
+2. **Анализ диаграмм.** LLM описывает и оценивает схему/диаграмму из работы студента.
+3. **Multi-image.** Отправить 3 страницы работы → единая оценка.
+4. **Vision + Structured.** Извлечь из скана таблицу оценок в Pydantic-модель.
+
+### Где в проекте
+- `app/api/v1/multimodal.py` — роутер
+- `app/services/vision.py` — обработка изображений
+- `app/schemas/multimodal.py` — схемы
+
+---
+
+## Тема 13: Advanced Agentic Patterns
+
+### Что изучить
+- ReAct (Reasoning + Acting) — формальный паттерн: думай → действуй → наблюдай → повтори
+- Reflection / Self-correction — агент проверяет свой output и исправляет ошибки
+- Plan-and-Execute — агент сначала строит план, потом выполняет шаги
+- Map-Reduce — параллельная обработка + агрегация результатов
+- Реализация каждого паттерна в LangGraph
+- Когда какой паттерн выбрать
+
+### Практические задания в проекте
+1. **ReAct.** Полноценный ReAct агент: рассуждение → вызов tools → анализ результата → повтор или ответ.
+2. **Reflection.** Агент оценивает работу, затем critic-нода проверяет оценку и при необходимости отправляет на переоценку.
+3. **Plan-Execute.** Агент получает сложное задание (оценить портфолио из 5 работ), строит план, выполняет пошагово.
+4. **Map-Reduce.** Параллельная оценка работы по 5 критериям → агрегация в итоговый результат.
+
+### Где в проекте
+- `app/graph/patterns/` — реализации паттернов
+- `app/api/v1/patterns.py` — роутер
+
+---
+
+## Тема 14: Multi-Agent Systems
+
+### Что изучить
+- Зачем мульти-агенты — декомпозиция сложных задач, специализация
+- Архитектуры: supervisor, hierarchical, peer-to-peer, swarm
+- LangGraph multi-agent — subgraphs, message passing между графами
+- Agent handoff — передача задачи между агентами
+- Shared vs isolated state — общее и изолированное состояние
+- Координация и коммуникация между агентами
+
+### Практические задания в проекте
+1. **Supervisor.** Supervisor-агент распределяет задачи между analyzer, scorer и reviewer.
+2. **Subgraphs.** Каждый агент — отдельный StateGraph, объединённый в мета-граф.
+3. **Handoff.** Analyzer передаёт работу Scorer'у, тот — Reviewer'у, с возможностью возврата.
+4. **Специализация.** Разные агенты для разных типов работ: EssayAgent, CodeAgent, MathAgent.
+
+### Где в проекте
+- `app/graph/agents/` — отдельные агенты
+- `app/graph/multi_agent.py` — координатор
+- `app/api/v1/multi_agent.py` — роутер
+
+---
+
+## Тема 15: MCP (Model Context Protocol)
+
+### Что изучить
+- Что такое MCP — открытый протокол Anthropic для подключения LLM к инструментам и данным
+- Архитектура: host, client, server — кто за что отвечает
+- Три примитива: tools, resources, prompts — что каждый даёт
+- Написание MCP-сервера на Python (библиотека `mcp`)
+- MCP-клиент — подключение к серверу
+- Интеграция MCP + LangChain / LangGraph
+- MCP в production — транспорт (stdio, SSE), безопасность, масштабирование
+
+### Практические задания в проекте
+1. **MCP-сервер рубрик.** Написать MCP-сервер, отдающий рубрики как resources и tools для CRUD.
+2. **MCP-сервер оценок.** Сервер с tools: assess_work, get_history, compare_assessments.
+3. **MCP-клиент.** Подключить LangChain к MCP-серверу через MCP Adapters.
+4. **Комбинация.** Агент, который использует несколько MCP-серверов: рубрики + оценки + RAG.
+
+### Где в проекте
+- `mcp_servers/` — MCP серверы
+- `app/services/mcp_client.py` — клиент
+- `app/api/v1/mcp_endpoints.py` — роутер
+
+---
+
 ## Порядок прохождения
 
 ```
@@ -280,11 +402,18 @@
                                   ↓
                               Тема 5     (Фаза 2: RAG)
                                   ↓
-                          Тема 6 → Тема 7   (Фазы 3-4: агенты и диалоги)
+                          Тема 6 → Тема 7   (Фаза 3: агенты и диалоги)
                                        ↓
-                              Тема 8 → Тема 9 → Тема 10   (Фазы 4-5: production)
+                          Тема 8 → Тема 9 → Тема 10   (Фаза 4: production)
+                                                  ↓
+                          Тема 11 → Тема 12        (Фаза 5: tools и мультимодальность)
+                                       ↓
+                          Тема 13 → Тема 14        (Фаза 6: продвинутые агенты)
+                                       ↓
+                                  Тема 15          (Фаза 7: стандарты интеграции)
 ```
 
 Темы 1-4 проходятся последовательно — каждая опирается на предыдущую.
 Дальше можно параллелить: RAG (5) не зависит от agents (6).
 Observability (8) стоит подключить как можно раньше — трейсинг помогает учиться.
+Темы 11-15 — продвинутый блок: tool use (11) и multimodal (12) независимы друг от друга, но оба нужны для agentic patterns (13) и multi-agent (14). MCP (15) — финальная тема, объединяющая всё.

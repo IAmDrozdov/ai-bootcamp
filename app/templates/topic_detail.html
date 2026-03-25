@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} — AI Bootcamp{% endblock %}
+
+{% block content %}
+<article class="lesson-content">
+    {{ content | safe }}
+</article>
+<div class="lesson-nav">
+    {% if prev_slug %}
+    <a href="/lessons/{{ prev_slug }}" class="nav-link prev">← Предыдущий</a>
+    {% else %}
+    <span></span>
+    {% endif %}
+    <a href="/" class="nav-link home">Все уроки</a>
+    {% if next_slug %}
+    <a href="/lessons/{{ next_slug }}" class="nav-link next">Следующий →</a>
+    {% else %}
+    <span></span>
+    {% endif %}
+</div>
+{% endblock %}
