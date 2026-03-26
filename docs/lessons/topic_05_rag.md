@@ -1207,5 +1207,6 @@ embeddings = HuggingFaceEmbeddings(
 - [Chunking Strategies](https://www.pinecone.io/learn/chunking-strategies/) — обзор подходов к нарезке
 - Paper: *"Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"* (Lewis et al., 2020) — оригинальная статья RAG
 - [OpenAI Embeddings Guide](https://platform.openai.com/docs/guides/embeddings) — гайд по embedding-моделям
+- **[Тема 19: Vector Databases](topic_19_vector_databases.md)** — глубокое сравнение vector DB: ChromaDB, pgvector, Pinecone, Qdrant, Weaviate. Hybrid search, benchmarking, выбор для production. Здесь мы использовали только Chroma — тема 19 покажет альтернативы.
 
 **Следующая тема:** [Тема 6: LangGraph + Agents](topic_06_langgraph_agents.md) — многошаговые графы и агенты.

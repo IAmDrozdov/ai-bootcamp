@@ -9,3 +9,5 @@ dist/
 build/
 data/uploads/
 .ruff_cache/
+docs/ai-bootcamp-book.pdf
+docs/_book.html

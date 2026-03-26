@@ -24,6 +24,12 @@
 | 13 | [Advanced Agentic Patterns](#тема-13-advanced-agentic-patterns) — ReAct, reflection, plan-execute | [Урок](lessons/topic_13_agentic_patterns.md) |
 | 14 | [Multi-Agent Systems](#тема-14-multi-agent-systems) — как строить команды агентов | [Урок](lessons/topic_14_multi_agent.md) |
 | 15 | [MCP (Model Context Protocol)](#тема-15-mcp-model-context-protocol) — стандарт интеграции LLM с инструментами | [Урок](lessons/topic_15_mcp.md) |
+| | **Инструменты** | |
+| 16 | [Langfuse Deep Dive](#тема-16-langfuse-deep-dive) — prompt management, datasets, experiments | [Урок](lessons/topic_16_langfuse.md) |
+| 17 | [LangSmith](#тема-17-langsmith) — Hub, трейсинг, evaluation, мониторинг | [Урок](lessons/topic_17_langsmith.md) |
+| 18 | [Ollama и локальные LLM](#тема-18-ollama-и-локальные-llm) — локальный запуск, квантизация | [Урок](lessons/topic_18_local_llms.md) |
+| 19 | [Vector Databases](#тема-19-vector-databases--сравнение-и-выбор) — Chroma, pgvector, Pinecone, Qdrant | [Урок](lessons/topic_19_vector_databases.md) |
+| 20 | [Deployment](#тема-20-deployment--деплой-llm-приложений) — Docker, LangServe, масштабирование | [Урок](lessons/topic_20_deployment.md) |
 
 ---
 
@@ -395,25 +401,156 @@
 
 ---
 
+## Тема 16: Langfuse Deep Dive
+
+### Что изучить
+- Langfuse как платформа: трейсинг, prompt management, evaluation, datasets
+- Traces, spans, generations — модель данных Langfuse
+- Prompt management — версионирование промптов, A/B деплой, rollback
+- Datasets и experiments — создание тестовых наборов, запуск экспериментов
+- Scores — ручная и автоматическая оценка quality, пользовательский фидбек
+- Annotation queues — workflow для ручной разметки
+- Cost tracking и dashboards — мониторинг расходов
+- Self-hosted vs Cloud — варианты деплоя
+
+### Практические задания в проекте
+1. **Prompt versioning.** Перенести assessment prompt в Langfuse, создать 3 версии, переключать через API.
+2. **Dataset + Experiment.** Создать dataset из 10 эссе, прогнать эксперимент с двумя промптами, сравнить scores.
+3. **Online evaluation.** Настроить автоматическую LLM-as-judge оценку каждого trace.
+4. **Dashboard.** Построить view: стоимость по модели, latency percentiles, quality scores по времени.
+
+### Где в проекте
+- `app/services/langfuse_service.py` — расширенная интеграция
+- `app/api/v1/langfuse.py` — роутер
+
+---
+
+## Тема 17: LangSmith
+
+### Что изучить
+- LangSmith как платформа LangChain: трейсинг, Hub, evaluation, monitoring
+- LangSmith трейсинг — автоматический через environment variable
+- LangChain Hub — публикация и загрузка промптов
+- Datasets — создание, загрузка, версионирование тестовых данных
+- Evaluation — `evaluate()`, custom evaluators, comparison experiments
+- Annotation queues — ручная разметка и фидбек
+- Online evaluation — мониторинг production traces
+- LangSmith vs Langfuse — сравнение, когда что выбрать
+
+### Практические задания в проекте
+1. **Трейсинг.** Подключить LangSmith, увидеть traces всех chain-вызовов.
+2. **Hub prompt.** Опубликовать assessment prompt в Hub, загружать оттуда в runtime.
+3. **Evaluation.** Создать dataset, написать custom evaluator, запустить evaluation run.
+4. **Comparison.** Сравнить два промпта на одном dataset, визуализировать разницу.
+
+### Где в проекте
+- `app/services/langsmith_service.py` — интеграция
+- `app/api/v1/langsmith.py` — роутер
+
+---
+
+## Тема 18: Ollama и локальные LLM
+
+### Что изучить
+- Зачем локальные модели — приватность, стоимость, офлайн, скорость итераций
+- Ollama — установка, запуск, управление моделями
+- Модели: Llama 3, Mistral, Gemma, Qwen, CodeLlama — когда какую выбрать
+- Квантизация — Q4, Q8, GGUF — баланс качество/память/скорость
+- Интеграция с LangChain — `ChatOllama`, `OllamaEmbeddings`
+- vLLM — high-performance inference server для production
+- Локальные embeddings — sentence-transformers, nomic-embed
+- Гибридная стратегия — локальная модель для dev/простых задач, облачная для production
+
+### Практические задания в проекте
+1. **Ollama setup.** Установить Ollama, скачать Llama 3.1, интегрировать через `ChatOllama`.
+2. **Сравнение.** Прогнать assessment на Claude Sonnet, Llama 3.1, Mistral — сравнить качество, скорость, стоимость.
+3. **Локальные embeddings.** Заменить OpenAI embeddings на `nomic-embed-text` через Ollama для RAG.
+4. **Fallback.** Облачная модель по умолчанию, локальная как fallback при недоступности API.
+
+### Где в проекте
+- `app/services/local_llm.py` — интеграция с Ollama
+- `app/api/v1/local.py` — роутер
+
+---
+
+## Тема 19: Vector Databases — сравнение и выбор
+
+### Что изучить
+- Зачем vector DB — от in-memory поиска к production-ready хранилищу
+- ChromaDB — embedded, простой, для прототипов и dev
+- pgvector — PostgreSQL extension, если уже есть Postgres
+- Pinecone — managed cloud, автоматическое масштабирование
+- Qdrant — open-source, rich filtering, hybrid search
+- Weaviate — GraphQL API, модульная архитектура
+- Сравнение: performance, filtering, scaling, стоимость, operational complexity
+- Hybrid search — keyword + semantic, BM25 + embeddings
+- Metadata filtering — фильтрация до и после semantic search
+
+### Практические задания в проекте
+1. **Benchmark.** Проиндексировать 1000 чанков в Chroma, pgvector, Qdrant — сравнить latency, recall.
+2. **pgvector.** Перенести RAG из Chroma на pgvector (Docker + asyncpg).
+3. **Hybrid search.** Реализовать гибридный поиск: BM25 keyword + embedding similarity.
+4. **Metadata filtering.** Добавить фильтрацию по предмету, году, типу работы.
+
+### Где в проекте
+- `app/services/vector_stores/` — реализации для разных DB
+- `app/api/v1/vector.py` — роутер
+
+---
+
+## Тема 20: Deployment — деплой LLM-приложений
+
+### Что изучить
+- Docker — контейнеризация FastAPI + LLM app
+- Docker Compose — оркестрация: app + vector DB + Redis + Langfuse
+- Environment management — secrets, config, модели для разных env
+- LangServe — деплой LangChain chains как REST API (альтернатива ручному FastAPI)
+- Scaling — горизонтальное масштабирование stateless LLM-сервисов
+- Health checks — проверка доступности LLM, vector DB, кэша
+- CI/CD для промптов — тестирование промптов перед деплоем
+- Monitoring в production — метрики, алерты, логирование
+
+### Практические задания в проекте
+1. **Dockerfile.** Написать multi-stage Dockerfile для assessment API.
+2. **Docker Compose.** Собрать полный стек: FastAPI + ChromaDB + Redis + Langfuse.
+3. **LangServe.** Развернуть assessment chain через LangServe с playground UI.
+4. **Health checks.** Endpoint `/health` проверяет: LLM API доступен, vector DB отвечает, кэш работает.
+
+### Где в проекте
+- `Dockerfile`, `docker-compose.yml` — контейнеризация
+- `app/api/v1/health.py` — health checks
+- `langserve_app.py` — LangServe вариант
+
+---
+
 ## Порядок прохождения
 
 ```
-Тема 1 → Тема 2 → Тема 3 → Тема 4     (Фаза 1: основы LangChain)
+Тема 1 → Тема 2 → Тема 3 → Тема 4      (Фаза 1: основы LangChain)
                                   ↓
-                              Тема 5     (Фаза 2: RAG)
+                              Тема 5      (Фаза 2: RAG)
                                   ↓
-                          Тема 6 → Тема 7   (Фаза 3: агенты и диалоги)
+                          Тема 6 → Тема 7    (Фаза 3: агенты и диалоги)
                                        ↓
-                          Тема 8 → Тема 9 → Тема 10   (Фаза 4: production)
+                          Тема 8 → Тема 9 → Тема 10    (Фаза 4: production)
                                                   ↓
-                          Тема 11 → Тема 12        (Фаза 5: tools и мультимодальность)
+                          Тема 11 → Тема 12       (Фаза 5: tools и мультимодальность)
                                        ↓
-                          Тема 13 → Тема 14        (Фаза 6: продвинутые агенты)
+                          Тема 13 → Тема 14       (Фаза 6: продвинутые агенты)
                                        ↓
-                                  Тема 15          (Фаза 7: стандарты интеграции)
+                                  Тема 15         (Фаза 7: стандарты интеграции)
+
+              ─── Инструменты (можно проходить параллельно с основными темами) ───
+
+              Тема 16 (Langfuse)     — после темы 8
+              Тема 17 (LangSmith)    — после темы 8
+              Тема 18 (Ollama)       — после темы 2
+              Тема 19 (Vector DBs)   — после темы 5
+              Тема 20 (Deployment)   — после темы 10
 ```
 
 Темы 1-4 проходятся последовательно — каждая опирается на предыдущую.
 Дальше можно параллелить: RAG (5) не зависит от agents (6).
 Observability (8) стоит подключить как можно раньше — трейсинг помогает учиться.
 Темы 11-15 — продвинутый блок: tool use (11) и multimodal (12) независимы друг от друга, но оба нужны для agentic patterns (13) и multi-agent (14). MCP (15) — финальная тема, объединяющая всё.
+Темы 16-20 — инструменты. Их можно проходить параллельно с основным курсом: Langfuse/LangSmith подключай сразу после observability (8), Ollama — как только освоишь LCEL (2), Vector DBs — после RAG (5), Deployment — после production-паттернов (10).

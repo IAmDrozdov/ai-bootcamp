@@ -990,5 +990,7 @@ PROD: LANGFUSE_PUBLIC_KEY=pk-lf-prod-...   (project: assessment-prod)
 - [Langfuse Scores](https://langfuse.com/docs/scores/overview) — автоматические и пользовательские оценки
 - [LangSmith](https://docs.smith.langchain.com/) — альтернатива от LangChain (SaaS)
 - [LangChain Callbacks](https://python.langchain.com/docs/concepts/callbacks/) — система callbacks в LangChain
+- **[Тема 16: Langfuse Deep Dive](topic_16_langfuse.md)** — глубокое погружение: prompt management, datasets, experiments, scores, annotation queues, cost analytics. Эта тема раскрывает Langfuse как полноценную платформу — здесь мы рассмотрели только трейсинг.
+- **[Тема 17: LangSmith](topic_17_langsmith.md)** — альтернативная платформа: Hub, evaluation, datasets, мониторинг. Сравнение с Langfuse.
 
 **Следующая тема:** [Тема 9: Evaluation](topic_09_evaluation.md) — как измерять качество LLM.
