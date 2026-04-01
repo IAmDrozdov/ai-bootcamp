@@ -1,7 +1,6 @@
 # Тема 13: Advanced Agentic Patterns — паттерны проектирования агентов
 
 > **Пререквизиты:** [Тема 6 (LangGraph)](topic_06_langgraph_agents.md), [Тема 11 (Tool Use)](topic_11_tool_use.md)
-> **Что добавляем в проект:** `app/api/v1/patterns.py`, `app/graph/patterns/react_agent.py`, `app/graph/patterns/reflection.py`, `app/graph/patterns/plan_execute.py`, `app/graph/patterns/map_reduce.py`, `app/schemas/patterns.py`
 > **Зависимости:** `langgraph`, `langchain-core`, `langchain-anthropic`
 
 ---
@@ -651,110 +650,22 @@ graph.add_node("tools", tool_node)
 
 ---
 
-## Практика: роутер `/api/v1/patterns`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/patterns.py`
+### Пример 1. ReAct — reasoning + acting в цикле
 
-Определяем Pydantic-модели для запросов и ответов всех четырёх паттернов.
-
-```python
-from pydantic import BaseModel, Field
-
-
-class ReactAssessmentRequest(BaseModel):
-    student_work: str
-    rubric_criteria: list[str] = Field(
-        default=["content", "structure", "argumentation"],
-        description="Criteria names for assessment",
-    )
-    max_iterations: int = Field(default=10, ge=1, le=30)
-
-
-class ReflectionAssessmentRequest(BaseModel):
-    student_work: str
-    rubric_criteria: list[str] = Field(
-        default=["content", "structure", "argumentation"],
-    )
-    max_revisions: int = Field(default=3, ge=1, le=5)
-
-
-class PlanExecuteRequest(BaseModel):
-    student_works: list[str] = Field(
-        min_length=1,
-        max_length=10,
-        description="List of student works to assess as a portfolio",
-    )
-    objective: str = Field(
-        default="Assess the portfolio and provide a comprehensive recommendation",
-    )
-
-
-class MapReduceRequest(BaseModel):
-    student_work: str
-    criteria: list[dict] = Field(
-        default=[
-            {"name": "content", "description": "Depth and accuracy of content", "max_score": 25},
-            {"name": "structure", "description": "Organization and logical flow", "max_score": 25},
-            {"name": "argumentation", "description": "Quality of arguments and evidence", "max_score": 25},
-            {"name": "language", "description": "Grammar, style, and clarity", "max_score": 25},
-        ],
-    )
-
-
-class ToolCallRecord(BaseModel):
-    tool_name: str
-    tool_input: dict
-    tool_output: str
-
-
-class ReactAssessmentResponse(BaseModel):
-    assessment: str
-    tool_calls: list[ToolCallRecord]
-    iterations: int
-
-
-class ReflectionAssessmentResponse(BaseModel):
-    final_assessment: str
-    revision_count: int
-    feedback_history: list[str]
-
-
-class PlanExecuteResponse(BaseModel):
-    plan: list[str]
-    step_results: list[dict]
-    final_result: str
-
-
-class CriterionResult(BaseModel):
-    criterion_name: str
-    score: int
-    max_score: int
-    feedback: str
-
-
-class MapReduceResponse(BaseModel):
-    criterion_results: list[CriterionResult]
-    overall_score: int
-    max_overall_score: int
-    summary: str
-```
-
-Обрати внимание на разделение: каждый паттерн получает свои Request/Response модели. Это позволяет точно контролировать входные параметры (например, `max_iterations` для ReAct, `max_revisions` для Reflection) и формат результата (tool_calls для ReAct, feedback_history для Reflection).
-
-### Шаг 2. ReAct agent — `app/graph/patterns/react_agent.py`
-
-Полная реализация ReAct-агента для assessment с кастомными tools.
+Агент получает студенческую работу и решает, какие tools вызвать для сбора аналитики. После каждого tool-вызова он анализирует результат и решает — нужно ещё данных или пора выставлять оценку.
 
 ```python
+import re
+from typing import Annotated, TypedDict
+
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from typing import Annotated, TypedDict
-
-from app.config import get_settings
 
 
 @tool
@@ -764,198 +675,104 @@ def count_words(text: str) -> int:
 
 
 @tool
-def count_paragraphs(text: str) -> int:
-    """Count the number of paragraphs in the text."""
-    return len([p for p in text.split("\n\n") if p.strip()])
-
-
-@tool
 def check_citations(text: str) -> dict:
-    """Check for citation patterns in the text. Returns count and examples."""
-    import re
-    patterns = [
-        r'\([A-Z][a-z]+,?\s*\d{4}\)',
-        r'\[[0-9]+\]',
-        r'according to [A-Z][a-z]+',
-    ]
+    """Check for citation patterns in the text."""
+    patterns = [r'\([A-Z][a-z]+,?\s*\d{4}\)', r'\[[0-9]+\]']
     citations = []
-    for pattern in patterns:
-        citations.extend(re.findall(pattern, text))
-    return {
-        "citation_count": len(citations),
-        "examples": citations[:5],
-        "has_citations": len(citations) > 0,
-    }
+    for p in patterns:
+        citations.extend(re.findall(p, text))
+    return {"citation_count": len(citations), "examples": citations[:5]}
 
 
 @tool
 def analyze_vocabulary(text: str) -> dict:
-    """Analyze vocabulary complexity of the text."""
+    """Analyze vocabulary complexity."""
     words = text.lower().split()
-    unique_words = set(words)
-    avg_word_length = sum(len(w) for w in words) / max(len(words), 1)
-    long_words = [w for w in unique_words if len(w) > 8]
+    unique = set(words)
     return {
         "total_words": len(words),
-        "unique_words": len(unique_words),
-        "vocabulary_richness": round(len(unique_words) / max(len(words), 1), 3),
-        "avg_word_length": round(avg_word_length, 2),
-        "complex_words_sample": sorted(long_words)[:10],
+        "unique_words": len(unique),
+        "vocabulary_richness": round(len(unique) / max(len(words), 1), 3),
     }
 
 
-@tool
-def detect_structure_elements(text: str) -> dict:
-    """Detect structural elements: introduction, body, conclusion, transitions."""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    transition_words = [
-        "however", "moreover", "furthermore", "in addition",
-        "consequently", "therefore", "nevertheless", "in conclusion",
-        "firstly", "secondly", "finally", "on the other hand",
-    ]
-    transitions_found = []
-    for word in transition_words:
-        if word in text.lower():
-            transitions_found.append(word)
-    return {
-        "paragraph_count": len(paragraphs),
-        "has_introduction": len(paragraphs) > 0 and len(paragraphs[0].split()) > 15,
-        "has_conclusion": len(paragraphs) > 1 and any(
-            kw in paragraphs[-1].lower()
-            for kw in ["in conclusion", "to summarize", "overall", "in summary"]
-        ),
-        "transitions_found": transitions_found,
-        "transition_count": len(transitions_found),
-    }
+TOOLS = [count_words, check_citations, analyze_vocabulary]
 
 
-ASSESSMENT_TOOLS = [
-    count_words,
-    count_paragraphs,
-    check_citations,
-    analyze_vocabulary,
-    detect_structure_elements,
-]
-
-
-class ReactAssessmentState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
+class ReactState(TypedDict):
+    messages: Annotated[list, add_messages]
     iteration_count: int
 
 
-def build_react_assessment_graph(criteria: list[str]) -> StateGraph:
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        api_key=settings.anthropic_api_key,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-    ).bind_tools(ASSESSMENT_TOOLS)
-
-    async def agent_node(state: ReactAssessmentState) -> dict:
-        response = await llm.ainvoke(state["messages"])
-        return {
-            "messages": [response],
-            "iteration_count": state.get("iteration_count", 0) + 1,
-        }
-
-    def should_continue(state: ReactAssessmentState) -> str:
-        last_message = state["messages"][-1]
-        if isinstance(last_message, AIMessage) and last_message.tool_calls:
-            return "tools"
-        return "end"
-
-    tool_node = ToolNode(ASSESSMENT_TOOLS)
-
-    graph = StateGraph(ReactAssessmentState)
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", tool_node)
-
-    graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", should_continue, {
-        "tools": "tools",
-        "end": END,
-    })
-    graph.add_edge("tools", "agent")
-
-    return graph
+llm = ChatAnthropic(model="claude-sonnet-4-20250514").bind_tools(TOOLS)
 
 
-async def run_react_assessment(
-    student_work: str,
-    criteria: list[str],
-    max_iterations: int = 10,
-) -> dict:
-    graph = build_react_assessment_graph(criteria)
-    app = graph.compile()
-
-    criteria_text = ", ".join(criteria)
-    system_prompt = (
-        "You are an expert academic assessor. You have access to analysis tools. "
-        "Use them to gather data about the student work before making your assessment. "
-        f"Assess the work on these criteria: {criteria_text}. "
-        "For each criterion, provide a score (0-25) and specific feedback. "
-        "Always use at least 2 tools before giving your final assessment."
-    )
-
-    result = await app.ainvoke(
-        {
-            "messages": [
-                ("system", system_prompt),
-                ("human", f"Please assess this student work:\n\n{student_work}"),
-            ],
-            "iteration_count": 0,
-        },
-        config={"recursion_limit": max_iterations * 2 + 5},
-    )
-
-    tool_calls_log = []
-    iterations = 0
-    for msg in result["messages"]:
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            iterations += 1
-            for tc in msg.tool_calls:
-                tool_calls_log.append({
-                    "tool_name": tc["name"],
-                    "tool_input": tc["args"],
-                })
-        if isinstance(msg, ToolMessage):
-            for entry in tool_calls_log:
-                if not entry.get("tool_output"):
-                    entry["tool_output"] = msg.content
-                    break
-
-    final_message = result["messages"][-1]
-    assessment_text = final_message.content if isinstance(final_message, AIMessage) else str(final_message)
-
+async def agent_node(state: ReactState) -> dict:
+    response = await llm.ainvoke(state["messages"])
     return {
-        "assessment": assessment_text,
-        "tool_calls": tool_calls_log,
-        "iterations": iterations,
+        "messages": [response],
+        "iteration_count": state.get("iteration_count", 0) + 1,
     }
+
+
+def should_continue(state: ReactState) -> str:
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "tools"
+    return "end"
+
+
+graph = StateGraph(ReactState)
+graph.add_node("agent", agent_node)
+graph.add_node("tools", ToolNode(TOOLS))
+graph.add_edge(START, "agent")
+graph.add_conditional_edges("agent", should_continue, {"tools": "tools", "end": END})
+graph.add_edge("tools", "agent")
+
+react_app = graph.compile()
+
+student_work = (
+    "The impact of climate change on biodiversity is a critical topic in modern ecology. "
+    "Rising temperatures have led to shifts in species distribution patterns globally. "
+    "However, some argue that natural adaptation can mitigate these effects. "
+    "Studies by Smith (2020) and Johnson (2021) demonstrate significant coral reef degradation."
+)
+
+result = await react_app.ainvoke(
+    {
+        "messages": [
+            ("system",
+             "You are an academic assessor. Use tools to gather data about the work, "
+             "then provide a score (0-100) and detailed feedback."),
+            ("human", f"Assess this student work:\n\n{student_work}"),
+        ],
+        "iteration_count": 0,
+    },
+    config={"recursion_limit": 25},
+)
+
+for msg in result["messages"]:
+    if isinstance(msg, AIMessage) and msg.tool_calls:
+        for tc in msg.tool_calls:
+            print(f"Tool call: {tc['name']}")
+    elif isinstance(msg, ToolMessage):
+        print(f"  → {msg.content[:120]}")
+
+print(f"\nIterations: {result['iteration_count']}")
+print(f"\nAssessment:\n{result['messages'][-1].content[:500]}")
 ```
 
-Разберём ключевые решения:
+Граф содержит два узла: `agent` (вызов LLM) и `tools` (выполнение tool calls). Conditional edge `should_continue` проверяет наличие `tool_calls` в ответе LLM — если есть, цикл продолжается. `recursion_limit=25` ограничивает максимальное количество шагов графа (~12 итераций ReAct-цикла).
 
-**Tools.** Пять tools покрывают разные аспекты анализа текста. Каждый tool имеет docstring — это обязательно, LLM использует описание для решения, какой tool вызвать. Без docstring модель будет вызывать tools случайным образом.
+### Пример 2. Reflection — генерация и самопроверка
 
-**`bind_tools`.** Мы привязываем tools к LLM через `bind_tools()`, а не через `create_react_agent`. Это даёт больше контроля над графом — мы можем добавить кастомную логику в `agent_node` и `should_continue`.
-
-**`should_continue`.** Conditional edge проверяет последнее сообщение: если LLM вернул tool_calls — переходим к `tools`, иначе — к END. Это и есть ядро ReAct-цикла.
-
-**`recursion_limit`.** Устанавливается как `max_iterations * 2 + 5` — каждая итерация ReAct занимает 2 шага (agent + tools), плюс запас.
-
-### Шаг 3. Reflection — `app/graph/patterns/reflection.py`
-
-Реализация цикла генерации и самопроверки для повышения качества оценки.
+Generator создаёт оценку работы, Critic проверяет её по чек-листу (completeness, evidence, consistency, actionability). Если качество недостаточно — Generator получает feedback и улучшает результат. Цикл ограничен `MAX_REVISIONS`.
 
 ```python
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, START, END
-
-from app.config import get_settings
 
 
 class ReflectionState(TypedDict):
@@ -968,162 +785,103 @@ class ReflectionState(TypedDict):
     feedback_history: list[str]
 
 
-GENERATOR_PROMPT = (
-    "You are an expert academic assessor. "
-    "Assess the student work on the following criteria: {criteria}. "
-    "For each criterion, provide a score (0-25) and specific, evidence-based feedback. "
-    "Be thorough and reference specific parts of the student work."
-)
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
 
-GENERATOR_REVISION_PROMPT = (
-    "You are an expert academic assessor. "
-    "Your previous assessment received the following feedback:\n\n"
-    "{feedback}\n\n"
-    "Revise your assessment to address this feedback. "
-    "Criteria: {criteria}\n\n"
-    "Student work:\n{student_work}\n\n"
-    "Previous assessment:\n{draft}"
-)
-
-CRITIC_PROMPT = (
-    "You are a quality assurance reviewer for academic assessments. "
-    "Review the following assessment for quality and completeness.\n\n"
-    "Student work:\n{student_work}\n\n"
-    "Assessment criteria: {criteria}\n\n"
-    "Assessment to review:\n{draft}\n\n"
-    "Evaluate the assessment on these dimensions:\n"
-    "1. COMPLETENESS: Does it address ALL criteria listed?\n"
-    "2. EVIDENCE: Are scores supported by specific references to the student work?\n"
-    "3. CONSISTENCY: Do the scores match the qualitative feedback?\n"
-    "4. ACTIONABILITY: Is the feedback specific enough for the student to improve?\n"
-    "5. FAIRNESS: Are scores reasonable and not biased?\n\n"
-    "If the assessment is satisfactory on all dimensions, respond with exactly: SATISFACTORY\n"
-    "Otherwise, provide specific, actionable feedback for the assessor to improve."
-)
+MAX_REVISIONS = 3
 
 
-def build_reflection_graph(max_revisions: int = 3):
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        api_key=settings.anthropic_api_key,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-    )
-
-    async def generate_node(state: ReflectionState) -> dict:
-        criteria_text = ", ".join(state["criteria"])
-
-        if state.get("feedback") and state.get("draft"):
-            prompt = GENERATOR_REVISION_PROMPT.format(
-                feedback=state["feedback"],
-                criteria=criteria_text,
-                student_work=state["student_work"],
-                draft=state["draft"],
-            )
-        else:
-            prompt = (
-                f"{GENERATOR_PROMPT.format(criteria=criteria_text)}\n\n"
-                f"Student work:\n{state['student_work']}"
-            )
-
-        response = await llm.ainvoke([("human", prompt)])
-        return {
-            "draft": response.content,
-            "revision_count": state.get("revision_count", 0) + 1,
-        }
-
-    async def reflect_node(state: ReflectionState) -> dict:
-        criteria_text = ", ".join(state["criteria"])
-        prompt = CRITIC_PROMPT.format(
-            student_work=state["student_work"],
-            criteria=criteria_text,
-            draft=state["draft"],
+async def generate_node(state: ReflectionState) -> dict:
+    criteria_text = ", ".join(state["criteria"])
+    if state.get("feedback") and state.get("draft"):
+        prompt = (
+            f"Your previous assessment received feedback:\n{state['feedback']}\n\n"
+            f"Revise your assessment. Criteria: {criteria_text}\n"
+            f"Student work: {state['student_work']}\n"
+            f"Previous assessment: {state['draft']}"
         )
-
-        response = await llm.ainvoke([("human", prompt)])
-        is_ok = "SATISFACTORY" in response.content.upper()
-
-        history = state.get("feedback_history", [])
-        history = [*history, response.content]
-
-        return {
-            "feedback": response.content,
-            "is_satisfactory": is_ok,
-            "feedback_history": history,
-        }
-
-    def should_continue(state: ReflectionState) -> str:
-        if state.get("is_satisfactory", False):
-            return "done"
-        if state.get("revision_count", 0) >= max_revisions:
-            return "done"
-        return "revise"
-
-    graph = StateGraph(ReflectionState)
-    graph.add_node("generate", generate_node)
-    graph.add_node("reflect", reflect_node)
-
-    graph.add_edge(START, "generate")
-    graph.add_edge("generate", "reflect")
-    graph.add_conditional_edges("reflect", should_continue, {
-        "revise": "generate",
-        "done": END,
-    })
-
-    return graph
+    else:
+        prompt = (
+            f"Assess the student work on criteria: {criteria_text}. "
+            f"For each criterion give a score (0-25) and evidence-based feedback.\n\n"
+            f"Student work: {state['student_work']}"
+        )
+    response = await llm.ainvoke([("human", prompt)])
+    return {"draft": response.content, "revision_count": state.get("revision_count", 0) + 1}
 
 
-async def run_reflection_assessment(
-    student_work: str,
-    criteria: list[str],
-    max_revisions: int = 3,
-) -> dict:
-    graph = build_reflection_graph(max_revisions)
-    app = graph.compile()
+async def reflect_node(state: ReflectionState) -> dict:
+    criteria_text = ", ".join(state["criteria"])
+    prompt = (
+        f"Review this assessment for quality.\n\n"
+        f"Student work: {state['student_work']}\n"
+        f"Criteria: {criteria_text}\n"
+        f"Assessment: {state['draft']}\n\n"
+        "Check:\n"
+        "1. COMPLETENESS — all criteria addressed?\n"
+        "2. EVIDENCE — scores justified with specific references?\n"
+        "3. CONSISTENCY — scores match feedback?\n"
+        "4. ACTIONABILITY — feedback specific enough to improve?\n\n"
+        "If satisfactory, respond: SATISFACTORY\n"
+        "Otherwise, provide specific feedback for improvement."
+    )
+    response = await llm.ainvoke([("human", prompt)])
+    is_ok = "SATISFACTORY" in response.content.upper()
+    history = [*state.get("feedback_history", []), response.content]
+    return {"feedback": response.content, "is_satisfactory": is_ok, "feedback_history": history}
 
-    result = await app.ainvoke({
-        "student_work": student_work,
-        "criteria": criteria,
-        "draft": "",
-        "feedback": "",
-        "revision_count": 0,
-        "is_satisfactory": False,
-        "feedback_history": [],
-    })
 
-    return {
-        "final_assessment": result["draft"],
-        "revision_count": result["revision_count"],
-        "feedback_history": result.get("feedback_history", []),
-    }
+def should_continue(state: ReflectionState) -> str:
+    if state.get("is_satisfactory"):
+        return "done"
+    if state.get("revision_count", 0) >= MAX_REVISIONS:
+        return "done"
+    return "revise"
+
+
+graph = StateGraph(ReflectionState)
+graph.add_node("generate", generate_node)
+graph.add_node("reflect", reflect_node)
+graph.add_edge(START, "generate")
+graph.add_edge("generate", "reflect")
+graph.add_conditional_edges("reflect", should_continue, {"revise": "generate", "done": END})
+
+reflection_app = graph.compile()
+
+result = await reflection_app.ainvoke({
+    "student_work": (
+        "Climate change affects biodiversity. Many species are dying. "
+        "We need to do something about it."
+    ),
+    "criteria": ["content", "structure", "argumentation", "evidence"],
+    "draft": "",
+    "feedback": "",
+    "revision_count": 0,
+    "is_satisfactory": False,
+    "feedback_history": [],
+})
+
+print(f"Revisions: {result['revision_count']}")
+print(f"Satisfactory: {result['is_satisfactory']}")
+for i, fb in enumerate(result["feedback_history"], 1):
+    print(f"\n--- Feedback {i} ---")
+    print(fb[:300])
+print(f"\nFinal assessment:\n{result['draft'][:500]}")
 ```
 
-Ключевые моменты:
+Generator и Critic используют одну модель, но разные промпты, оптимизированные под свою роль. Промпт Critic'а содержит чёткий чек-лист — без него обратная связь будет слишком расплывчатой. Двойной критерий остановки: `is_satisfactory=True` или `revision_count >= MAX_REVISIONS` — без жёсткого лимита граф может зациклиться.
 
-**Два отдельных промпта.** Generator и Critic используют разные промпты, оптимизированные под свою задачу. Generator фокусируется на оценке, Critic — на проверке качества оценки. Это создаёт продуктивное «напряжение» между ролями.
+### Пример 3. Plan-and-Execute — планирование и пошаговое выполнение
 
-**CRITIC_PROMPT с чек-листом.** Критик проверяет по 5 конкретным измерениям. Без чёткого чек-листа Critic будет давать расплывчатый feedback, и Generator не сможет улучшить оценку.
-
-**`feedback_history`.** Сохраняем все feedback'и, а не только последний — это полезно для диагностики и для отображения в API-ответе.
-
-**Двойной критерий остановки.** Граф останавливается если Critic говорит «SATISFACTORY» ИЛИ если достигнут `max_revisions`. Без жёсткого лимита граф может зациклиться — Critic может быть «вечно недоволен».
-
-### Шаг 4. Plan-Execute — `app/graph/patterns/plan_execute.py`
-
-Реализация паттерна для оценки портфолио: сначала составляем план, потом выполняем по шагам с возможностью replanning.
+Planner генерирует план через structured output (`Plan`). Executor выполняет каждый шаг с контекстом предыдущих результатов. Replanner корректирует оставшийся план после каждого шага — может добавлять, удалять или менять порядок шагов.
 
 ```python
 import operator
 from typing import Annotated, TypedDict
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
-
-from app.config import get_settings
 
 
 class Step(BaseModel):
@@ -1131,7 +889,7 @@ class Step(BaseModel):
 
 
 class Plan(BaseModel):
-    steps: list[Step] = Field(description="Ordered list of steps to complete the objective")
+    steps: list[Step] = Field(description="Ordered list of steps")
 
 
 class PlanExecuteState(TypedDict):
@@ -1143,206 +901,146 @@ class PlanExecuteState(TypedDict):
     final_result: str
 
 
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+structured_llm = llm.with_structured_output(Plan)
+
 PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a planning agent. Given an objective and a list of student works, "
-     "create a concrete, step-by-step plan to achieve the objective. "
-     "Each step should be specific and actionable. "
+     "You are a planning agent. Create a concrete step-by-step plan. "
      "Number of student works: {num_works}"),
     ("human",
-     "Objective: {objective}\n\n"
-     "Student works preview (first 200 chars each):\n{works_preview}\n\n"
-     "Create a plan with concrete steps."),
+     "Objective: {objective}\n\nWorks preview:\n{works_preview}\n\nCreate a plan."),
 ])
 
 EXECUTOR_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are an executor agent. Complete the given step thoroughly. "
-     "Provide a detailed result."),
+    ("system", "You are an executor agent. Complete the given step thoroughly."),
     ("human",
-     "Overall objective: {objective}\n\n"
-     "Current step: {current_step}\n\n"
-     "Context from previous steps:\n{previous_results}\n\n"
-     "Relevant student work:\n{relevant_work}\n\n"
-     "Execute this step and provide a detailed result."),
-])
-
-REPLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system",
-     "You are a replanning agent. Given the original plan and results so far, "
-     "decide if the remaining plan needs adjustment. "
-     "You can add steps, remove steps, or modify existing ones. "
-     "If the objective is already achieved, return an empty plan."),
-    ("human",
-     "Objective: {objective}\n\n"
-     "Original plan:\n{original_plan}\n\n"
-     "Completed steps and results:\n{completed_results}\n\n"
-     "Remaining steps:\n{remaining_steps}\n\n"
-     "Should the remaining plan be adjusted? "
-     "Provide the updated list of remaining steps, or empty if done."),
+     "Objective: {objective}\nCurrent step: {current_step}\n"
+     "Previous results:\n{previous_results}\n\nStudent work:\n{relevant_work}\n\nExecute this step."),
 ])
 
 
-def build_plan_execute_graph():
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        api_key=settings.anthropic_api_key,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
+async def plan_node(state: PlanExecuteState) -> dict:
+    works_preview = "\n".join(
+        f"Work {i+1}: {w[:200]}..." for i, w in enumerate(state["student_works"])
     )
-    structured_llm = llm.with_structured_output(Plan)
-
-    async def plan_node(state: PlanExecuteState) -> dict:
-        works_preview = "\n".join(
-            f"Work {i+1}: {w[:200]}..."
-            for i, w in enumerate(state["student_works"])
+    response = await structured_llm.ainvoke(
+        PLANNER_PROMPT.format_messages(
+            objective=state["objective"],
+            num_works=len(state["student_works"]),
+            works_preview=works_preview,
         )
-        response = await structured_llm.ainvoke(
-            PLANNER_PROMPT.format_messages(
-                objective=state["objective"],
-                num_works=len(state["student_works"]),
-                works_preview=works_preview,
-            )
-        )
-        return {
-            "plan": [step.description for step in response.steps],
-            "current_step_index": 0,
-        }
-
-    async def execute_node(state: PlanExecuteState) -> dict:
-        idx = state["current_step_index"]
-        current_step = state["plan"][idx]
-
-        previous_results = "\n".join(
-            f"Step {r['step_index']+1}: {r['result'][:300]}"
-            for r in state.get("step_results", [])
-        ) or "No previous results."
-
-        work_idx = min(idx, len(state["student_works"]) - 1)
-        relevant_work = state["student_works"][work_idx]
-
-        response = await llm.ainvoke(
-            EXECUTOR_PROMPT.format_messages(
-                objective=state["objective"],
-                current_step=current_step,
-                previous_results=previous_results,
-                relevant_work=relevant_work,
-            )
-        )
-
-        return {
-            "step_results": [{"step_index": idx, "step": current_step, "result": response.content}],
-            "current_step_index": idx + 1,
-        }
-
-    async def replan_node(state: PlanExecuteState) -> dict:
-        idx = state["current_step_index"]
-        if idx >= len(state["plan"]):
-            return {}
-
-        original_plan = "\n".join(f"{i+1}. {s}" for i, s in enumerate(state["plan"]))
-        completed = "\n".join(
-            f"Step {r['step_index']+1} ({r['step']}): {r['result'][:200]}"
-            for r in state.get("step_results", [])
-        )
-        remaining = "\n".join(
-            f"{i+1}. {s}" for i, s in enumerate(state["plan"][idx:], start=idx)
-        )
-
-        response = await structured_llm.ainvoke(
-            REPLANNER_PROMPT.format_messages(
-                objective=state["objective"],
-                original_plan=original_plan,
-                completed_results=completed,
-                remaining_steps=remaining,
-            )
-        )
-
-        if response.steps:
-            completed_steps = state["plan"][:idx]
-            new_remaining = [step.description for step in response.steps]
-            return {"plan": completed_steps + new_remaining}
-        return {}
-
-    def should_continue(state: PlanExecuteState) -> str:
-        if state["current_step_index"] >= len(state["plan"]):
-            return "finalize"
-        return "execute"
-
-    async def finalize_node(state: PlanExecuteState) -> dict:
-        all_results = "\n\n".join(
-            f"### Step {r['step_index']+1}: {r['step']}\n{r['result']}"
-            for r in state.get("step_results", [])
-        )
-        prompt = (
-            f"Objective: {state['objective']}\n\n"
-            f"All step results:\n{all_results}\n\n"
-            "Synthesize all results into a comprehensive final assessment. "
-            "Include overall recommendation and key findings."
-        )
-        response = await llm.ainvoke([("human", prompt)])
-        return {"final_result": response.content}
-
-    graph = StateGraph(PlanExecuteState)
-    graph.add_node("plan", plan_node)
-    graph.add_node("execute", execute_node)
-    graph.add_node("replan", replan_node)
-    graph.add_node("finalize", finalize_node)
-
-    graph.add_edge(START, "plan")
-    graph.add_edge("plan", "execute")
-    graph.add_edge("execute", "replan")
-    graph.add_conditional_edges("replan", should_continue, {
-        "execute": "execute",
-        "finalize": "finalize",
-    })
-    graph.add_edge("finalize", END)
-
-    return graph
-
-
-async def run_plan_execute_assessment(
-    student_works: list[str],
-    objective: str,
-) -> dict:
-    graph = build_plan_execute_graph()
-    app = graph.compile()
-
-    result = await app.ainvoke(
-        {
-            "objective": objective,
-            "student_works": student_works,
-            "plan": [],
-            "current_step_index": 0,
-            "step_results": [],
-            "final_result": "",
-        },
-        config={"recursion_limit": 50},
     )
+    return {"plan": [s.description for s in response.steps], "current_step_index": 0}
 
+
+async def execute_node(state: PlanExecuteState) -> dict:
+    idx = state["current_step_index"]
+    previous_results = "\n".join(
+        f"Step {r['step_index']+1}: {r['result'][:300]}"
+        for r in state.get("step_results", [])
+    ) or "No previous results."
+    work_idx = min(idx, len(state["student_works"]) - 1)
+    response = await llm.ainvoke(
+        EXECUTOR_PROMPT.format_messages(
+            objective=state["objective"],
+            current_step=state["plan"][idx],
+            previous_results=previous_results,
+            relevant_work=state["student_works"][work_idx],
+        )
+    )
     return {
-        "plan": result["plan"],
-        "step_results": result.get("step_results", []),
-        "final_result": result.get("final_result", ""),
+        "step_results": [{"step_index": idx, "step": state["plan"][idx], "result": response.content}],
+        "current_step_index": idx + 1,
     }
+
+
+async def replan_node(state: PlanExecuteState) -> dict:
+    idx = state["current_step_index"]
+    if idx >= len(state["plan"]):
+        return {}
+    completed = "\n".join(
+        f"Step {r['step_index']+1}: {r['result'][:200]}"
+        for r in state.get("step_results", [])
+    )
+    remaining = "\n".join(
+        f"{i+1}. {s}" for i, s in enumerate(state["plan"][idx:], start=idx)
+    )
+    response = await structured_llm.ainvoke([
+        ("system",
+         "You are a replanning agent. Adjust the remaining plan if needed. "
+         "Return empty steps list if the objective is already achieved."),
+        ("human",
+         f"Objective: {state['objective']}\n\nCompleted:\n{completed}\n\n"
+         f"Remaining:\n{remaining}\n\nProvide updated remaining steps."),
+    ])
+    if response.steps:
+        return {"plan": state["plan"][:idx] + [s.description for s in response.steps]}
+    return {}
+
+
+def should_continue(state: PlanExecuteState) -> str:
+    if state["current_step_index"] >= len(state["plan"]):
+        return "finalize"
+    return "execute"
+
+
+async def finalize_node(state: PlanExecuteState) -> dict:
+    all_results = "\n\n".join(
+        f"### Step {r['step_index']+1}: {r['step']}\n{r['result']}"
+        for r in state.get("step_results", [])
+    )
+    response = await llm.ainvoke([("human",
+        f"Objective: {state['objective']}\n\nAll step results:\n{all_results}\n\n"
+        "Synthesize into a final recommendation."
+    )])
+    return {"final_result": response.content}
+
+
+graph = StateGraph(PlanExecuteState)
+graph.add_node("plan", plan_node)
+graph.add_node("execute", execute_node)
+graph.add_node("replan", replan_node)
+graph.add_node("finalize", finalize_node)
+graph.add_edge(START, "plan")
+graph.add_edge("plan", "execute")
+graph.add_edge("execute", "replan")
+graph.add_conditional_edges("replan", should_continue, {
+    "execute": "execute",
+    "finalize": "finalize",
+})
+graph.add_edge("finalize", END)
+
+plan_app = graph.compile()
+
+result = await plan_app.ainvoke(
+    {
+        "objective": "Assess the portfolio and provide a recommendation on student progress",
+        "student_works": [
+            "Essay about climate change impacts on marine ecosystems...",
+            "Lab report on water quality analysis methodology...",
+            "Research proposal for renewable energy study...",
+        ],
+        "plan": [],
+        "current_step_index": 0,
+        "step_results": [],
+        "final_result": "",
+    },
+    config={"recursion_limit": 50},
+)
+
+print("Plan:")
+for i, step in enumerate(result["plan"], 1):
+    print(f"  {i}. {step}")
+print(f"\nSteps executed: {len(result['step_results'])}")
+print(f"\nFinal result:\n{result['final_result'][:500]}")
 ```
 
-Разберём архитектуру:
+Structured output для плана (`with_structured_output(Plan)`) гарантирует стандартный формат — всегда список конкретных шагов, а не свободный текст. Replanner видит результаты выполненных шагов и может добавить или удалить оставшиеся — это ключевое отличие от статического плана. `recursion_limit=50` — Plan-Execute может потребовать много шагов графа.
 
-**Три LLM-роли.** Planner использует structured output (`Plan` модель) для генерации списка шагов. Executor получает один шаг и выполняет его. Replanner решает, нужно ли корректировать оставшийся план.
+### Пример 4. Map-Reduce — параллельная обработка с агрегацией
 
-**Structured output для плана.** Planner возвращает `Plan(steps=[Step(...), ...])` — это гарантирует, что план всегда будет списком конкретных шагов, а не свободным текстом.
-
-**Контекст в Executor.** Executor получает: текущий шаг, результаты предыдущих шагов (усечённые до 300 символов), и релевантную студенческую работу. Это обеспечивает связность выполнения.
-
-**Цикл execute → replan.** После каждого шага Replanner проверяет оставшийся план. Если работа показала неожиданные особенности, Replanner может добавить дополнительные шаги.
-
-**`recursion_limit=50`.** Plan-Execute может потребовать много шагов — лимит должен быть выше, чем для ReAct.
-
-### Шаг 5. Map-Reduce — `app/graph/patterns/map_reduce.py`
-
-Параллельная оценка по нескольким критериям с агрегацией результатов.
+Каждый критерий оценки обрабатывается отдельным LLM-вызовом параллельно через `Send()`. Агрегирующий узел собирает все частичные результаты и формирует итоговое резюме.
 
 ```python
 import operator
@@ -1353,14 +1051,12 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
-from app.config import get_settings
-
 
 class CriterionScore(BaseModel):
-    criterion_name: str = Field(description="Name of the criterion")
-    score: int = Field(description="Score for this criterion")
-    max_score: int = Field(description="Maximum possible score")
-    feedback: str = Field(description="Specific feedback for this criterion")
+    criterion_name: str
+    score: int
+    max_score: int
+    feedback: str
 
 
 class MapReduceState(TypedDict):
@@ -1378,355 +1074,103 @@ class CriterionState(TypedDict):
     partial_results: Annotated[list[dict], operator.add]
 
 
-CRITERION_PROMPT = (
-    "You are an expert assessor focused on a single evaluation criterion.\n\n"
-    "Criterion: {name}\n"
-    "Description: {description}\n"
-    "Maximum score: {max_score}\n\n"
-    "Student work:\n{student_work}\n\n"
-    "Evaluate the student work ONLY on this specific criterion. "
-    "Provide a score (0 to {max_score}) and detailed, evidence-based feedback. "
-    "Reference specific parts of the student work."
-)
-
-AGGREGATION_PROMPT = (
-    "You are a senior assessor synthesizing criterion-level evaluations.\n\n"
-    "Individual criterion results:\n{criterion_results}\n\n"
-    "Provide a brief overall summary (2-3 sentences) that synthesizes the findings "
-    "across all criteria. Highlight the most notable strengths and areas for improvement."
-)
-
-
-def build_map_reduce_graph():
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        api_key=settings.anthropic_api_key,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-    )
-    structured_llm = llm.with_structured_output(CriterionScore)
-
-    def fan_out_criteria(state: MapReduceState) -> list[Send]:
-        return [
-            Send("assess_criterion", {
-                "student_work": state["student_work"],
-                "criterion": criterion,
-                "partial_results": [],
-            })
-            for criterion in state["criteria"]
-        ]
-
-    async def assess_criterion_node(state: CriterionState) -> dict:
-        criterion = state["criterion"]
-        prompt = CRITERION_PROMPT.format(
-            name=criterion["name"],
-            description=criterion["description"],
-            max_score=criterion["max_score"],
-            student_work=state["student_work"],
-        )
-
-        result = await structured_llm.ainvoke([("human", prompt)])
-
-        return {
-            "partial_results": [{
-                "criterion_name": result.criterion_name,
-                "score": result.score,
-                "max_score": result.max_score,
-                "feedback": result.feedback,
-            }],
-        }
-
-    async def aggregate_node(state: MapReduceState) -> dict:
-        results = state["partial_results"]
-        overall = sum(r["score"] for r in results)
-        max_overall = sum(r["max_score"] for r in results)
-
-        results_text = "\n".join(
-            f"- {r['criterion_name']}: {r['score']}/{r['max_score']} — {r['feedback']}"
-            for r in results
-        )
-        prompt = AGGREGATION_PROMPT.format(criterion_results=results_text)
-
-        response = await llm.ainvoke([("human", prompt)])
-
-        return {
-            "overall_score": overall,
-            "max_overall_score": max_overall,
-            "summary": response.content,
-        }
-
-    graph = StateGraph(MapReduceState)
-    graph.add_node("assess_criterion", assess_criterion_node)
-    graph.add_node("aggregate", aggregate_node)
-
-    graph.add_conditional_edges(START, fan_out_criteria)
-    graph.add_edge("assess_criterion", "aggregate")
-    graph.add_edge("aggregate", END)
-
-    return graph
-
-
-async def run_map_reduce_assessment(
-    student_work: str,
-    criteria: list[dict],
-) -> dict:
-    graph = build_map_reduce_graph()
-    app = graph.compile()
-
-    result = await app.ainvoke({
-        "student_work": student_work,
-        "criteria": criteria,
-        "partial_results": [],
-        "overall_score": 0,
-        "max_overall_score": 0,
-        "summary": "",
-    })
-
-    return {
-        "criterion_results": result["partial_results"],
-        "overall_score": result["overall_score"],
-        "max_overall_score": result["max_overall_score"],
-        "summary": result["summary"],
-    }
-```
-
-Ключевые решения:
-
-**`Send()` для fan-out.** Функция `fan_out_criteria` возвращает список `Send()` — по одному на каждый критерий. LangGraph запускает все ветки параллельно. Каждая ветка получает своё состояние (`CriterionState`) с конкретным критерием.
-
-**Отдельный `CriterionState`.** Каждая параллельная ветка работает с упрощённым state, содержащим только нужные данные. Это изоляция — ветки не влияют друг на друга.
-
-**`operator.add` для `partial_results`.** Когда несколько веток завершаются и возвращают `partial_results`, reducer объединяет их в один список. Node `aggregate` получает полный список результатов всех веток.
-
-**Structured output в Map.** Каждая ветка использует `with_structured_output(CriterionScore)` — это гарантирует стандартный формат результата от каждой параллельной ветки.
-
-**Агрегация.** Node `aggregate` делает две вещи: математически суммирует баллы (детерминировано) и генерирует текстовое резюме через LLM (creative). Это разделение важно — числа считаем сами, текст генерирует модель.
-
-### Шаг 6. Роутер — `app/api/v1/patterns.py`
-
-Четыре эндпоинта, по одному на каждый паттерн.
-
-```python
-from fastapi import APIRouter, HTTPException
-
-from app.schemas.patterns import (
-    MapReduceRequest,
-    MapReduceResponse,
-    PlanExecuteRequest,
-    PlanExecuteResponse,
-    ReactAssessmentRequest,
-    ReactAssessmentResponse,
-    ReflectionAssessmentRequest,
-    ReflectionAssessmentResponse,
-    ToolCallRecord,
-    CriterionResult,
-)
-
-router = APIRouter(prefix="/patterns", tags=["lesson-13-agentic-patterns"])
-
-
-@router.post("/react")
-async def react_assessment(request: ReactAssessmentRequest) -> ReactAssessmentResponse:
-    from app.graph.patterns.react_agent import run_react_assessment
-
-    if not request.student_work.strip():
-        raise HTTPException(status_code=422, detail="student_work must not be empty")
-
-    result = await run_react_assessment(
-        student_work=request.student_work,
-        criteria=request.rubric_criteria,
-        max_iterations=request.max_iterations,
-    )
-
-    return ReactAssessmentResponse(
-        assessment=result["assessment"],
-        tool_calls=[
-            ToolCallRecord(
-                tool_name=tc["tool_name"],
-                tool_input=tc["tool_input"],
-                tool_output=tc.get("tool_output", ""),
-            )
-            for tc in result["tool_calls"]
-        ],
-        iterations=result["iterations"],
-    )
-
-
-@router.post("/reflection")
-async def reflection_assessment(
-    request: ReflectionAssessmentRequest,
-) -> ReflectionAssessmentResponse:
-    from app.graph.patterns.reflection import run_reflection_assessment
-
-    if not request.student_work.strip():
-        raise HTTPException(status_code=422, detail="student_work must not be empty")
-
-    result = await run_reflection_assessment(
-        student_work=request.student_work,
-        criteria=request.rubric_criteria,
-        max_revisions=request.max_revisions,
-    )
-
-    return ReflectionAssessmentResponse(
-        final_assessment=result["final_assessment"],
-        revision_count=result["revision_count"],
-        feedback_history=result["feedback_history"],
-    )
-
-
-@router.post("/plan-execute")
-async def plan_execute_assessment(request: PlanExecuteRequest) -> PlanExecuteResponse:
-    from app.graph.patterns.plan_execute import run_plan_execute_assessment
-
-    if not any(w.strip() for w in request.student_works):
-        raise HTTPException(status_code=422, detail="At least one student work must be non-empty")
-
-    result = await run_plan_execute_assessment(
-        student_works=request.student_works,
-        objective=request.objective,
-    )
-
-    return PlanExecuteResponse(
-        plan=result["plan"],
-        step_results=result["step_results"],
-        final_result=result["final_result"],
-    )
-
-
-@router.post("/map-reduce")
-async def map_reduce_assessment(request: MapReduceRequest) -> MapReduceResponse:
-    from app.graph.patterns.map_reduce import run_map_reduce_assessment
-
-    if not request.student_work.strip():
-        raise HTTPException(status_code=422, detail="student_work must not be empty")
-
-    result = await run_map_reduce_assessment(
-        student_work=request.student_work,
-        criteria=request.criteria,
-    )
-
-    return MapReduceResponse(
-        criterion_results=[
-            CriterionResult(**cr) for cr in result["criterion_results"]
-        ],
-        overall_score=result["overall_score"],
-        max_overall_score=result["max_overall_score"],
-        summary=result["summary"],
-    )
-```
-
-Обрати внимание на несколько паттернов:
-
-**Lazy imports.** Модули графов импортируются внутри функций-обработчиков, а не на уровне модуля. Это позволяет серверу стартовать, даже если в коде графа есть ошибки — ошибка проявится только при вызове конкретного эндпоинта.
-
-**Валидация на входе.** Каждый эндпоинт проверяет, что входные данные не пустые, до запуска графа. Это дешевле, чем запустить граф и получить бессмысленный результат.
-
-**Маппинг dict → Pydantic.** Результаты графов возвращаются как dict'ы, а эндпоинт оборачивает их в Pydantic-модели. Это обеспечивает валидацию ответа и автоматическую генерацию OpenAPI-схемы.
-
-### Шаг 7. Регистрация и тестирование
-
-**Регистрация роутера.** Добавь роутер в `app/api/router.py`:
-
-```python
-from fastapi import APIRouter
-
-from app.api.v1 import assessment, rubrics, prompts, patterns
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(patterns.router)
-```
-
-**Структура файлов.** После этого шага в проекте появятся:
-
-```
-app/
-├── api/
-│   └── v1/
-│       └── patterns.py           ← роутер (4 эндпоинта)
-├── graph/
-│   └── patterns/
-│       ├── __init__.py
-│       ├── react_agent.py        ← ReAct паттерн
-│       ├── reflection.py         ← Reflection паттерн
-│       ├── plan_execute.py       ← Plan-Execute паттерн
-│       └── map_reduce.py         ← Map-Reduce паттерн
-└── schemas/
-    └── patterns.py               ← Pydantic модели
-```
-
-**Тестирование через curl.**
-
-ReAct:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/patterns/react \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of climate change on biodiversity is a critical topic in modern ecology. Rising temperatures have led to shifts in species distribution patterns globally. However, some argue that natural adaptation can mitigate these effects. Studies by Smith (2020) and Johnson (2021) demonstrate significant coral reef degradation.",
-    "rubric_criteria": ["content", "structure", "argumentation"],
-    "max_iterations": 10
-  }'
-```
-
-Reflection:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/patterns/reflection \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change affects biodiversity. Many species are dying. We need to do something about it.",
-    "rubric_criteria": ["content", "structure", "argumentation", "evidence"],
-    "max_revisions": 3
-  }'
-```
-
-Plan-Execute:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/patterns/plan-execute \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_works": [
-      "Essay about climate change impacts on marine ecosystems...",
-      "Lab report on water quality analysis methodology...",
-      "Research proposal for renewable energy study..."
-    ],
-    "objective": "Assess the portfolio and provide a comprehensive recommendation on student progress"
-  }'
-```
-
-Map-Reduce:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/patterns/map-reduce \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of climate change on biodiversity is a critical topic. Rising temperatures lead to shifts in species distribution. Studies show coral reef degradation is accelerating.",
-    "criteria": [
-      {"name": "content", "description": "Depth and accuracy of content", "max_score": 25},
-      {"name": "structure", "description": "Organization and logical flow", "max_score": 25},
-      {"name": "argumentation", "description": "Quality of arguments and evidence", "max_score": 25},
-      {"name": "language", "description": "Grammar, style, clarity", "max_score": 25}
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+structured_llm = llm.with_structured_output(CriterionScore)
+
+
+def fan_out_criteria(state: MapReduceState) -> list[Send]:
+    return [
+        Send("assess_criterion", {
+            "student_work": state["student_work"],
+            "criterion": c,
+            "partial_results": [],
+        })
+        for c in state["criteria"]
     ]
-  }'
+
+
+async def assess_criterion_node(state: CriterionState) -> dict:
+    c = state["criterion"]
+    prompt = (
+        f"You are an assessor focused on one criterion.\n\n"
+        f"Criterion: {c['name']}\nDescription: {c['description']}\n"
+        f"Max score: {c['max_score']}\n\n"
+        f"Student work:\n{state['student_work']}\n\n"
+        f"Evaluate ONLY on this criterion. Score 0 to {c['max_score']}."
+    )
+    result = await structured_llm.ainvoke([("human", prompt)])
+    return {"partial_results": [{
+        "criterion_name": result.criterion_name,
+        "score": result.score,
+        "max_score": result.max_score,
+        "feedback": result.feedback,
+    }]}
+
+
+async def aggregate_node(state: MapReduceState) -> dict:
+    results = state["partial_results"]
+    overall = sum(r["score"] for r in results)
+    max_overall = sum(r["max_score"] for r in results)
+    results_text = "\n".join(
+        f"- {r['criterion_name']}: {r['score']}/{r['max_score']} — {r['feedback']}"
+        for r in results
+    )
+    response = await llm.ainvoke([("human",
+        f"Synthesize these evaluations into a 2-3 sentence summary:\n\n{results_text}"
+    )])
+    return {
+        "overall_score": overall,
+        "max_overall_score": max_overall,
+        "summary": response.content,
+    }
+
+
+graph = StateGraph(MapReduceState)
+graph.add_node("assess_criterion", assess_criterion_node)
+graph.add_node("aggregate", aggregate_node)
+graph.add_conditional_edges(START, fan_out_criteria)
+graph.add_edge("assess_criterion", "aggregate")
+graph.add_edge("aggregate", END)
+
+mr_app = graph.compile()
+
+result = await mr_app.ainvoke({
+    "student_work": (
+        "The impact of climate change on biodiversity is a critical topic. "
+        "Rising temperatures lead to shifts in species distribution. "
+        "Studies show coral reef degradation is accelerating."
+    ),
+    "criteria": [
+        {"name": "content", "description": "Depth and accuracy of content", "max_score": 25},
+        {"name": "structure", "description": "Organization and logical flow", "max_score": 25},
+        {"name": "argumentation", "description": "Quality of arguments and evidence", "max_score": 25},
+        {"name": "language", "description": "Grammar, style, clarity", "max_score": 25},
+    ],
+    "partial_results": [],
+    "overall_score": 0,
+    "max_overall_score": 0,
+    "summary": "",
+})
+
+for r in result["partial_results"]:
+    print(f"{r['criterion_name']}: {r['score']}/{r['max_score']}")
+    print(f"  {r['feedback'][:150]}\n")
+print(f"Overall: {result['overall_score']}/{result['max_overall_score']}")
+print(f"\nSummary: {result['summary'][:300]}")
 ```
 
-**Проверка через Swagger.** Запусти сервер (`uvicorn app.main:app --reload`) и открой `http://localhost:8000/docs`. Все 4 эндпоинта должны быть видны в секции `lesson-13-agentic-patterns` с полными схемами запросов и ответов.
+`Send()` создаёт параллельные ветки — по одной на каждый критерий. `CriterionState` изолирует данные каждой ветки. `operator.add` на поле `partial_results` объединяет результаты всех веток в один список. Node `aggregate` суммирует баллы детерминировано и генерирует текстовое резюме через LLM.
 
 ### Связь с теорией
 
-Каждый эндпоинт реализует один из четырёх паттернов из теоретической части:
+Каждый пример реализует один из четырёх паттернов из теоретической части:
 
-| Эндпоинт | Паттерн | Ключевой механизм |
-|----------|---------|-------------------|
-| `POST /patterns/react` | ReAct (раздел 2) | `bind_tools` + `should_continue` conditional edge |
-| `POST /patterns/reflection` | Reflection (раздел 3) | Generator + Critic + conditional loop |
-| `POST /patterns/plan-execute` | Plan-Execute (раздел 4) | Structured planner + executor + replanner cycle |
-| `POST /patterns/map-reduce` | Map-Reduce (раздел 5) | `Send()` fan-out + `operator.add` reducer |
+| Пример | Паттерн | Ключевой механизм |
+|--------|---------|-------------------|
+| Пример 1 | ReAct (раздел 2) | `bind_tools` + `should_continue` conditional edge |
+| Пример 2 | Reflection (раздел 3) | Generator + Critic + conditional loop |
+| Пример 3 | Plan-Execute (раздел 4) | Structured planner + executor + replanner cycle |
+| Пример 4 | Map-Reduce (раздел 5) | `Send()` fan-out + `operator.add` reducer |
 
 **State design** (раздел 7) реализован в каждом графе:
 - ReAct: `messages` с `add_messages` reducer
@@ -1734,7 +1178,7 @@ curl -X POST http://localhost:8000/api/v1/patterns/map-reduce \
 - Plan-Execute: `plan` с перезаписью при replanning, `step_results` с `operator.add`
 - Map-Reduce: `partial_results` с `operator.add`, `CriterionState` для параллельных веток
 
-Паттерны можно **комбинировать** (раздел 6): например, обернуть `/patterns/react` в Reflection, чтобы проверить качество оценки после ReAct-цикла. Или использовать Map-Reduce внутри Plan-Execute для параллельного выполнения независимых шагов.
+Паттерны можно **комбинировать** (раздел 6): например, обернуть ReAct-агента в Reflection-цикл для проверки качества оценки, или использовать Map-Reduce внутри Plan-Execute для параллельного выполнения независимых шагов.
 
 ---
 
@@ -1746,9 +1190,9 @@ curl -X POST http://localhost:8000/api/v1/patterns/map-reduce \
 - [ ] Объясни роль Replanner в Plan-Execute. Когда он добавляет шаги? Когда удаляет? Что будет без него?
 - [ ] Как `Send()` реализует параллелизм в Map-Reduce? Почему нельзя просто запустить несколько node'ов?
 - [ ] Почему `partial_results` использует `Annotated[list[dict], operator.add]`? Что произойдёт без reducer'а?
-- [ ] Запусти `/patterns/react` и посмотри `tool_calls` в ответе — какие tools вызвала модель и почему?
-- [ ] Запусти `/patterns/reflection` с `max_revisions=1` и `max_revisions=3` — сравни качество `final_assessment`. Улучшился ли результат?
-- [ ] Запусти `/patterns/map-reduce` с 2 критериями и с 5 — как изменилось время ответа? Почему?
+- [ ] Запусти пример ReAct и посмотри вывод tool calls — какие tools вызвала модель и почему?
+- [ ] Запусти пример Reflection с `MAX_REVISIONS=1` и `MAX_REVISIONS=3` — сравни качество финальной оценки. Улучшился ли результат?
+- [ ] Запусти пример Map-Reduce с 2 критериями и с 5 — как изменилось время выполнения? Почему?
 - [ ] Выбери паттерн для задачи: «Проверь 10 домашних работ студентов по одной рубрике и составь рейтинг». Обоснуй выбор, используя дерево решений из раздела 8.
 
 ---

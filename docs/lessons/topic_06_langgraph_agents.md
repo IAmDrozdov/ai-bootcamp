@@ -1,8 +1,7 @@
 # Тема 6: LangGraph + Agents
 
 > **Пререквизиты:** темы 1–4 (LCEL chains, structured output), рекомендуется тема 5 (RAG)
-> **Что добавляем в проект:** `app/api/v1/graph.py`, `app/graph/assessment_graph.py`, `app/graph/tools.py`, `app/schemas/graph.py`
-> **Зависимости:** `langgraph` (группа `agents`)
+> **Зависимости:** `langgraph`, `langchain-anthropic`
 
 ---
 
@@ -30,7 +29,7 @@ LCEL chains из темы 2 — это **линейные** пайплайны: 
 
 LangGraph — это **фреймворк для построения stateful, multi-step applications** на базе LLM. Он моделирует workflow как направленный граф, где узлы — это функции, рёбра — переходы между ними, а состояние — типизированный словарь, доступный всем узлам.
 
-В нашем проекте LangGraph позволяет строить многошаговые пайплайны оценки: анализ работы → выбор модели → оценка → ревью — где каждый шаг может принимать решения на основе результатов предыдущих.
+LangGraph позволяет строить многошаговые пайплайны: анализ → выбор модели → оценка → ревью — где каждый шаг может принимать решения на основе результатов предыдущих.
 
 ### 2. StateGraph — основная абстракция
 
@@ -538,67 +537,170 @@ result = await app.ainvoke(None, config)
 
 ---
 
-## Практика: роутер `/api/v1/graph`
+## Практика
 
-Мы создадим четыре эндпоинта, демонстрирующих разные возможности LangGraph:
+Четыре самостоятельных примера, каждый демонстрирует отдельный концепт LangGraph:
 
-| Эндпоинт | Что делает | Концепт |
-|----------|------------|---------|
-| `POST /assess` | Линейный граф: prepare → assess → format | StateGraph, nodes, edges |
-| `POST /assess/routed` | Conditional routing по длине работы | Conditional edges |
-| `POST /assess/tools` | LLM вызывает tools для анализа | Tool calling, ToolNode, цикл |
-| `POST /assess/reviewed` | Draft → review (двойная проверка) | Multi-step pipeline |
+| Пример | Что делает | Концепт |
+|--------|------------|---------|
+| 1. Линейный граф | prepare → assess → format | StateGraph, nodes, edges |
+| 2. Conditional routing | Выбор ветки по длине текста | Conditional edges |
+| 3. Tool calling | LLM вызывает tools в цикле | ToolNode, ReAct-цикл, reducers |
+| 4. Human-in-the-loop | Пауза для ревью перед публикацией | interrupt_before, checkpointer |
 
-### Шаг 1. Схемы данных — `app/schemas/graph.py`
+### Пример 1. Линейный граф: prepare → assess → format
+
+Базовый StateGraph с тремя узлами и линейными рёбрами. Каждый узел читает state и возвращает обновления.
 
 ```python
-from pydantic import BaseModel
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
 
-from app.schemas.assessment import AssessmentResponse
 
-
-class GraphAssessRequest(BaseModel):
+class AssessmentState(TypedDict):
     student_work: str
-    rubric_id: str | None = "essay_default"
+    analysis: str
+    score: int
+    result: str
 
 
-class GraphAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    nodes_executed: list[str]
+def prepare(state: AssessmentState) -> dict:
+    work = state["student_work"]
+    word_count = len(work.split())
+    paragraphs = len([p for p in work.split("\n\n") if p.strip()])
+    return {"analysis": f"Words: {word_count}, Paragraphs: {paragraphs}"}
 
 
-class RoutedAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    model_used: str
-    word_count: int
-    route: str
+def assess(state: AssessmentState) -> dict:
+    word_count = int(state["analysis"].split("Words: ")[1].split(",")[0])
+    if word_count > 100:
+        return {"score": 80}
+    return {"score": 50}
 
 
-class ToolCallInfo(BaseModel):
-    tool_name: str
-    tool_input: str
-    tool_output: str
+def format_result(state: AssessmentState) -> dict:
+    return {"result": f"Score: {state['score']}/100 | {state['analysis']}"}
 
 
-class ToolsAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    tool_calls: list[ToolCallInfo]
+graph = StateGraph(AssessmentState)
+graph.add_node("prepare", prepare)
+graph.add_node("assess", assess)
+graph.add_node("format_result", format_result)
 
+graph.add_edge(START, "prepare")
+graph.add_edge("prepare", "assess")
+graph.add_edge("assess", "format_result")
+graph.add_edge("format_result", END)
 
-class ReviewedAssessResponse(BaseModel):
-    draft_assessment: AssessmentResponse
-    final_assessment: AssessmentResponse
-    review_notes: str
+app = graph.compile()
+
+result = app.invoke({
+    "student_work": "The impact of artificial intelligence on modern education is profound. "
+    "AI-powered tutoring systems can provide personalized learning experiences "
+    "that adapt to individual student needs.\n\n"
+    "This essay examines three key areas where AI transforms education: "
+    "adaptive learning, automated assessment, and accessibility improvements.",
+    "analysis": "",
+    "score": 0,
+    "result": "",
+})
+
+print(result["analysis"])
+print(result["result"])
 ```
 
-Каждый эндпоинт возвращает свой response-тип с дополнительной метаинформацией: какие узлы выполнились, какая модель использовалась, какие tools были вызваны.
+Каждый node возвращает только изменённые поля — LangGraph мержит их с текущим state.
 
-### Шаг 2. Tools — `app/graph/tools.py`
+### Пример 2. Conditional routing по длине текста
+
+Router-функция анализирует state и выбирает следующий узел. Короткий текст идёт на быструю оценку, длинный — на полную.
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+
+class RoutedState(TypedDict):
+    student_work: str
+    word_count: int
+    route: str
+    assessment: str
+
+
+def analyze(state: RoutedState) -> dict:
+    return {"word_count": len(state["student_work"].split())}
+
+
+def route_by_length(state: RoutedState) -> str:
+    if state["word_count"] < 50:
+        return "quick_assess"
+    return "full_assess"
+
+
+def quick_assess(state: RoutedState) -> dict:
+    return {
+        "assessment": f"Quick review ({state['word_count']} words): basic feedback",
+        "route": "quick",
+    }
+
+
+def full_assess(state: RoutedState) -> dict:
+    return {
+        "assessment": f"Full review ({state['word_count']} words): detailed feedback",
+        "route": "full",
+    }
+
+
+graph = StateGraph(RoutedState)
+graph.add_node("analyze", analyze)
+graph.add_node("quick_assess", quick_assess)
+graph.add_node("full_assess", full_assess)
+
+graph.add_edge(START, "analyze")
+graph.add_conditional_edges(
+    "analyze",
+    route_by_length,
+    {"quick_assess": "quick_assess", "full_assess": "full_assess"},
+)
+graph.add_edge("quick_assess", END)
+graph.add_edge("full_assess", END)
+
+app = graph.compile()
+
+short_result = app.invoke({
+    "student_work": "AI is changing education.",
+    "word_count": 0,
+    "route": "",
+    "assessment": "",
+})
+print(f"Short → route: {short_result['route']}, {short_result['assessment']}")
+
+long_text = " ".join(["Education and AI are transforming the modern world."] * 15)
+long_result = app.invoke({
+    "student_work": long_text,
+    "word_count": 0,
+    "route": "",
+    "assessment": "",
+})
+print(f"Long  → route: {long_result['route']}, {long_result['assessment']}")
+```
+
+Router-функция — чистая функция, не меняющая state. Она только возвращает строку-ключ для выбора следующего узла.
+
+### Пример 3. Tool calling — ReAct-цикл с ToolNode
+
+LLM сама решает, какие tools вызвать. Цикл `agent → tools → agent` продолжается, пока LLM не перестанет запрашивать tools.
 
 ```python
 import re
+from typing import Annotated, TypedDict
+from operator import add
 
+from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
 
 
 @tool
@@ -607,586 +709,160 @@ def count_words(text: str) -> dict:
     words = len(text.split())
     sentences = len([s for s in re.split(r"[.!?]+", text) if s.strip()])
     paragraphs = len([p for p in text.split("\n\n") if p.strip()])
-    return {
-        "words": words,
-        "sentences": max(sentences, 1),
-        "paragraphs": max(paragraphs, 1),
-    }
-
-
-@tool
-def check_structure(text: str) -> dict:
-    """Check essay structure: introduction, conclusion, and transition words."""
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    has_intro = len(paragraphs) > 0 and len(paragraphs[0].split()) > 20
-    has_conclusion = len(paragraphs) > 1 and len(paragraphs[-1].split()) > 20
-    transitions = [
-        "however", "moreover", "furthermore", "in addition",
-        "therefore", "consequently", "nevertheless", "in contrast",
-    ]
-    found = sum(1 for t in transitions if t.lower() in text.lower())
-    return {
-        "paragraph_count": len(paragraphs),
-        "has_introduction": has_intro,
-        "has_conclusion": has_conclusion,
-        "transitions_found": found,
-    }
+    return {"words": words, "sentences": max(sentences, 1), "paragraphs": max(paragraphs, 1)}
 
 
 @tool
 def check_citations(text: str) -> dict:
-    """Find academic citations in APA format, e.g. (Smith, 2023) or (Johnson et al., 2024)."""
+    """Find academic citations in APA format, e.g. (Smith, 2023)."""
     pattern = r"\([A-Z][a-z]+(?:\s+et\s+al\.?)?,?\s*\d{4}\)"
     citations = re.findall(pattern, text)
     return {"count": len(citations), "citations": citations}
-```
-
-Каждый tool — чистая функция с понятным docstring. LLM использует docstring для принятия решения, когда вызывать tool. Обрати внимание: возвращаем `dict`, а не строку — структурированные данные LLM интерпретирует точнее.
-
-### Шаг 3. Графы — `app/graph/assessment_graph.py`
-
-```python
-import json
-from operator import add
-from typing import Annotated, TypedDict
-
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
-
-from app.graph.tools import check_citations, check_structure, count_words
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_BAD_EXAMPLE,
-    FEW_SHOT_GOOD_EXAMPLE,
-)
-from app.schemas.assessment import AssessmentResponse
-
-
-class SimpleState(TypedDict):
-    student_work: str
-    rubric: str
-    analysis: str
-    assessment: dict | None
-
-
-class RoutedState(TypedDict):
-    student_work: str
-    rubric: str
-    word_count: int
-    route: str
-    model_used: str
-    assessment: dict | None
 
 
 class ToolsState(TypedDict):
     student_work: str
-    rubric: str
     messages: Annotated[list, add]
-    assessment: dict | None
+    summary: str
 
 
-class ReviewedState(TypedDict):
-    student_work: str
-    rubric: str
-    analysis: str
-    draft_assessment: dict | None
-    review_notes: str
-    final_assessment: dict | None
+tools = [count_words, check_citations]
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+llm_with_tools = llm.bind_tools(tools)
+tool_node = ToolNode(tools)
 
 
-def _build_prompt():
-    return ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-
-def build_simple_graph(llm: ChatAnthropic):
-    async def prepare(state: SimpleState) -> dict:
-        work = state["student_work"]
-        word_count = len(work.split())
-        paragraphs = len([p for p in work.split("\n\n") if p.strip()])
-        return {"analysis": f"Words: {word_count}, Paragraphs: {paragraphs}"}
-
-    async def assess(state: SimpleState) -> dict:
-        prompt = _build_prompt()
-        structured_llm = llm.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "rubric": state["rubric"],
-        })
-        return {"assessment": result.model_dump()}
-
-    async def format_result(state: SimpleState) -> dict:
-        assessment = dict(state["assessment"])
-        assessment["_analysis"] = state["analysis"]
-        return {"assessment": assessment}
-
-    graph = StateGraph(SimpleState)
-    graph.add_node("prepare", prepare)
-    graph.add_node("assess", assess)
-    graph.add_node("format_result", format_result)
-    graph.add_edge(START, "prepare")
-    graph.add_edge("prepare", "assess")
-    graph.add_edge("assess", "format_result")
-    graph.add_edge("format_result", END)
-    return graph.compile()
-
-
-def build_routed_graph(llm_fast: ChatAnthropic, llm_full: ChatAnthropic):
-    async def analyze(state: RoutedState) -> dict:
-        return {"word_count": len(state["student_work"].split())}
-
-    def route_by_length(state: RoutedState) -> str:
-        if state["word_count"] < 200:
-            return "quick_assess"
-        return "full_assess"
-
-    async def quick_assess(state: RoutedState) -> dict:
-        prompt = _build_prompt()
-        structured_llm = llm_fast.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "rubric": state["rubric"],
-        })
-        return {
-            "assessment": result.model_dump(),
-            "route": "quick",
-            "model_used": llm_fast.model,
-        }
-
-    async def full_assess(state: RoutedState) -> dict:
-        prompt = _build_prompt()
-        structured_llm = llm_full.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "rubric": state["rubric"],
-        })
-        return {
-            "assessment": result.model_dump(),
-            "route": "full",
-            "model_used": llm_full.model,
-        }
-
-    graph = StateGraph(RoutedState)
-    graph.add_node("analyze", analyze)
-    graph.add_node("quick_assess", quick_assess)
-    graph.add_node("full_assess", full_assess)
-    graph.add_edge(START, "analyze")
-    graph.add_conditional_edges(
-        "analyze",
-        route_by_length,
-        {"quick_assess": "quick_assess", "full_assess": "full_assess"},
-    )
-    graph.add_edge("quick_assess", END)
-    graph.add_edge("full_assess", END)
-    return graph.compile()
-
-
-def build_tools_graph(llm: ChatAnthropic):
-    tools = [count_words, check_structure, check_citations]
-    llm_with_tools = llm.bind_tools(tools)
-    tool_node = ToolNode(tools)
-
-    async def agent(state: ToolsState) -> dict:
-        if not state["messages"]:
-            msg = HumanMessage(
-                content=(
-                    "Analyze this student work using the available tools, "
-                    "then summarize your findings.\n\n"
-                    f"Student work:\n{state['student_work']}"
-                )
-            )
-            response = await llm_with_tools.ainvoke([msg])
-            return {"messages": [msg, response]}
-        response = await llm_with_tools.ainvoke(state["messages"])
-        return {"messages": [response]}
-
-    def should_continue(state: ToolsState) -> str:
-        last = state["messages"][-1]
-        if hasattr(last, "tool_calls") and last.tool_calls:
-            return "tools"
-        return "assess"
-
-    async def assess(state: ToolsState) -> dict:
-        tool_parts = []
-        for msg in state["messages"]:
-            if isinstance(msg, ToolMessage):
-                tool_parts.append(f"{msg.name}: {msg.content}")
-        tool_summary = "\n".join(tool_parts)
-
-        system = ASSESSMENT_SYSTEM_PROMPT + "\n\n## Tool Analysis Results\n{tool_results}"
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system),
-            ("human", "Please assess the following student work:\n\n{student_work}"),
-        ]).partial(
-            few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-            few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
+def agent(state: ToolsState) -> dict:
+    if not state["messages"]:
+        msg = HumanMessage(
+            content=f"Analyze this text using available tools:\n\n{state['student_work']}"
         )
-        structured_llm = llm.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "rubric": state["rubric"],
-            "tool_results": tool_summary,
-        })
-        return {"assessment": result.model_dump()}
-
-    graph = StateGraph(ToolsState)
-    graph.add_node("agent", agent)
-    graph.add_node("tools", tool_node)
-    graph.add_node("assess", assess)
-    graph.add_edge(START, "agent")
-    graph.add_conditional_edges(
-        "agent",
-        should_continue,
-        {"tools": "tools", "assess": "assess"},
-    )
-    graph.add_edge("tools", "agent")
-    graph.add_edge("assess", END)
-    return graph.compile()
+        response = llm_with_tools.invoke([msg])
+        return {"messages": [msg, response]}
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
 
 
-def build_reviewed_graph(llm: ChatAnthropic):
-    async def analyze(state: ReviewedState) -> dict:
-        work = state["student_work"]
-        word_count = len(work.split())
-        paragraphs = len([p for p in work.split("\n\n") if p.strip()])
-        return {"analysis": f"Words: {word_count}, Paragraphs: {paragraphs}"}
-
-    async def draft_assess(state: ReviewedState) -> dict:
-        prompt = _build_prompt()
-        structured_llm = llm.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "rubric": state["rubric"],
-        })
-        return {"draft_assessment": result.model_dump()}
-
-    async def review(state: ReviewedState) -> dict:
-        review_prompt = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                "You are a senior academic reviewer. Check this assessment for "
-                "fairness, consistency between scores and feedback, and "
-                "constructiveness of suggestions. If adjustments are needed, "
-                "provide the corrected assessment.",
-            ),
-            (
-                "human",
-                "Student work:\n{student_work}\n\n"
-                "Analysis: {analysis}\n\n"
-                "Draft assessment to review:\n{draft}\n\n"
-                "Provide your reviewed final assessment.",
-            ),
-        ])
-        structured_llm = llm.with_structured_output(AssessmentResponse)
-        chain = review_prompt | structured_llm
-        result = await chain.ainvoke({
-            "student_work": state["student_work"],
-            "analysis": state["analysis"],
-            "draft": json.dumps(state["draft_assessment"], indent=2),
-        })
-        return {
-            "final_assessment": result.model_dump(),
-            "review_notes": "Reviewed for fairness, score-feedback alignment, and constructiveness",
-        }
-
-    graph = StateGraph(ReviewedState)
-    graph.add_node("analyze", analyze)
-    graph.add_node("draft_assess", draft_assess)
-    graph.add_node("review", review)
-    graph.add_edge(START, "analyze")
-    graph.add_edge("analyze", "draft_assess")
-    graph.add_edge("draft_assess", "review")
-    graph.add_edge("review", END)
-    return graph.compile()
-```
-
-Файл содержит четыре builder-функции, по одной на каждый эндпоинт:
-
-- **`build_simple_graph`** — линейный граф из трёх узлов. Демонстрирует базовые StateGraph, add_node, add_edge.
-- **`build_routed_graph`** — conditional edge на основе word count. Принимает две LLM: быструю (haiku) и мощную (sonnet).
-- **`build_tools_graph`** — ReAct-паттерн с ToolNode. Цикл `agent → tools → agent` до тех пор, пока LLM не перестанет вызывать tools.
-- **`build_reviewed_graph`** — линейный, но с двойным LLM-вызовом: draft-оценка и ревью. Ревьюер получает draft и может скорректировать баллы.
-
-### Шаг 4. Роутер — `app/api/v1/graph.py`
-
-```python
-from fastapi import APIRouter, HTTPException
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import ToolMessage
-
-from app.dependencies import LLMDep, RubricStoreDep, SettingsDep
-from app.graph.assessment_graph import (
-    build_reviewed_graph,
-    build_routed_graph,
-    build_simple_graph,
-    build_tools_graph,
-)
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.graph import (
-    GraphAssessRequest,
-    GraphAssessResponse,
-    ReviewedAssessResponse,
-    RoutedAssessResponse,
-    ToolCallInfo,
-    ToolsAssessResponse,
-)
-
-router = APIRouter(prefix="/graph", tags=["lesson-6-graph"])
+def should_continue(state: ToolsState) -> str:
+    last = state["messages"][-1]
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "tools"
+    return "summarize"
 
 
-@router.post("/assess")
-async def graph_assess(
-    request: GraphAssessRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> GraphAssessResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
-
-    graph = build_simple_graph(llm)
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "analysis": "",
-        "assessment": None,
-    })
-
-    assessment = AssessmentResponse(**result["assessment"])
-    return GraphAssessResponse(
-        assessment=assessment,
-        nodes_executed=["prepare", "assess", "format_result"],
-    )
-
-
-@router.post("/assess/routed")
-async def routed_assess(
-    request: GraphAssessRequest,
-    rubrics: RubricStoreDep,
-    settings: SettingsDep,
-) -> RoutedAssessResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
-
-    llm_fast = ChatAnthropic(
-        model="claude-3-5-haiku-20241022",
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-    llm_full = ChatAnthropic(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-
-    graph = build_routed_graph(llm_fast, llm_full)
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "word_count": 0,
-        "route": "",
-        "model_used": "",
-        "assessment": None,
-    })
-
-    assessment = AssessmentResponse(**result["assessment"])
-    return RoutedAssessResponse(
-        assessment=assessment,
-        model_used=result["model_used"],
-        word_count=result["word_count"],
-        route=result["route"],
-    )
-
-
-@router.post("/assess/tools")
-async def tools_assess(
-    request: GraphAssessRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> ToolsAssessResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
-
-    graph = build_tools_graph(llm)
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "messages": [],
-        "assessment": None,
-    })
-
-    tool_calls = []
-    for msg in result["messages"]:
+def summarize(state: ToolsState) -> dict:
+    tool_results = []
+    for msg in state["messages"]:
         if isinstance(msg, ToolMessage):
-            tool_calls.append(ToolCallInfo(
-                tool_name=msg.name,
-                tool_input="",
-                tool_output=str(msg.content),
-            ))
-
-    assessment = AssessmentResponse(**result["assessment"])
-    return ToolsAssessResponse(assessment=assessment, tool_calls=tool_calls)
+            tool_results.append(f"{msg.name}: {msg.content}")
+    return {"summary": "\n".join(tool_results)}
 
 
-@router.post("/assess/reviewed")
-async def reviewed_assess(
-    request: GraphAssessRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> ReviewedAssessResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
+graph = StateGraph(ToolsState)
+graph.add_node("agent", agent)
+graph.add_node("tools", tool_node)
+graph.add_node("summarize", summarize)
 
-    graph = build_reviewed_graph(llm)
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "analysis": "",
-        "draft_assessment": None,
-        "review_notes": "",
-        "final_assessment": None,
-    })
+graph.add_edge(START, "agent")
+graph.add_conditional_edges(
+    "agent",
+    should_continue,
+    {"tools": "tools", "summarize": "summarize"},
+)
+graph.add_edge("tools", "agent")
+graph.add_edge("summarize", END)
 
-    draft = AssessmentResponse(**result["draft_assessment"])
-    final = AssessmentResponse(**result["final_assessment"])
-    return ReviewedAssessResponse(
-        draft_assessment=draft,
-        final_assessment=final,
-        review_notes=result["review_notes"],
-    )
+app = graph.compile()
 
+result = app.invoke({
+    "student_work": (
+        "According to Smith (2023), artificial intelligence is transforming education. "
+        "However, concerns remain valid (Brown, 2023).\n\n"
+        "The first major impact is personalized learning.\n\n"
+        "In conclusion, AI's potential to improve outcomes is significant."
+    ),
+    "messages": [],
+    "summary": "",
+})
 
-def _resolve_rubric(rubric_id, rubrics):
-    rid = rubric_id or "essay_default"
-    if rid not in rubrics:
-        raise HTTPException(status_code=404, detail=f"Rubric '{rid}' not found")
-    return rubrics[rid]
-
-
-def _format_rubric(rubric):
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
+print("Tool results:")
+print(result["summary"])
+print(f"\nTotal messages in conversation: {len(result['messages'])}")
 ```
 
-Каждый эндпоинт:
-1. Резолвит рубрику через `RubricStoreDep`
-2. Строит граф через соответствующую builder-функцию
-3. Запускает граф через `ainvoke`
-4. Маппит результат в response-схему
+`messages: Annotated[list, add]` — reducer, который конкатенирует списки вместо замены. Без него каждый node перезаписывал бы всю историю сообщений.
 
-Для `/assess/routed` используется `SettingsDep` для доступа к API-ключу и конфигурации — два LLM-экземпляра создаются с разными моделями.
+### Пример 4. Human-in-the-loop с interrupt_before
 
-### Шаг 5. Регистрация в `app/api/router.py`
+Граф останавливается перед узлом `publish`, давая возможность проверить результат. Для возобновления нужен checkpointer.
 
 ```python
-from fastapi import APIRouter
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
-from app.api.v1 import assessment, graph, rubrics
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(graph.router)
+class ReviewState(TypedDict):
+    text: str
+    draft: str
+    published: str
+
+
+def create_draft(state: ReviewState) -> dict:
+    return {"draft": f"Draft assessment of: {state['text'][:50]}..."}
+
+
+def publish(state: ReviewState) -> dict:
+    return {"published": f"PUBLISHED: {state['draft']}"}
+
+
+graph = StateGraph(ReviewState)
+graph.add_node("create_draft", create_draft)
+graph.add_node("publish", publish)
+
+graph.add_edge(START, "create_draft")
+graph.add_edge("create_draft", "publish")
+graph.add_edge("publish", END)
+
+app = graph.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=["publish"],
+)
+
+config = {"configurable": {"thread_id": "review-1"}}
+
+result = app.invoke(
+    {"text": "Student essay about climate change...", "draft": "", "published": ""},
+    config,
+)
+
+snapshot = app.get_state(config)
+print(f"Draft: {snapshot.values['draft']}")
+print(f"Next node: {snapshot.next}")
+print(f"Published: {snapshot.values.get('published', '(not yet)')}")
+
+final = app.invoke(None, config)
+print(f"\nAfter resume — published: {final['published']}")
 ```
 
-### Шаг 6. Тестирование
+`interrupt_before=["publish"]` останавливает граф перед выполнением `publish`. Между паузой и возобновлением можно проверить или изменить state:
 
-Установи зависимости и запусти сервер:
-
-```bash
-uv pip install -e ".[agents]"
-uvicorn app.main:app --reload
+```python
+app.update_state(config, {"draft": "Corrected draft by reviewer"})
+final = app.invoke(None, config)
+print(final["published"])
 ```
-
-**Линейный граф (prepare → assess → format):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/graph/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of artificial intelligence on modern education is both profound and multifaceted. AI-powered tutoring systems, as demonstrated by Smith (2023), can provide personalized learning experiences that adapt to individual student needs. This essay examines three key areas where AI transforms education: adaptive learning, automated assessment, and accessibility improvements.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-**Conditional routing (short → haiku, long → sonnet):**
-
-Короткая работа (<200 слов) — маршрутизируется на быструю модель:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/graph/assess/routed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "AI is changing education. Computers help students learn. This is a short essay about technology.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-Длинная работа (>200 слов) — маршрутизируется на мощную модель:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/graph/assess/routed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The integration of artificial intelligence into educational systems represents a paradigm shift in how knowledge is transmitted and assessed. According to recent meta-analyses by Johnson et al. (2024), AI-powered adaptive learning platforms have demonstrated consistent improvements in student outcomes across diverse educational contexts. This essay examines the transformative potential of AI in three critical areas: personalized learning pathways, automated formative assessment, and equitable access to quality education. The first area, personalized learning, leverages machine learning algorithms to create individualized educational experiences. Unlike traditional one-size-fits-all approaches, AI systems can analyze student performance data in real-time and adjust content difficulty, pacing, and presentation style accordingly (Williams, 2023). The second area concerns automated assessment, where natural language processing enables immediate, detailed feedback on student work. The third area addresses accessibility, where AI translation and text-to-speech tools break down barriers for students with diverse needs.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-Обрати внимание на поля `route` и `model_used` в ответе — они показывают, какой путь был выбран.
-
-**Tool calling (LLM решает, какие tools вызвать):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/graph/assess/tools \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "According to Smith (2023) and Johnson et al. (2024), artificial intelligence is transforming education. However, concerns about academic integrity remain valid (Brown, 2023).\n\nThe first major impact is personalized learning. AI tutoring systems adapt to individual student needs.\n\nIn conclusion, while AI presents challenges, its potential to improve educational outcomes is significant.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-В ответе `tool_calls` покажет, какие tools LLM решила вызвать: `count_words` для подсчёта слов, `check_structure` для проверки структуры, `check_citations` для поиска цитирований.
-
-**Reviewed assessment (draft → review):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/graph/assess/reviewed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is the defining crisis of our generation. The Intergovernmental Panel on Climate Change (IPCC, 2023) warns that without immediate action, global temperatures will rise by 2.5 degrees Celsius by 2100. This essay argues that a combination of carbon pricing, renewable energy investment, and reforestation offers the most viable path to mitigation.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-Сравни `draft_assessment` и `final_assessment` — ревьюер может скорректировать баллы, если считает их несправедливыми или непоследовательными.
 
 ### Связь с теорией
 
-| Эндпоинт | Теоретический концепт | Что демонстрирует |
-|----------|----------------------|-------------------|
-| `POST /assess` | StateGraph, nodes, edges (разделы 2, 3) | Базовый линейный граф: define state → add nodes → add edges → compile → invoke |
-| `POST /assess/routed` | Conditional edges (раздел 5) | Router-функция анализирует state и выбирает ветку обработки |
-| `POST /assess/tools` | Tool calling, ToolNode, reducers (разделы 4, 6) | ReAct-цикл: agent → tools → agent; `messages: Annotated[list, add]` накапливает историю |
-| `POST /assess/reviewed` | Multi-node pipeline (раздел 3) | Двойной LLM-вызов с разными промптами; draft-node и review-node обмениваются данными через state |
+| Пример | Теоретический концепт | Что демонстрирует |
+|--------|----------------------|-------------------|
+| 1. Линейный граф | StateGraph, nodes, edges (разделы 2, 3) | Базовый граф: define state → add nodes → add edges → compile → invoke |
+| 2. Conditional routing | Conditional edges (раздел 5) | Router-функция анализирует state и выбирает ветку обработки |
+| 3. Tool calling | Tool calling, ToolNode, reducers (разделы 4, 6) | ReAct-цикл: agent → tools → agent; `messages: Annotated[list, add]` накапливает историю |
+| 4. Human-in-the-loop | interrupt_before, checkpointer (разделы 7, 8) | Пауза перед узлом, проверка state, возобновление выполнения |
 
-Граф-код в `assessment_graph.py` показывает четыре паттерна LangGraph от простого к сложному: линейный → условный → циклический → многошаговый. Каждый следующий эндпоинт добавляет один новый концепт.
+Четыре паттерна LangGraph от простого к сложному: линейный → условный → циклический → с паузами. Каждый следующий пример добавляет один новый концепт.
 
 ---
 
@@ -1199,8 +875,8 @@ curl -s -X POST http://localhost:8000/api/v1/graph/assess/reviewed \
 - [ ] Зачем checkpointer? Почему interrupt не работает без него?
 - [ ] Как `interrupt_before` реализует human-in-the-loop? Как возобновить граф после паузы?
 - [ ] Почему node должен возвращать только изменённые поля, а не весь state?
-- [ ] Запусти `/assess/routed` с коротким и длинным эссе — какие модели были выбраны?
-- [ ] Запусти `/assess/tools` — какие tools вызвала LLM и почему?
+- [ ] Запусти пример 2 с коротким и длинным текстом — какой route был выбран в каждом случае?
+- [ ] Запусти пример 3 — какие tools вызвала LLM и почему?
 
 ---
 
@@ -1280,7 +956,7 @@ def count_words(text: str) -> int:
     return len(text.split())
 ```
 
-### 6. Sync-функция для LLM-вызова в node
+### 6. Sync-функция для LLM-вызова в async-контексте
 
 ```python
 def assess_node(state):
@@ -1288,7 +964,7 @@ def assess_node(state):
     return {"assessment": result}
 ```
 
-Sync `invoke` блокирует event loop FastAPI. Используй `async def` и `ainvoke`:
+Sync `invoke` блокирует event loop. Если граф запускается через `ainvoke` или `astream`, используй `async def` и `ainvoke` внутри node'ов:
 
 ```python
 async def assess_node(state):

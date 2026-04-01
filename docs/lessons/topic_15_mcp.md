@@ -1,8 +1,7 @@
 # Тема 15: MCP (Model Context Protocol) — стандарт интеграции LLM с инструментами
 
 > **Пререквизиты:** [Тема 11 (Tool Use)](topic_11_tool_use.md), рекомендуется [Тема 6 (LangGraph)](topic_06_langgraph_agents.md)
-> **Что добавляем в проект:** `mcp_servers/rubrics_server.py`, `mcp_servers/assessment_server.py`, `app/services/mcp_client.py`, `app/api/v1/mcp_endpoints.py`, `app/schemas/mcp.py`
-> **Зависимости:** `mcp[cli]`, `langchain-mcp-adapters`, `httpx`
+> **Зависимости:** `mcp[cli]`, `langchain-mcp-adapters`
 
 ---
 
@@ -46,7 +45,7 @@
 
 MCP определяет три роли:
 
-**Host** — приложение верхнего уровня, с которым взаимодействует пользователь. Примеры: Claude Desktop, Cursor, твой FastAPI-сервер. Host управляет жизненным циклом клиентов, решает какие серверы подключать, контролирует политики безопасности.
+**Host** — приложение верхнего уровня, с которым взаимодействует пользователь. Примеры: Claude Desktop, Cursor, твой Python-скрипт. Host управляет жизненным циклом клиентов, решает какие серверы подключать, контролирует политики безопасности.
 
 **Client** — компонент внутри Host, который поддерживает 1:1 соединение с одним MCP-сервером. Говорит на JSON-RPC 2.0. Один Host может создать несколько клиентов для подключения к разным серверам одновременно.
 
@@ -54,7 +53,7 @@ MCP определяет три роли:
 
 ```
 ┌─────────────────────────────────────────┐
-│              Host (FastAPI app)          │
+│              Host (Application)          │
 │                                         │
 │  ┌──────────┐  ┌──────────┐             │
 │  │ Client A │  │ Client B │             │
@@ -874,60 +873,11 @@ async with MultiServerMCPClient(
 
 ---
 
-## Практика: MCP-серверы + роутер `/api/v1/mcp`
+## Практика
 
-В этой практике мы создадим два MCP-сервера (рубрики и оценки), клиент для подключения к ним и FastAPI роутер, который использует MCP tools через LangChain агента.
+В этой практике мы создадим два MCP-сервера, подключимся к ним клиентом и интегрируем с LangChain-агентом. Каждый пример — автономный скрипт.
 
-### Шаг 1. Схемы — `app/schemas/mcp.py`
-
-Определим Pydantic-модели для запросов и ответов MCP-эндпоинтов.
-
-```python
-from pydantic import BaseModel, Field
-
-
-class MCPToolInfo(BaseModel):
-    name: str = Field(description="Tool name")
-    description: str | None = Field(default=None, description="Tool description")
-    input_schema: dict = Field(default_factory=dict, description="JSON Schema for tool inputs")
-
-
-class MCPToolsResponse(BaseModel):
-    server: str = Field(description="MCP server name")
-    tools: list[MCPToolInfo] = Field(default_factory=list)
-
-
-class MCPAssessRequest(BaseModel):
-    student_work: str = Field(description="Student work to assess")
-    rubric_name: str = Field(default="essay", description="Rubric name to use")
-
-
-class MCPAssessResponse(BaseModel):
-    result: str = Field(description="Assessment result from LLM agent")
-    tools_used: list[str] = Field(default_factory=list, description="Names of MCP tools invoked")
-
-
-class MCPResourceRequest(BaseModel):
-    uri: str = Field(description="MCP resource URI, e.g. rubric://essay")
-
-
-class MCPResourceResponse(BaseModel):
-    uri: str = Field(description="Requested URI")
-    content: str = Field(description="Resource content")
-    mime_type: str | None = Field(default=None, description="MIME type of the resource")
-
-
-class MCPMultiServerRequest(BaseModel):
-    query: str = Field(description="User query for the multi-server agent")
-
-
-class MCPMultiServerResponse(BaseModel):
-    result: str = Field(description="Agent response")
-    tools_used: list[str] = Field(default_factory=list)
-    servers_used: list[str] = Field(default_factory=list, description="MCP servers that provided tools")
-```
-
-### Шаг 2. MCP Server: Рубрики — `mcp_servers/rubrics_server.py`
+### Пример 1. MCP-сервер: рубрики — `rubrics_server.py`
 
 Сервер предоставляет tools для поиска и получения рубрик, resources для прямого доступа к данным рубрик, и prompt для формирования оценочных запросов.
 
@@ -1104,13 +1054,13 @@ if __name__ == "__main__":
 | Resource | `rubrics://list` | Список всех доступных рубрик |
 | Prompt | `assess` | Промпт для оценки работы с аргументами |
 
-Проверка через MCP Inspector:
+Тестирование через MCP Inspector:
 
 ```bash
-mcp dev mcp_servers/rubrics_server.py
+mcp dev rubrics_server.py
 ```
 
-### Шаг 3. MCP Server: Оценки — `mcp_servers/assessment_server.py`
+### Пример 2. MCP-сервер: оценки — `assessment_server.py`
 
 Второй сервер отвечает за оценку студенческих работ и историю оценок.
 
@@ -1330,361 +1280,211 @@ if __name__ == "__main__":
 | Resource | `assessment://{id}` | Данные оценки по ID |
 | Resource | `assessments://recent` | Список недавних оценок |
 
-Проверка:
+Тестирование:
 
 ```bash
-mcp dev mcp_servers/assessment_server.py
+mcp dev assessment_server.py
 ```
 
-### Шаг 4. MCP Client Service — `app/services/mcp_client.py`
+### Пример 3. MCP-клиент: подключение и discovery
 
-Сервис инкапсулирует подключение к MCP-серверам и загрузку tools. Используется как async context manager.
+Скрипт подключается к rubrics-серверу, получает список tools, resources и prompts, вызывает tool, читает resource и получает prompt.
 
 ```python
-import sys
-from contextlib import asynccontextmanager
-from pathlib import Path
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
+SERVER_PARAMS = StdioServerParameters(
+    command="python",
+    args=["rubrics_server.py"],
+)
+
+
+async def main():
+    async with stdio_client(SERVER_PARAMS) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+
+            tools = await session.list_tools()
+            for tool in tools.tools:
+                print(f"Tool: {tool.name} — {tool.description}")
+
+            resources = await session.list_resources()
+            for resource in resources.resources:
+                print(f"Resource: {resource.uri} — {resource.name}")
+
+            result = await session.call_tool("search_rubrics", {"query": "essay"})
+            print(f"\nSearch result:\n{result.content[0].text}")
+
+            resource_content = await session.read_resource("rubric://essay")
+            print(f"\nResource content:\n{resource_content.contents[0].text}")
+
+            prompts = await session.list_prompts()
+            for prompt in prompts.prompts:
+                print(f"\nPrompt: {prompt.name} — {prompt.description}")
+
+            prompt_result = await session.get_prompt(
+                "assess",
+                {"student_work": "Example essay text.", "rubric_name": "essay"},
+            )
+            for msg in prompt_result.messages:
+                print(f"\nPrompt message ({msg.role}):\n{msg.content.text}")
+
+
+asyncio.run(main())
+```
+
+Lifecycle подключения:
+
+1. `stdio_client(SERVER_PARAMS)` — запускает subprocess с MCP-сервером, возвращает потоки
+2. `ClientSession(read, write)` — создаёт JSON-RPC сессию
+3. `session.initialize()` — handshake: обмен capabilities
+4. `list_tools()` / `list_resources()` / `list_prompts()` — discovery примитивов
+5. `call_tool(name, args)` — вызов tool
+6. `read_resource(uri)` — чтение resource по URI
+7. `get_prompt(name, args)` — получение промпта с аргументами
+8. При выходе из `async with` — subprocess завершается, ресурсы освобождаются
+
+### Пример 4. LangChain + MCP: агент с одним сервером
+
+`load_mcp_tools` конвертирует MCP tools в LangChain-совместимые `BaseTool`, которые можно использовать в `create_react_agent`.
+
+```python
+import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-
-RUBRICS_SERVER = StdioServerParameters(
-    command=sys.executable,
-    args=[str(PROJECT_ROOT / "mcp_servers" / "rubrics_server.py")],
-    env=None,
-)
-
-ASSESSMENT_SERVER = StdioServerParameters(
-    command=sys.executable,
-    args=[str(PROJECT_ROOT / "mcp_servers" / "assessment_server.py")],
-    env=None,
-)
-
-MULTI_SERVER_CONFIG = {
-    "rubrics": {
-        "command": sys.executable,
-        "args": [str(PROJECT_ROOT / "mcp_servers" / "rubrics_server.py")],
-        "transport": "stdio",
-    },
-    "assessment": {
-        "command": sys.executable,
-        "args": [str(PROJECT_ROOT / "mcp_servers" / "assessment_server.py")],
-        "transport": "stdio",
-    },
-}
-
-
-@asynccontextmanager
-async def connect_to_server(server_params: StdioServerParameters):
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            yield session
-
-
-@asynccontextmanager
-async def get_mcp_tools(server_params: StdioServerParameters):
-    async with connect_to_server(server_params) as session:
-        tools = await load_mcp_tools(session)
-        yield tools, session
-
-
-@asynccontextmanager
-async def get_multi_server_client():
-    async with MultiServerMCPClient(MULTI_SERVER_CONFIG) as client:
-        yield client
-```
-
-Ключевые решения:
-
-- `sys.executable` — используем тот же Python-интерпретатор, в котором работает FastAPI. Это гарантирует, что MCP-сервер найдёт все установленные библиотеки.
-- `PROJECT_ROOT` — абсолютный путь к корню проекта, чтобы пути к серверам работали из любой рабочей директории.
-- Каждая функция — `asynccontextmanager`. Это обеспечивает корректное закрытие соединений: при выходе из `async with` subprocess завершается, ресурсы освобождаются.
-- `MULTI_SERVER_CONFIG` — конфигурация для `MultiServerMCPClient`, объединяющего оба сервера.
-
-### Шаг 5. Router — `app/api/v1/mcp_endpoints.py`
-
-Роутер предоставляет 4 эндпоинта, каждый из которых демонстрирует разный аспект MCP.
-
-```python
-from fastapi import APIRouter, HTTPException
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
 
-from app.config import get_settings
-from app.schemas.mcp import (
-    MCPAssessRequest,
-    MCPAssessResponse,
-    MCPMultiServerRequest,
-    MCPMultiServerResponse,
-    MCPResourceRequest,
-    MCPResourceResponse,
-    MCPToolInfo,
-    MCPToolsResponse,
-)
-from app.services.mcp_client import (
-    ASSESSMENT_SERVER,
-    RUBRICS_SERVER,
-    connect_to_server,
-    get_mcp_tools,
-    get_multi_server_client,
+model = ChatAnthropic(model="claude-sonnet-4-20250514")
+
+server_params = StdioServerParameters(
+    command="python",
+    args=["rubrics_server.py"],
 )
 
-router = APIRouter(prefix="/mcp", tags=["mcp"])
 
+async def main():
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
 
-def _get_model() -> ChatAnthropic:
-    settings = get_settings()
-    return ChatAnthropic(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-    )
+            tools = await load_mcp_tools(session)
+            print(f"Loaded {len(tools)} tools: {[t.name for t in tools]}")
 
-
-@router.post("/tools")
-async def list_mcp_tools(server: str = "rubrics") -> MCPToolsResponse:
-    server_params = RUBRICS_SERVER if server == "rubrics" else ASSESSMENT_SERVER
-    server_name = server
-
-    try:
-        async with connect_to_server(server_params) as session:
-            result = await session.list_tools()
-            tools = [
-                MCPToolInfo(
-                    name=tool.name,
-                    description=tool.description,
-                    input_schema=tool.inputSchema if tool.inputSchema else {},
-                )
-                for tool in result.tools
-            ]
-            return MCPToolsResponse(server=server_name, tools=tools)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect to MCP server: {e}")
-
-
-@router.post("/assess")
-async def mcp_assess(request: MCPAssessRequest) -> MCPAssessResponse:
-    model = _get_model()
-
-    try:
-        async with get_mcp_tools(RUBRICS_SERVER) as (tools, session):
             agent = create_react_agent(model, tools)
-
             result = await agent.ainvoke(
                 {
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"First, get the '{request.rubric_name}' rubric using the get_rubric tool. "
-                            f"Then provide a detailed assessment of this student work based on "
-                            f"the rubric criteria:\n\n{request.student_work}",
+                            "content": "Find rubrics about essays and show the full essay rubric",
                         }
                     ]
                 }
             )
 
-            tools_used = []
-            response_text = ""
             for msg in result["messages"]:
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    tools_used.extend(tc["name"] for tc in msg.tool_calls)
-                if hasattr(msg, "content") and isinstance(msg.content, str):
-                    response_text = msg.content
-
-            return MCPAssessResponse(result=response_text, tools_used=tools_used)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"MCP assessment failed: {e}")
+                    for tc in msg.tool_calls:
+                        print(f"Tool call: {tc['name']}({tc['args']})")
+                if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+                    print(f"\n{msg.type}: {msg.content}")
 
 
-@router.post("/resources")
-async def read_mcp_resource(request: MCPResourceRequest) -> MCPResourceResponse:
-    is_assessment = request.uri.startswith("assessment://") or request.uri.startswith("assessments://")
-    server_params = ASSESSMENT_SERVER if is_assessment else RUBRICS_SERVER
-
-    try:
-        async with connect_to_server(server_params) as session:
-            result = await session.read_resource(request.uri)
-
-            content = ""
-            mime_type = None
-            if result.contents:
-                content = result.contents[0].text if hasattr(result.contents[0], "text") else str(result.contents[0])
-                mime_type = result.contents[0].mimeType if hasattr(result.contents[0], "mimeType") else None
-
-            return MCPResourceResponse(uri=request.uri, content=content, mime_type=mime_type)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read MCP resource: {e}")
-
-
-@router.post("/multi-server")
-async def multi_server_agent(request: MCPMultiServerRequest) -> MCPMultiServerResponse:
-    model = _get_model()
-
-    try:
-        async with get_multi_server_client() as client:
-            tools = client.get_tools()
-            tool_names_by_server = {}
-            for tool in tools:
-                server_name = getattr(tool, "server_name", "unknown")
-                tool_names_by_server.setdefault(server_name, []).append(tool.name)
-
-            agent = create_react_agent(model, tools)
-
-            result = await agent.ainvoke(
-                {"messages": [{"role": "user", "content": request.query}]}
-            )
-
-            tools_used = []
-            response_text = ""
-            for msg in result["messages"]:
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    tools_used.extend(tc["name"] for tc in msg.tool_calls)
-                if hasattr(msg, "content") and isinstance(msg.content, str):
-                    response_text = msg.content
-
-            servers_used = list({
-                server
-                for server, tool_list in tool_names_by_server.items()
-                for used in tools_used
-                if used in tool_list
-            })
-
-            return MCPMultiServerResponse(
-                result=response_text,
-                tools_used=tools_used,
-                servers_used=servers_used,
-            )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Multi-server agent failed: {e}")
+asyncio.run(main())
 ```
 
-**Как каждый эндпоинт связан с теорией:**
+Что делает `load_mcp_tools(session)`:
 
-| Эндпоинт | Концепция из теории | Что демонстрирует |
-|---|---|---|
-| `POST /mcp/tools` | §2 (Architecture), §3 (Tools) | Discovery: подключение к серверу и получение списка tools |
-| `POST /mcp/assess` | §5 (Server), §7 (LangChain integration) | LangGraph агент, использующий MCP tools из одного сервера |
-| `POST /mcp/resources` | §3 (Resources) | Чтение MCP resources по URI из разных серверов |
-| `POST /mcp/multi-server` | §7 (MultiServerMCPClient) | Агент с tools из двух серверов одновременно |
+1. Вызывает `session.list_tools()` на MCP-сервере
+2. Для каждого MCP tool создаёт `langchain_core.tools.BaseTool`
+3. Конвертирует `inputSchema` в Pydantic-совместимые аргументы
+4. Оборачивает `session.call_tool()` в `_arun()` методы
 
-### Шаг 6. Регистрация + Тестирование
+Результат — обычные LangChain tools для `bind_tools()`, `create_react_agent()` или любого другого компонента LangChain.
 
-Регистрация роутера в `app/api/router.py`:
+### Пример 5. MultiServerMCPClient: агент с несколькими серверами
+
+`MultiServerMCPClient` управляет подключениями к нескольким MCP-серверам и объединяет их tools в единый список.
 
 ```python
-from fastapi import APIRouter
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_anthropic import ChatAnthropic
+from langgraph.prebuilt import create_react_agent
 
-from app.api.v1 import assessment, rubrics, prompts, mcp_endpoints
+model = ChatAnthropic(model="claude-sonnet-4-20250514")
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(mcp_endpoints.router)
+
+async def main():
+    async with MultiServerMCPClient(
+        {
+            "rubrics": {
+                "command": "python",
+                "args": ["rubrics_server.py"],
+                "transport": "stdio",
+            },
+            "assessment": {
+                "command": "python",
+                "args": ["assessment_server.py"],
+                "transport": "stdio",
+            },
+        }
+    ) as client:
+        tools = client.get_tools()
+        print(f"Tools from all servers: {[t.name for t in tools]}")
+
+        agent = create_react_agent(model, tools)
+        result = await agent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Find the 'essay' rubric and assess this work: "
+                        "'Climate change is caused by greenhouse gases. "
+                        "Governments must implement carbon taxes and invest "
+                        "in renewable energy.'",
+                    }
+                ]
+            }
+        )
+
+        tools_used = []
+        for msg in result["messages"]:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                tools_used.extend(tc["name"] for tc in msg.tool_calls)
+            if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+                print(f"\n{msg.type}: {msg.content}")
+
+        print(f"\nTools used: {tools_used}")
+
+
+asyncio.run(main())
 ```
 
-Установка зависимостей:
+`MultiServerMCPClient`:
 
-```bash
-pip install "mcp[cli]" langchain-mcp-adapters httpx
-```
+1. Создаёт `ClientSession` для каждого сервера
+2. Инициализирует все соединения параллельно
+3. `get_tools()` возвращает объединённый список LangChain tools со всех серверов
+4. При выходе из context manager корректно закрывает все соединения
 
-Запуск сервера:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-**Тестирование MCP серверов отдельно:**
-
-```bash
-mcp dev mcp_servers/rubrics_server.py
-```
-
-```bash
-mcp dev mcp_servers/assessment_server.py
-```
-
-**POST /mcp/tools** — список tools с rubrics-сервера:
-
-```bash
-curl -s -X POST "http://localhost:8000/api/v1/mcp/tools?server=rubrics" \
-  -H "Content-Type: application/json" | python -m json.tool
-```
-
-Ожидаемый результат: JSON с двумя tools — `search_rubrics` и `get_rubric`, каждый с описанием и `input_schema`.
-
-**POST /mcp/tools** — список tools с assessment-сервера:
-
-```bash
-curl -s -X POST "http://localhost:8000/api/v1/mcp/tools?server=assessment" \
-  -H "Content-Type: application/json" | python -m json.tool
-```
-
-Ожидаемый результат: три tools — `assess_work`, `get_assessment_history`, `compare_assessments`.
-
-**POST /mcp/assess** — оценка через MCP + LangGraph агента:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/mcp/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a significant global challenge. Rising temperatures lead to melting ice caps, which causes sea levels to rise. Governments must implement carbon taxes and invest in renewable energy sources. Scientific evidence clearly shows that human activities are the primary driver of climate change. Without immediate action, future generations will face severe environmental consequences.",
-    "rubric_name": "essay"
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `result` содержит развёрнутую оценку по каждому критерию рубрики. `tools_used` содержит `["get_rubric"]` — агент сначала получил рубрику, затем оценил работу.
-
-**POST /mcp/resources** — чтение ресурса рубрики:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/mcp/resources \
-  -H "Content-Type: application/json" \
-  -d '{"uri": "rubric://essay"}' | python -m json.tool
-```
-
-Ожидаемый результат: JSON с полными данными рубрики `essay` — все критерии, max_score, weight.
-
-**POST /mcp/resources** — список всех рубрик:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/mcp/resources \
-  -H "Content-Type: application/json" \
-  -d '{"uri": "rubrics://list"}' | python -m json.tool
-```
-
-**POST /mcp/multi-server** — агент с инструментами из двух серверов:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/mcp/multi-server \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "Find the essay rubric, then assess this student work: \"The mitochondria is the powerhouse of the cell. It produces ATP through cellular respiration. This process involves glycolysis, the Krebs cycle, and oxidative phosphorylation.\" Use the essay rubric for assessment."
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: агент использует `get_rubric` из rubrics-сервера и `assess_work` из assessment-сервера. `tools_used` содержит оба tool, `servers_used` — оба сервера.
-
-### Связь с теорией
+### Связь примеров с теорией
 
 | Концепция | Где в коде | Секция теории |
 |---|---|---|
-| MCP Server с FastMCP | `mcp_servers/rubrics_server.py` | §5 |
+| MCP Server с FastMCP | `rubrics_server.py`, `assessment_server.py` | §5 |
 | Tools, Resources, Prompts | Оба MCP-сервера | §3 |
-| stdio транспорт | `app/services/mcp_client.py` → `StdioServerParameters` | §4 |
-| ClientSession lifecycle | `connect_to_server()` context manager | §6 |
-| load_mcp_tools → LangChain | `get_mcp_tools()` → `load_mcp_tools()` | §7 |
-| MultiServerMCPClient | `get_multi_server_client()`, endpoint `/multi-server` | §7 |
-| Capability discovery | `POST /mcp/tools` → `session.list_tools()` | §2 |
-| Resource URI addressing | `POST /mcp/resources` → `session.read_resource(uri)` | §3 |
-| Input validation | `assess_work()` — проверка длины и пустоты | §8 |
-| Error handling | `try/except` в эндпоинтах, HTTPException | §8 |
+| stdio транспорт | `StdioServerParameters` в клиентских скриптах | §4 |
+| ClientSession lifecycle | Пример 3 — подключение, discovery, вызовы | §6 |
+| load_mcp_tools → LangChain | Пример 4 — `load_mcp_tools(session)` | §7 |
+| MultiServerMCPClient | Пример 5 — агент с двумя серверами | §7 |
+| Capability discovery | Пример 3 — `list_tools()`, `list_resources()`, `list_prompts()` | §2 |
+| Resource URI addressing | Пример 3 — `read_resource("rubric://essay")` | §3 |
+| Input validation | `assess_work()` в assessment-сервере — проверка длины и пустоты | §8 |
 
 ---
 
@@ -1795,7 +1595,7 @@ def read_file(path: str) -> str:
 
 ### 6. Не тестировать MCP server отдельно от клиента
 
-Если тестировать MCP server только через полный pipeline (FastAPI → MCP Client → MCP Server → LLM → ответ), отладка ошибок становится крайне сложной. Невозможно понять, что сломалось: сервер, клиент, транспорт или LLM.
+Если тестировать MCP server только через полный pipeline (Приложение → MCP Client → MCP Server → LLM → ответ), отладка ошибок становится крайне сложной. Невозможно понять, что сломалось: сервер, клиент, транспорт или LLM.
 
 Всегда тестируйте MCP-сервер отдельно:
 
@@ -1803,7 +1603,7 @@ def read_file(path: str) -> str:
 mcp dev mcp_servers/rubrics_server.py
 ```
 
-MCP Inspector позволяет вызвать каждый tool, прочитать каждый resource и получить каждый prompt вручную — без клиента, без LLM, без FastAPI. Убедитесь, что сервер работает корректно, прежде чем интегрировать с остальной системой.
+MCP Inspector позволяет вызвать каждый tool, прочитать каждый resource и получить каждый prompt вручную — без клиента и без LLM. Убедитесь, что сервер работает корректно, прежде чем интегрировать с остальной системой.
 
 ---
 

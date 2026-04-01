@@ -1,7 +1,6 @@
 # Тема 2: LangChain Core + LCEL
 
 > **Пререквизиты:** [Тема 1: Промпт-инжиниринг](topic_01_prompt_engineering.md)
-> **Что добавим в проект:** `app/api/v1/chains.py` — роутер с 4 эндпоинтами
 > **Зависимости:** `langchain-core`, `langchain-anthropic`
 
 ---
@@ -15,7 +14,7 @@ LCEL (LangChain Expression Language) построен на одной абстр
 | Метод | Описание |
 |-------|----------|
 | `invoke(input)` | Синхронный вызов. Отправляет input, ждёт полный результат. |
-| `ainvoke(input)` | Асинхронный invoke. Для FastAPI и async-кода. |
+| `ainvoke(input)` | Асинхронный invoke. Для async-кода. |
 | `stream(input)` | Генератор, выдаёт результат по частям (токенам). |
 | `astream(input)` | Асинхронный stream. |
 | `batch(inputs)` | Параллельный вызов на списке входов. |
@@ -89,13 +88,13 @@ chain = prompt | model | parser
 - **Async**: `chain.ainvoke()` вызывает `ainvoke()` на каждом шаге последовательно.
 - **Batch**: `chain.batch(inputs)` обрабатывает каждый input через всю цепочку параллельно.
 
-В проекте:
+Пример:
 
 ```python
 chain = prompt | structured_llm
 ```
 
-Здесь 2 Runnables: `prompt` (ChatPromptTemplate) → messages, `structured_llm` (ChatAnthropic + structured output) → AssessmentResponse.
+Здесь 2 Runnables: `prompt` (ChatPromptTemplate) → messages, `structured_llm` (ChatAnthropic + structured output) → типизированный ответ.
 
 #### Отладка цепочек
 
@@ -421,12 +420,12 @@ results = await chain.abatch(
 
 В 2024+ **все современные модели** — это ChatModel. BaseLLM — legacy для старых completion-моделей. В новом коде используй только ChatModel.
 
-### 11. Как устроен chain в проекте
+### 11. Типовая структура chain
 
 ```python
 def build_assessment_chain(llm: ChatAnthropic) -> Runnable:
     prompt = ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
+        ("system", SYSTEM_PROMPT),
         ("human", "Please assess:\n\n{student_work}"),
     ]).partial(few_shot_good=..., few_shot_bad=...)
 
@@ -436,22 +435,20 @@ def build_assessment_chain(llm: ChatAnthropic) -> Runnable:
 
 Здесь 2 Runnables в цепочке:
 1. `prompt` — `ChatPromptTemplate` → принимает `dict`, возвращает `list[BaseMessage]`
-2. `structured_llm` — `ChatAnthropic` + structured output → принимает `list[BaseMessage]`, возвращает `AssessmentResponse`
+2. `structured_llm` — `ChatAnthropic` + structured output → принимает `list[BaseMessage]`, возвращает типизированный объект
 
-### 12. invoke vs ainvoke в FastAPI
+### 12. invoke vs ainvoke
 
-FastAPI — async framework. Используй `ainvoke`:
+В async-контексте используй `ainvoke`:
 
 ```python
-@router.post("")
-async def assess_work(request: AssessmentRequest, chain: ChainDep):
-    result = await chain.ainvoke({"student_work": request.student_work, "rubric": rubric_text})
-    return result
+async def assess(text: str) -> AssessmentResponse:
+    return await chain.ainvoke({"student_work": text})
 ```
 
-Если использовать `invoke` в async endpoint — заблокируешь event loop. FastAPI запустит его в threadpool, но это хуже, чем нативный `ainvoke`.
+Если использовать `invoke` внутри `async def` — заблокируешь event loop. Python запустит его в threadpool, но это менее эффективно, чем нативный `ainvoke`.
 
-Правило: в `async def` endpoint → `ainvoke` / `abatch` / `astream`. В `def` endpoint (sync) → `invoke` / `batch` / `stream`. Никогда не смешивай.
+Правило: в `async def` → `ainvoke` / `abatch` / `astream`. В обычных функциях → `invoke` / `batch` / `stream`. Не смешивай sync- и async-вызовы.
 
 ---
 
@@ -747,462 +744,227 @@ for r in results_safe:
 
 ---
 
-## Практика: роутер `/api/v1/chains`
+## Практика
 
-В этом разделе мы создадим FastAPI-роутер с 4 эндпоинтами, каждый из которых демонстрирует одну из LCEL-концепций.
+В этом разделе — 4 самостоятельных примера, каждый демонстрирует одну LCEL-концепцию. Код можно запускать в Jupyter-ноутбуке или как обычный Python-скрипт.
 
-| Эндпоинт | Концепция | Что проверяем |
+| Пример | Концепция | Что проверяем |
 |---|---|---|
-| `POST /enriched` | RunnablePassthrough.assign() | Обогащение данных метаинформацией |
-| `POST /parallel` | RunnableParallel | Параллельная оценка по 2 рубрикам |
-| `POST /batch` | chain.abatch() | Пакетная оценка нескольких работ |
-| `POST /with-fallback` | .with_fallbacks() | Отказоустойчивость с fallback-моделью |
+| 1 | RunnablePassthrough.assign() | Обогащение данных метаинформацией |
+| 2 | RunnableParallel | Параллельная оценка по 2 рубрикам |
+| 3 | chain.abatch() | Пакетная оценка нескольких работ |
+| 4 | .with_fallbacks() | Отказоустойчивость с fallback-моделью |
 
-### Шаг 1. Схемы запросов и ответов
+### Общие зависимости
 
-```python
-from pydantic import BaseModel, Field
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.rubric import Rubric
-
-
-class EnrichedAssessmentRequest(BaseModel):
-    student_work: str
-    rubric: Rubric
-
-
-class AssessmentMetadata(BaseModel):
-    word_count: int
-    paragraph_count: int
-    timestamp: str
-
-
-class EnrichedAssessmentResponse(BaseModel):
-    assessment: AssessmentResponse
-    metadata: AssessmentMetadata
-
-
-class ParallelAssessmentRequest(BaseModel):
-    student_work: str
-    rubric_1: Rubric
-    rubric_2: Rubric
-
-
-class ParallelAssessmentResponse(BaseModel):
-    rubric_1_result: AssessmentResponse
-    rubric_2_result: AssessmentResponse
-    elapsed_seconds: float
-
-
-class BatchAssessmentRequest(BaseModel):
-    works: list[str] = Field(min_length=1, max_length=10)
-    rubric: Rubric
-    max_concurrency: int = Field(default=3, ge=1, le=10)
-
-
-class BatchAssessmentResponse(BaseModel):
-    results: list[AssessmentResponse]
-    total_works: int
-    elapsed_seconds: float
-
-
-class FallbackAssessmentRequest(BaseModel):
-    student_work: str
-    rubric: Rubric
-
-
-class FallbackAssessmentResponse(BaseModel):
-    assessment: AssessmentResponse
-    primary_model: str
-    fallback_model: str
+```bash
+pip install langchain-core langchain-anthropic
 ```
 
-- `EnrichedAssessmentResponse` возвращает assessment + metadata, вычисленную через `RunnablePassthrough.assign()`
-- `ParallelAssessmentResponse` содержит результаты обеих рубрик + время выполнения (чтобы убедиться в параллельности)
-- `BatchAssessmentRequest` ограничивает размер batch (1-10 работ) и concurrency (1-10)
-- `FallbackAssessmentResponse` показывает, какие модели были сконфигурированы как primary и fallback
+### Пример 1. RunnablePassthrough.assign() — обогащение данных
 
-### Шаг 2. Роутер `app/api/v1/chains.py`
+`RunnablePassthrough.assign()` добавляет вычисляемые поля к входному dict, сохраняя все исходные ключи. Здесь мы добавляем `word_count`, `paragraph_count` и `timestamp` перед передачей в промпт.
 
-Полный файл роутера. Создай `app/api/v1/chains.py`:
+```python
+from datetime import UTC, datetime
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from pydantic import BaseModel
+
+
+class Assessment(BaseModel):
+    score: int
+    feedback: str
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor. Consider the metadata when assessing."),
+    (
+        "human",
+        "Word count: {word_count}\nParagraph count: {paragraph_count}\n"
+        "Timestamp: {timestamp}\n\nAssess this text:\n\n{text}",
+    ),
+])
+
+enrich = RunnablePassthrough.assign(
+    word_count=lambda x: len(x["text"].split()),
+    paragraph_count=lambda x: len([p for p in x["text"].split("\n\n") if p.strip()]),
+    timestamp=lambda _: datetime.now(UTC).isoformat(),
+)
+
+chain = enrich | prompt | llm.with_structured_output(Assessment)
+
+result = await chain.ainvoke({
+    "text": (
+        "Artificial intelligence is transforming the modern workplace.\n\n"
+        "While automation threatens certain routine jobs, it simultaneously "
+        "creates new roles in AI development and data science.\n\n"
+        "Studies suggest that up to 47% of jobs may be automated within two decades."
+    ),
+})
+
+print(f"Score: {result.score}")
+print(f"Feedback: {result.feedback}")
+```
+
+Ожидаемый результат: `word_count`, `paragraph_count` и `timestamp` вычисляются автоматически через `assign()` и доступны в промпте как `{word_count}` и т.д. Исходное поле `text` сохраняется.
+
+### Пример 2. RunnableParallel — параллельное выполнение
+
+`RunnableParallel` запускает несколько цепочек одновременно на одном входе. Две цепочки с разными рубриками (через `.partial()`) работают параллельно — время выполнения ≈ одному вызову, а не сумме.
 
 ```python
 import time
-from datetime import UTC, datetime
 
-from fastapi import APIRouter
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
-from pydantic import BaseModel, Field
+from langchain_core.runnables import RunnableParallel
+from pydantic import BaseModel
 
-from app.dependencies import SettingsDep
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_BAD_EXAMPLE,
-    FEW_SHOT_GOOD_EXAMPLE,
+
+class Assessment(BaseModel):
+    score: int
+    feedback: str
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+structured_llm = llm.with_structured_output(Assessment)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor. Use this rubric:\n{rubric}"),
+    ("human", "Assess this text:\n\n{text}"),
+])
+
+prompt_academic = prompt.partial(
+    rubric="Thesis (25%), Evidence (25%), Structure (20%), Critical Thinking (20%), Language (10%)"
 )
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.rubric import Rubric
+prompt_creative = prompt.partial(
+    rubric="Originality (30%), Voice (25%), Narrative (25%), Language Craft (20%)"
+)
 
-router = APIRouter(prefix="/chains", tags=["lesson-2-chains"])
+parallel = RunnableParallel(
+    academic=prompt_academic | structured_llm,
+    creative=prompt_creative | structured_llm,
+)
 
+start = time.monotonic()
+results = await parallel.ainvoke({
+    "text": (
+        "AI is reshaping how we work, learn, and communicate. "
+        "The rapid advancement of machine learning has created both "
+        "unprecedented opportunities and significant challenges for society."
+    ),
+})
+elapsed = time.monotonic() - start
 
-class EnrichedAssessmentRequest(BaseModel):
-    student_work: str
-    rubric: Rubric
-
-
-class AssessmentMetadata(BaseModel):
-    word_count: int
-    paragraph_count: int
-    timestamp: str
-
-
-class EnrichedAssessmentResponse(BaseModel):
-    assessment: AssessmentResponse
-    metadata: AssessmentMetadata
-
-
-class ParallelAssessmentRequest(BaseModel):
-    student_work: str
-    rubric_1: Rubric
-    rubric_2: Rubric
-
-
-class ParallelAssessmentResponse(BaseModel):
-    rubric_1_result: AssessmentResponse
-    rubric_2_result: AssessmentResponse
-    elapsed_seconds: float
-
-
-class BatchAssessmentRequest(BaseModel):
-    works: list[str] = Field(min_length=1, max_length=10)
-    rubric: Rubric
-    max_concurrency: int = Field(default=3, ge=1, le=10)
-
-
-class BatchAssessmentResponse(BaseModel):
-    results: list[AssessmentResponse]
-    total_works: int
-    elapsed_seconds: float
-
-
-class FallbackAssessmentRequest(BaseModel):
-    student_work: str
-    rubric: Rubric
-
-
-class FallbackAssessmentResponse(BaseModel):
-    assessment: AssessmentResponse
-    primary_model: str
-    fallback_model: str
-
-
-def format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-def build_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
-        (
-            "human",
-            "Word count: {word_count}\nParagraph count: {paragraph_count}\n"
-            "Timestamp: {timestamp}\n\n"
-            "Please assess the following student work:\n\n{student_work}",
-        ),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-
-def build_simple_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-
-@router.post("/enriched")
-async def enriched_assessment(
-    request: EnrichedAssessmentRequest,
-    settings: SettingsDep,
-) -> EnrichedAssessmentResponse:
-    rubric_text = format_rubric(request.rubric)
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-
-    enrich = RunnablePassthrough.assign(
-        word_count=lambda x: len(x["student_work"].split()),
-        paragraph_count=lambda x: len([p for p in x["student_work"].split("\n\n") if p.strip()]),
-        timestamp=lambda _: datetime.now(UTC).isoformat(),
-    )
-
-    prompt = build_prompt()
-    chain = enrich | prompt | llm.with_structured_output(AssessmentResponse)
-
-    result = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-    })
-
-    return EnrichedAssessmentResponse(
-        assessment=result,
-        metadata=AssessmentMetadata(
-            word_count=len(request.student_work.split()),
-            paragraph_count=len([p for p in request.student_work.split("\n\n") if p.strip()]),
-            timestamp=datetime.now(UTC).isoformat(),
-        ),
-    )
-
-
-@router.post("/parallel")
-async def parallel_assessment(
-    request: ParallelAssessmentRequest,
-    settings: SettingsDep,
-) -> ParallelAssessmentResponse:
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-    structured_llm = llm.with_structured_output(AssessmentResponse)
-
-    rubric_1_text = format_rubric(request.rubric_1)
-    rubric_2_text = format_rubric(request.rubric_2)
-
-    prompt_1 = build_simple_prompt().partial(rubric=rubric_1_text)
-    prompt_2 = build_simple_prompt().partial(rubric=rubric_2_text)
-
-    parallel = RunnableParallel(
-        rubric_1=prompt_1 | structured_llm,
-        rubric_2=prompt_2 | structured_llm,
-    )
-
-    start = time.monotonic()
-    results = await parallel.ainvoke({"student_work": request.student_work})
-    elapsed = time.monotonic() - start
-
-    return ParallelAssessmentResponse(
-        rubric_1_result=results["rubric_1"],
-        rubric_2_result=results["rubric_2"],
-        elapsed_seconds=round(elapsed, 2),
-    )
-
-
-@router.post("/batch")
-async def batch_assessment(
-    request: BatchAssessmentRequest,
-    settings: SettingsDep,
-) -> BatchAssessmentResponse:
-    rubric_text = format_rubric(request.rubric)
-    llm = ChatAnthropic(
-        model=settings.model_name,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-
-    prompt = build_simple_prompt()
-    chain = prompt | llm.with_structured_output(AssessmentResponse)
-
-    inputs = [{"student_work": work, "rubric": rubric_text} for work in request.works]
-
-    start = time.monotonic()
-    results = await chain.abatch(inputs, config={"max_concurrency": request.max_concurrency})
-    elapsed = time.monotonic() - start
-
-    return BatchAssessmentResponse(
-        results=results,
-        total_works=len(request.works),
-        elapsed_seconds=round(elapsed, 2),
-    )
-
-
-@router.post("/with-fallback")
-async def fallback_assessment(
-    request: FallbackAssessmentRequest,
-    settings: SettingsDep,
-) -> FallbackAssessmentResponse:
-    rubric_text = format_rubric(request.rubric)
-    primary_model = "claude-sonnet-4-20250514"
-    fallback_model = "claude-haiku-4-20250414"
-
-    primary = ChatAnthropic(
-        model=primary_model,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-    fallback = ChatAnthropic(
-        model=fallback_model,
-        temperature=settings.temperature,
-        max_tokens=settings.max_tokens,
-        api_key=settings.anthropic_api_key,
-    )
-
-    primary_structured = primary.with_structured_output(AssessmentResponse)
-    fallback_structured = fallback.with_structured_output(AssessmentResponse)
-    reliable_llm = primary_structured.with_fallbacks([fallback_structured])
-
-    prompt = build_simple_prompt()
-    chain = prompt | reliable_llm
-
-    result = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-    })
-
-    return FallbackAssessmentResponse(
-        assessment=result,
-        primary_model=primary_model,
-        fallback_model=fallback_model,
-    )
+print(f"Academic: score={results['academic'].score}, feedback={results['academic'].feedback}")
+print(f"Creative: score={results['creative'].score}, feedback={results['creative'].feedback}")
+print(f"Elapsed: {elapsed:.2f}s")
 ```
 
-**Как каждый эндпоинт связан с теорией:**
+Ожидаемый результат: два набора оценок по разным критериям. `elapsed` ≈ время одного LLM-вызова (3-8 секунд), не двух — подтверждение параллельности.
 
-- **`/enriched`** → Раздел 3 (RunnablePassthrough). `RunnablePassthrough.assign()` добавляет `word_count`, `paragraph_count`, `timestamp` к input dict. Эти данные доступны в промпте через `{word_count}` и т.д. Исходные поля (`student_work`, `rubric`) сохраняются.
-- **`/parallel`** → Раздел 4 (RunnableParallel). Две цепочки с разными рубриками (через `.partial()`) запускаются параллельно. `elapsed_seconds` в ответе позволяет убедиться, что время ≈ одному LLM-вызову, а не двум.
-- **`/batch`** → Раздел 9 (batch/abatch). `chain.abatch()` обрабатывает N работ параллельно. `max_concurrency` из запроса управляет параллелизмом через `config`. `elapsed_seconds` показывает ускорение по сравнению с последовательной обработкой.
-- **`/with-fallback`** → Раздел 6 (with_fallbacks). Primary (Sonnet) + fallback (Haiku). Оба обёрнуты в `with_structured_output()` — это критично, иначе fallback вернёт `AIMessage` вместо `AssessmentResponse`. При ошибке Sonnet автоматически используется Haiku.
+### Пример 3. chain.abatch() — пакетная обработка
 
-### Шаг 3. Регистрация в `app/api/router.py`
+`abatch()` обрабатывает список входов параллельно. `max_concurrency` ограничивает число одновременных запросов к API.
 
 ```python
-from fastapi import APIRouter
+import time
 
-from app.api.v1 import assessment, chains, prompts, rubrics
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(chains.router)
+
+class Assessment(BaseModel):
+    score: int
+    feedback: str
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor. Assess briefly."),
+    ("human", "Assess this text:\n\n{text}"),
+])
+
+chain = prompt | llm.with_structured_output(Assessment)
+
+inputs = [
+    {"text": "AI is transforming the workplace through automation of routine tasks. "
+             "Studies from MIT suggest 47% of jobs face automation risk."},
+    {"text": "AI is good. It helps people. The end."},
+    {"text": "The intersection of artificial intelligence and labor economics presents "
+             "a nuanced challenge. Frey and Osborne (2013) estimated 47% automation risk, "
+             "yet Arntz et al. (2016) suggest only 9% of jobs are fully automatable."},
+]
+
+start = time.monotonic()
+results = await chain.abatch(inputs, config={"max_concurrency": 3})
+elapsed = time.monotonic() - start
+
+for i, result in enumerate(results):
+    print(f"Work {i + 1}: score={result.score}, feedback={result.feedback[:80]}...")
+
+print(f"\nTotal: {len(results)} assessments in {elapsed:.2f}s")
 ```
 
-### Шаг 4. Тестирование
+Ожидаемый результат: 3 оценки с разными баллами (третья работа > первая > вторая). `elapsed` ≈ время одного вызова благодаря параллельности. Без `max_concurrency` при 100 inputs — 100 одновременных API-запросов, что гарантированно вызовет rate limiting.
 
-Запусти сервер:
+### Пример 4. .with_fallbacks() — отказоустойчивость
 
-```bash
-uvicorn app.main:app --reload
+`with_fallbacks()` автоматически переключается на запасную модель при ошибке основной. Обе модели обёрнуты в `with_structured_output()` — иначе fallback вернёт `AIMessage` вместо Pydantic-объекта.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel
+
+
+class Assessment(BaseModel):
+    score: int
+    feedback: str
+
+
+primary = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+backup = ChatAnthropic(model="claude-haiku-4-20250414", temperature=0)
+
+primary_structured = primary.with_structured_output(Assessment)
+backup_structured = backup.with_structured_output(Assessment)
+reliable_llm = primary_structured.with_fallbacks([backup_structured])
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor."),
+    ("human", "Assess this text:\n\n{text}"),
+])
+
+chain = prompt | reliable_llm
+
+result = await chain.ainvoke({
+    "text": (
+        "Artificial intelligence is transforming the modern workplace. "
+        "While automation threatens certain routine jobs, it simultaneously "
+        "creates new roles in AI development and data science."
+    ),
+})
+
+print(f"Score: {result.score}")
+print(f"Feedback: {result.feedback}")
 ```
 
-**Тест 1 — Enriched assessment (RunnablePassthrough.assign):**
+При нормальной работе используется primary (Sonnet). При ошибке (rate limit, timeout) — автоматически Haiku. Для production рекомендуется комбинировать с `.with_retry()`:
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chains/enriched \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Artificial intelligence is transforming the modern workplace.\n\nWhile automation threatens certain routine jobs, it simultaneously creates new roles in AI development and data science.\n\nStudies suggest that up to 47% of jobs may be automated within two decades.",
-    "rubric": {
-      "id": "essay", "name": "Essay Assessment",
-      "criteria": [
-        {"name": "Thesis", "description": "Clear thesis", "max_score": 25, "weight": 0.25},
-        {"name": "Evidence", "description": "Use of evidence", "max_score": 25, "weight": 0.25},
-        {"name": "Structure", "description": "Organization", "max_score": 20, "weight": 0.20},
-        {"name": "Critical Thinking", "description": "Depth of analysis", "max_score": 20, "weight": 0.20},
-        {"name": "Language", "description": "Grammar and style", "max_score": 10, "weight": 0.10}
-      ]
-    }
-  }' | python -m json.tool
+```python
+chain = (
+    prompt | primary_structured.with_retry(stop_after_attempt=2)
+).with_fallbacks([
+    prompt | backup_structured.with_retry(stop_after_attempt=2)
+])
 ```
-
-Ожидаемый результат: `metadata.word_count` > 0, `metadata.paragraph_count` = 3 (три абзаца через `\n\n`), `metadata.timestamp` содержит ISO-дату.
-
-**Тест 2 — Parallel assessment (RunnableParallel):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chains/parallel \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "AI is reshaping how we work, learn, and communicate. The rapid advancement of machine learning has created both unprecedented opportunities and significant challenges for society.",
-    "rubric_1": {
-      "id": "essay", "name": "Academic Essay",
-      "criteria": [
-        {"name": "Thesis", "description": "Clear thesis with logical development", "max_score": 25, "weight": 0.25},
-        {"name": "Evidence", "description": "Use of relevant evidence", "max_score": 25, "weight": 0.25},
-        {"name": "Structure", "description": "Organization and flow", "max_score": 20, "weight": 0.20},
-        {"name": "Critical Thinking", "description": "Depth of analysis", "max_score": 20, "weight": 0.20},
-        {"name": "Language", "description": "Grammar and style", "max_score": 10, "weight": 0.10}
-      ]
-    },
-    "rubric_2": {
-      "id": "creative", "name": "Creative Writing",
-      "criteria": [
-        {"name": "Originality", "description": "Fresh ideas and unique perspective", "max_score": 30, "weight": 0.30},
-        {"name": "Voice", "description": "Distinctive voice and style", "max_score": 25, "weight": 0.25},
-        {"name": "Narrative", "description": "Engaging narrative structure", "max_score": 25, "weight": 0.25},
-        {"name": "Language Craft", "description": "Skillful use of language", "max_score": 20, "weight": 0.20}
-      ]
-    }
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `elapsed_seconds` ≈ время одного LLM-вызова (3-8 секунд), а не двух. Два набора оценок по разным критериям.
-
-**Тест 3 — Batch assessment (abatch):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chains/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "works": [
-      "AI is transforming the workplace through automation of routine tasks. Studies from MIT suggest 47% of jobs face automation risk. However, new roles in AI development are emerging.",
-      "AI is good. It helps people. Some jobs will disappear but new ones will come. The end.",
-      "The intersection of artificial intelligence and labor economics presents a nuanced challenge. While Frey and Osborne (2013) estimated 47% automation risk, subsequent analyses by Arntz et al. (2016) suggest only 9% of jobs are fully automatable. This discrepancy highlights the importance of task-level rather than occupation-level analysis."
-    ],
-    "rubric": {
-      "id": "essay", "name": "Essay Assessment",
-      "criteria": [
-        {"name": "Thesis", "description": "Clear thesis", "max_score": 25, "weight": 0.25},
-        {"name": "Evidence", "description": "Use of evidence", "max_score": 25, "weight": 0.25},
-        {"name": "Structure", "description": "Organization", "max_score": 20, "weight": 0.20},
-        {"name": "Critical Thinking", "description": "Analysis depth", "max_score": 20, "weight": 0.20},
-        {"name": "Language", "description": "Grammar and style", "max_score": 10, "weight": 0.10}
-      ]
-    },
-    "max_concurrency": 3
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: 3 результата в `results`. Оценки отражают качество: третья работа (с цитатами и нюансированным анализом) > первая > вторая. `elapsed_seconds` ≈ время одного вызова (благодаря `max_concurrency=3`).
-
-**Тест 4 — Fallback assessment:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chains/with-fallback \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Artificial intelligence is transforming the modern workplace in profound ways. While automation threatens certain routine jobs, it simultaneously creates new roles in AI development, data science, and human-AI collaboration.",
-    "rubric": {
-      "id": "essay", "name": "Essay Assessment",
-      "criteria": [
-        {"name": "Thesis", "description": "Clear thesis", "max_score": 25, "weight": 0.25},
-        {"name": "Evidence", "description": "Use of evidence", "max_score": 25, "weight": 0.25},
-        {"name": "Structure", "description": "Organization", "max_score": 20, "weight": 0.20},
-        {"name": "Critical Thinking", "description": "Analysis depth", "max_score": 20, "weight": 0.20},
-        {"name": "Language", "description": "Grammar and style", "max_score": 10, "weight": 0.10}
-      ]
-    }
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `primary_model` = "claude-sonnet-4-20250514", `fallback_model` = "claude-haiku-4-20250414". В обычном режиме используется primary. Fallback активируется автоматически при ошибке primary (rate limit, timeout и т.д.).
 
 ---
 
@@ -1216,7 +978,7 @@ curl -s -X POST http://localhost:8000/api/v1/chains/with-fallback \
 - [ ] Когда использовать `RunnableParallel` vs просто два вызова `ainvoke`?
 - [ ] Почему `RunnableLambda` нужен, если можно просто вызвать функцию? Что он даёт?
 - [ ] Объясни разницу между `.with_fallbacks()` и `.with_retry()`. Когда что?
-- [ ] Почему в FastAPI нужен `ainvoke`, а не `invoke`?
+- [ ] Почему в `async def` нужен `ainvoke`, а не `invoke`? Что произойдёт при смешивании?
 - [ ] Чем `batch` отличается от `RunnableParallel`? Когда какой использовать?
 - [ ] Зачем `max_concurrency` в `abatch`? Что произойдёт без него при 100 inputs?
 - [ ] Почему fallback-модель тоже должна быть обёрнута в `with_structured_output()`?
@@ -1225,21 +987,19 @@ curl -s -X POST http://localhost:8000/api/v1/chains/with-fallback \
 
 ## Частые ошибки
 
-### 1. invoke в async endpoint
+### 1. invoke в async-функции
 
 ```python
-@router.post("")
-async def assess(request: Request, chain: ChainDep):
-    return chain.invoke({"student_work": request.student_work})
+async def assess(text: str) -> Assessment:
+    return chain.invoke({"text": text})
 ```
 
 ```python
-@router.post("")
-async def assess(request: Request, chain: ChainDep):
-    return await chain.ainvoke({"student_work": request.student_work})
+async def assess(text: str) -> Assessment:
+    return await chain.ainvoke({"text": text})
 ```
 
-`invoke` в `async def` блокирует event loop. FastAPI запустит его в threadpool, но это менее эффективно, чем нативный `ainvoke`.
+`invoke` в `async def` блокирует event loop. Python выполнит его синхронно, заморозив все остальные корутины. Используй `ainvoke` для нативной async-работы.
 
 ### 2. Потеря данных в цепочке
 

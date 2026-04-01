@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import re
+
 import markdown
 from pygments.formatters import HtmlFormatter
 
@@ -174,6 +176,56 @@ hr {{
     page-break-before: always;
 }}
 
+.toc-page {{
+    page-break-after: always;
+}}
+
+.toc-page h1 {{
+    text-align: center;
+    border-bottom: none;
+    margin-bottom: 1.2em;
+}}
+
+.toc-page ol {{
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+}}
+
+.toc-page li {{
+    margin: 0.45em 0;
+    font-size: 11.5pt;
+    line-height: 1.5;
+    border-bottom: 1px dotted #d1d5db;
+    padding-bottom: 0.35em;
+}}
+
+.toc-page li a {{
+    color: #1a1a1a;
+    text-decoration: none;
+}}
+
+.toc-page li a:hover {{
+    color: #2563eb;
+}}
+
+.toc-page .toc-number {{
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-weight: 600;
+    color: #2563eb;
+    margin-right: 0.4em;
+}}
+
+.toc-page .toc-desc {{
+    display: block;
+    font-size: 8.5pt;
+    color: #6b7280;
+    margin-top: 0.1em;
+    line-height: 1.35;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-style: italic;
+}}
+
 {PYGMENTS_CSS}
 """
 
@@ -214,15 +266,52 @@ def md_to_html(md_text: str) -> str:
     )
 
 
+def extract_title(md_text: str) -> str:
+    match = re.match(r"^#\s+(.+)", md_text.strip())
+    return match.group(1).strip() if match else "Без названия"
+
+
+def extract_subtopics(md_text: str) -> str:
+    headings = re.findall(r"^###\s+\d+\.\s+(.+)", md_text, re.MULTILINE)
+    if not headings:
+        return ""
+    return " · ".join(headings)
+
+
+def build_toc(titles: list[str], descriptions: list[str]) -> str:
+    items: list[str] = []
+    for i, (title, desc) in enumerate(zip(titles, descriptions)):
+        anchor = f"lesson-{i}"
+        num = i + 1
+        desc_html = f'\n<span class="toc-desc">{desc}</span>' if desc else ""
+        items.append(
+            f'<li><a href="#{anchor}">'
+            f'<span class="toc-number">{num}.</span>{title}</a>'
+            f"{desc_html}</li>"
+        )
+    return (
+        '<section class="toc-page">\n'
+        "<h1>Содержание</h1>\n"
+        "<ol>\n" + "\n".join(items) + "\n</ol>\n"
+        "</section>"
+    )
+
+
 def build_html(lessons: list[Path]) -> str:
+    titles: list[str] = []
+    descriptions: list[str] = []
     parts: list[str] = []
     for i, path in enumerate(lessons):
         md_text = path.read_text(encoding="utf-8")
+        titles.append(extract_title(md_text))
+        descriptions.append(extract_subtopics(md_text))
         html = md_to_html(md_text)
+        anchor = f"lesson-{i}"
         css_class = ' class="lesson-break"' if i > 0 else ""
-        parts.append(f"<article{css_class}>\n{html}\n</article>")
+        parts.append(f'<article id="{anchor}"{css_class}>\n{html}\n</article>')
 
-    body = "\n".join(parts)
+    toc = build_toc(titles, descriptions)
+    body = toc + "\n" + "\n".join(parts)
     return (
         "<!DOCTYPE html>\n"
         '<html lang="ru">\n<head>\n'

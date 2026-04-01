@@ -1,8 +1,7 @@
 # Тема 5: RAG (Retrieval-Augmented Generation)
 
 > **Пререквизиты:** темы 1–4 (prompt engineering, structured output, LCEL chains)
-> **Что добавляем в проект:** `app/api/v1/rag.py`, `app/services/vector_store.py`, `app/schemas/rag.py`
-> **Зависимости:** `langchain-chroma`, `langchain-openai`, `chromadb`, `sentence-transformers`, `pypdf` (группа `rag`)
+> **Зависимости:** `langchain-chroma`, `langchain-openai`, `chromadb`, `sentence-transformers`, `pypdf`
 
 ---
 
@@ -692,426 +691,262 @@ print(doc.metadata["source"])
 
 ---
 
-## Практика: роутер `/api/v1/rag`
+## Практика
 
-Мы создадим четыре эндпоинта, покрывающих полный RAG-пайплайн:
+В этой секции — пошаговые примеры, покрывающие полный RAG-пайплайн. Каждый пример самодостаточен и запускается в Jupyter-ноутбуке или как отдельный скрипт.
 
-| Эндпоинт | Что делает |
-|----------|------------|
-| `POST /index` | Индексирует текстовые документы в ChromaDB |
-| `POST /search` | Ищет похожие документы по запросу |
-| `POST /assess` | Оценка с RAG-контекстом (прошлые похожие оценки) |
-| `POST /compare` | Сравнение обычной и RAG-оценки side-by-side |
-
-### Шаг 1. Схемы данных — `app/schemas/rag.py`
+### Шаг 1. Создание документов из текстов
 
 ```python
-from pydantic import BaseModel, Field
+from langchain_core.documents import Document
 
-from app.schemas.assessment import AssessmentResponse
+essays = [
+    {
+        "text": "The impact of artificial intelligence on modern education is profound "
+        "and multifaceted. AI-powered tools are transforming how students learn, "
+        "enabling personalized learning paths and immediate feedback. Research by "
+        "Smith (2023) demonstrates that AI tutoring systems improve test scores by "
+        "15-20% compared to traditional methods. However, concerns about academic "
+        "integrity and over-reliance on technology remain valid.",
+        "source": "essay_ai_education",
+        "quality": "high",
+        "score": 88,
+    },
+    {
+        "text": "Social media is bad for kids. Everyone knows this. Kids spend too much "
+        "time on their phones and dont study. The government should ban social media "
+        "for anyone under 18. This is my opinion and I think its right.",
+        "source": "essay_social_media",
+        "quality": "low",
+        "score": 35,
+    },
+    {
+        "text": "Climate change presents one of the most significant challenges of the "
+        "21st century. According to the IPCC (2023), global temperatures have risen "
+        "by 1.1 degrees Celsius since pre-industrial times. This essay examines three "
+        "key mitigation strategies: carbon pricing, renewable energy investment, and "
+        "reforestation programs.",
+        "source": "essay_climate",
+        "quality": "medium",
+        "score": 72,
+    },
+]
 
+docs = [
+    Document(
+        page_content=e["text"],
+        metadata={"source": e["source"], "quality": e["quality"], "score": e["score"]},
+    )
+    for e in essays
+]
 
-class TextDocument(BaseModel):
-    content: str
-    metadata: dict = Field(default_factory=dict)
-
-
-class IndexRequest(BaseModel):
-    documents: list[TextDocument]
-    chunk_size: int = 500
-    chunk_overlap: int = 50
-
-
-class IndexResponse(BaseModel):
-    chunk_count: int
-    document_count: int
-    collection_name: str
-
-
-class SearchRequest(BaseModel):
-    query: str
-    k: int = 3
-
-
-class SearchResult(BaseModel):
-    content: str
-    metadata: dict
-    score: float
-
-
-class SearchResponse(BaseModel):
-    results: list[SearchResult]
-    query: str
-
-
-class RagAssessRequest(BaseModel):
-    student_work: str
-    rubric_id: str | None = "essay_default"
-    k: int = 3
-
-
-class RagAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    retrieved_context: list[SearchResult]
-
-
-class CompareRequest(BaseModel):
-    student_work: str
-    rubric_id: str | None = "essay_default"
-    k: int = 3
-
-
-class CompareResponse(BaseModel):
-    normal: AssessmentResponse
-    rag: AssessmentResponse
-    retrieved_docs: list[SearchResult]
-    normal_feedback_length: int
-    rag_feedback_length: int
+for doc in docs:
+    print(f"{doc.metadata['source']}: {doc.page_content[:60]}...")
 ```
 
-Схемы разделены по операциям. `SearchResult` используется повторно в `SearchResponse`, `RagAssessResponse` и `CompareResponse` — RORO-паттерн (Receive an Object, Return an Object).
+### Шаг 2. Нарезка на чанки (text splitting)
 
-### Шаг 2. Сервис vector store — `app/services/vector_store.py`
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+)
+chunks = splitter.split_documents(docs)
+
+print(f"Документов: {len(docs)}, чанков: {len(chunks)}")
+for i, chunk in enumerate(chunks):
+    print(f"\nChunk {i} (len={len(chunk.page_content)}):")
+    print(f"  metadata: {chunk.metadata}")
+    print(f"  text: {chunk.page_content[:80]}...")
+```
+
+Сравнение разных `chunk_size` на одном и том же тексте:
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+long_text = " ".join(doc.page_content for doc in docs)
+
+for size in [200, 500, 1000]:
+    s = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=50)
+    parts = s.split_text(long_text)
+    avg_len = sum(len(p) for p in parts) / len(parts)
+    print(f"chunk_size={size:>5} → {len(parts)} чанков, avg {avg_len:.0f} символов")
+```
+
+### Шаг 3. Embeddings и vector store (in-memory ChromaDB)
 
 ```python
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app.config import get_settings
+embedding = OpenAIEmbeddings(model="text-embedding-3-small")
 
+vectorstore = Chroma.from_documents(
+    documents=chunks,
+    embedding=embedding,
+    collection_name="practice_rag",
+)
 
-_vectorstore: Chroma | None = None
-
-
-def get_vectorstore() -> Chroma:
-    global _vectorstore
-    if _vectorstore is None:
-        settings = get_settings()
-        _vectorstore = Chroma(
-            collection_name="assessments",
-            embedding_function=OpenAIEmbeddings(
-                model="text-embedding-3-small",
-                api_key=settings.openai_api_key,
-            ),
-        )
-    return _vectorstore
-
-
-def index_documents(
-    texts: list[str],
-    metadatas: list[dict] | None = None,
-    chunk_size: int = 500,
-    chunk_overlap: int = 50,
-) -> dict:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    documents = []
-    for i, text in enumerate(texts):
-        meta = metadatas[i] if metadatas and i < len(metadatas) else {}
-        documents.append(Document(page_content=text, metadata=meta))
-    chunks = splitter.split_documents(documents)
-    vs = get_vectorstore()
-    vs.add_documents(chunks)
-    return {
-        "chunk_count": len(chunks),
-        "document_count": len(texts),
-    }
-
-
-def search_similar(query: str, k: int = 3) -> list[tuple[Document, float]]:
-    vs = get_vectorstore()
-    raw = vs.similarity_search_with_score(query, k=k)
-    return [(doc, 1.0 / (1.0 + dist)) for doc, dist in raw]
-
-
-def format_retrieved_docs(results: list[tuple[Document, float]]) -> str:
-    parts = []
-    for doc, score in results:
-        parts.append(f"[Relevance: {score:.3f}]\n{doc.page_content}")
-    return "\n\n---\n\n".join(parts)
+print(f"Проиндексировано чанков: {vectorstore._collection.count()}")
 ```
 
-Ключевые решения:
-- **Singleton-паттерн** для vector store через `_vectorstore` — аналог `@lru_cache` в `dependencies.py`. Коллекция создаётся один раз и переиспользуется.
-- **`search_similar`** преобразует расстояние ChromaDB (L2, чем меньше — тем ближе) в relevance score (0–1, чем больше — тем релевантнее) по формуле `1 / (1 + distance)`.
-- **`format_retrieved_docs`** формирует строку для вставки в промпт — каждый документ с его relevance score.
-
-### Шаг 3. Роутер — `app/api/v1/rag.py`
+Поиск похожих документов:
 
 ```python
-from fastapi import APIRouter, HTTPException
+query = "artificial intelligence impact on learning"
+
+results = vectorstore.similarity_search_with_score(query, k=3)
+
+for doc, distance in results:
+    relevance = 1.0 / (1.0 + distance)
+    print(f"[relevance={relevance:.3f}] source={doc.metadata.get('source')}")
+    print(f"  {doc.page_content[:120]}...")
+    print()
+```
+
+Поиск с фильтрацией по метаданным:
+
+```python
+high_quality = vectorstore.similarity_search(
+    "strong academic essay",
+    k=3,
+    filter={"quality": "high"},
+)
+
+for doc in high_quality:
+    print(f"source={doc.metadata['source']}, score={doc.metadata.get('score')}")
+    print(f"  {doc.page_content[:100]}...")
+```
+
+### Шаг 4. Retriever — обёртка для LCEL-цепочек
+
+```python
+retriever = vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 3},
+)
+
+retrieved = retriever.invoke("thesis about AI impact")
+for doc in retrieved:
+    print(f"[{doc.metadata.get('source')}] {doc.page_content[:100]}...")
+```
+
+MMR-retriever для разнообразия результатов:
+
+```python
+mmr_retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 3, "fetch_k": 10, "lambda_mult": 0.7},
+)
+
+mmr_results = mmr_retriever.invoke("thesis about AI impact")
+for doc in mmr_results:
+    print(f"[{doc.metadata.get('source')}] {doc.page_content[:100]}...")
+```
+
+### Шаг 5. RAG-цепочка (retriever → prompt → LLM)
+
+```python
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI
 
-from app.dependencies import ChainDep, LLMDep, RubricStoreDep
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_BAD_EXAMPLE,
-    FEW_SHOT_GOOD_EXAMPLE,
-)
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.rag import (
-    CompareRequest,
-    CompareResponse,
-    IndexRequest,
-    IndexResponse,
-    RagAssessRequest,
-    RagAssessResponse,
-    SearchRequest,
-    SearchResponse,
-    SearchResult,
-)
-from app.services.vector_store import (
-    format_retrieved_docs,
-    index_documents,
-    search_similar,
-)
+def format_docs(docs):
+    parts = []
+    for doc in docs:
+        score = doc.metadata.get("score", "N/A")
+        quality = doc.metadata.get("quality", "unknown")
+        parts.append(
+            f"[Previous assessment — quality: {quality}, score: {score}]\n{doc.page_content}"
+        )
+    return "\n\n---\n\n".join(parts)
 
-router = APIRouter(prefix="/rag", tags=["lesson-5-rag"])
+rag_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert essay assessor.
 
-RAG_SYSTEM_PROMPT = ASSESSMENT_SYSTEM_PROMPT + """
-
-## Previously Assessed Similar Works
-Use these as calibration — similar quality should receive similar scores.
-
+## Previously assessed similar works (use as calibration):
 {context}
-"""
+"""),
+    ("human", "Assess the following student work. "
+     "Provide a score (0-100) and detailed feedback.\n\n{student_work}"),
+])
 
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
-@router.post("/index")
-async def index_docs(request: IndexRequest) -> IndexResponse:
-    texts = [doc.content for doc in request.documents]
-    metadatas = [doc.metadata for doc in request.documents]
-    result = index_documents(
-        texts=texts,
-        metadatas=metadatas,
-        chunk_size=request.chunk_size,
-        chunk_overlap=request.chunk_overlap,
-    )
-    return IndexResponse(
-        chunk_count=result["chunk_count"],
-        document_count=result["document_count"],
-        collection_name="assessments",
-    )
+rag_chain = (
+    RunnablePassthrough.assign(context=retriever | format_docs)
+    | rag_prompt
+    | llm
+)
 
+student_essay = (
+    "Artificial intelligence is revolutionizing education across the globe. "
+    "Machine learning algorithms now power adaptive learning platforms that "
+    "adjust difficulty based on student performance (Johnson, 2024). This essay "
+    "argues that AI integration in classrooms, when properly implemented, leads "
+    "to measurably better learning outcomes."
+)
 
-@router.post("/search")
-async def search_docs(request: SearchRequest) -> SearchResponse:
-    results = search_similar(query=request.query, k=request.k)
-    return SearchResponse(
-        query=request.query,
-        results=[
-            SearchResult(
-                content=doc.page_content,
-                metadata=doc.metadata,
-                score=float(score),
-            )
-            for doc, score in results
-        ],
-    )
-
-
-@router.post("/assess")
-async def rag_assess(
-    request: RagAssessRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> RagAssessResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
-
-    results = search_similar(query=request.student_work, k=request.k)
-    context = format_retrieved_docs(results)
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", RAG_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-    structured_llm = llm.with_structured_output(AssessmentResponse)
-    chain = prompt | structured_llm
-    assessment = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "context": context,
-    })
-
-    retrieved = [
-        SearchResult(content=doc.page_content, metadata=doc.metadata, score=float(score))
-        for doc, score in results
-    ]
-    return RagAssessResponse(assessment=assessment, retrieved_context=retrieved)
-
-
-@router.post("/compare")
-async def compare_assessment(
-    request: CompareRequest,
-    chain: ChainDep,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> CompareResponse:
-    rubric = _resolve_rubric(request.rubric_id, rubrics)
-    rubric_text = _format_rubric(rubric)
-
-    normal_result = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-    })
-
-    results = search_similar(query=request.student_work, k=request.k)
-    context = format_retrieved_docs(results)
-
-    rag_prompt = ChatPromptTemplate.from_messages([
-        ("system", RAG_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-    structured_llm = llm.with_structured_output(AssessmentResponse)
-    rag_chain = rag_prompt | structured_llm
-    rag_result = await rag_chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-        "context": context,
-    })
-
-    retrieved = [
-        SearchResult(content=doc.page_content, metadata=doc.metadata, score=float(score))
-        for doc, score in results
-    ]
-
-    def feedback_len(resp: AssessmentResponse) -> int:
-        return sum(len(c.feedback) for c in resp.criterion_scores)
-
-    return CompareResponse(
-        normal=normal_result,
-        rag=rag_result,
-        retrieved_docs=retrieved,
-        normal_feedback_length=feedback_len(normal_result),
-        rag_feedback_length=feedback_len(rag_result),
-    )
-
-
-def _resolve_rubric(rubric_id, rubrics):
-    rid = rubric_id or "essay_default"
-    if rid not in rubrics:
-        raise HTTPException(status_code=404, detail=f"Rubric '{rid}' not found")
-    return rubrics[rid]
-
-
-def _format_rubric(rubric):
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
+response = rag_chain.invoke({"student_work": student_essay})
+print(response.content)
 ```
 
-Обрати внимание на паттерны:
-- **`RAG_SYSTEM_PROMPT`** расширяет базовый `ASSESSMENT_SYSTEM_PROMPT`, добавляя секцию `{context}` для найденных документов. Это сохраняет все инструкции оригинального промпта.
-- **`/compare`** использует `ChainDep` (обычная цепочка из `dependencies.py`) для normal-оценки и строит RAG-цепочку вручную для RAG-оценки — так видно разницу.
-- **`_resolve_rubric`** и **`_format_rubric`** дублируют логику из `app/api/v1/assessment.py`. В реальном проекте стоит вынести в общий utility-модуль.
-
-### Шаг 4. Регистрация в `app/api/router.py`
-
-Добавь импорт и include нового роутера:
+### Шаг 6. Отладка — проверяем каждый этап отдельно
 
 ```python
-from fastapi import APIRouter
+retrieved = retriever.invoke(student_essay)
+print("=== Найденные документы ===")
+for doc in retrieved:
+    print(f"  source={doc.metadata.get('source')}, quality={doc.metadata.get('quality')}")
+    print(f"  {doc.page_content[:120]}...")
+    print()
 
-from app.api.v1 import assessment, rag, rubrics
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(rag.router)
+context_str = format_docs(retrieved)
+print("=== Сформированный контекст ===")
+print(context_str[:500])
 ```
 
-### Шаг 5. Тестирование
+### Шаг 7. Сравнение ответа без RAG и с RAG
 
-Установи RAG-зависимости и запусти сервер:
+```python
+no_rag_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert essay assessor."),
+    ("human", "Assess the following student work. "
+     "Provide a score (0-100) and detailed feedback.\n\n{student_work}"),
+])
 
-```bash
-uv pip install -e ".[rag]"
-uvicorn app.main:app --reload
+no_rag_chain = no_rag_prompt | llm
+
+weak_essay = (
+    "AI is changing how we learn. Some people think its good, others think "
+    "its bad. I think AI will help students learn better because computers are smart."
+)
+
+print("=== Без RAG ===")
+no_rag_result = no_rag_chain.invoke({"student_work": weak_essay})
+print(no_rag_result.content)
+
+print("\n=== С RAG ===")
+rag_result = rag_chain.invoke({"student_work": weak_essay})
+print(rag_result.content)
 ```
 
-**Индексирование документов:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/rag/index \
-  -H "Content-Type: application/json" \
-  -d '{
-    "documents": [
-      {
-        "content": "The impact of artificial intelligence on modern education is profound and multifaceted. AI-powered tools are transforming how students learn, enabling personalized learning paths and immediate feedback. Research by Smith (2023) demonstrates that AI tutoring systems improve test scores by 15-20% compared to traditional methods. However, concerns about academic integrity and over-reliance on technology remain valid.",
-        "metadata": {"source": "essay_ai_education", "quality": "high", "score": 88}
-      },
-      {
-        "content": "Social media is bad for kids. Everyone knows this. Kids spend too much time on their phones and dont study. The government should ban social media for anyone under 18. This is my opinion and I think its right.",
-        "metadata": {"source": "essay_social_media", "quality": "low", "score": 35}
-      },
-      {
-        "content": "Climate change presents one of the most significant challenges of the 21st century. According to the IPCC (2023), global temperatures have risen by 1.1 degrees Celsius since pre-industrial times. This essay examines three key mitigation strategies: carbon pricing, renewable energy investment, and reforestation programs.",
-        "metadata": {"source": "essay_climate", "quality": "medium", "score": 72}
-      }
-    ],
-    "chunk_size": 500,
-    "chunk_overlap": 50
-  }'
-```
-
-**Поиск похожих документов:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/rag/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "artificial intelligence impact on learning", "k": 2}' | python -m json.tool
-```
-
-**RAG-оценка:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/rag/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Artificial intelligence is revolutionizing education across the globe. Machine learning algorithms now power adaptive learning platforms that adjust difficulty based on student performance (Johnson, 2024). This essay argues that AI integration in classrooms, when properly implemented, leads to measurably better learning outcomes.",
-    "rubric_id": "essay_default",
-    "k": 3
-  }' | python -m json.tool
-```
-
-**Сравнение normal vs RAG:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/rag/compare \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "AI is changing how we learn. Some people think its good, others think its bad. I think AI will help students learn better because computers are smart.",
-    "rubric_id": "essay_default",
-    "k": 3
-  }' | python -m json.tool
-```
+RAG-версия видит прошлые оценки похожих эссе и калибруется по ним — одинаковое качество получает одинаковые баллы.
 
 ### Связь с теорией
 
-Каждый эндпоинт соответствует этапу RAG-пайплайна из теории:
+Каждый шаг практики соответствует концепту из теории:
 
-| Эндпоинт | Теоретический концепт | Что демонстрирует |
-|----------|----------------------|-------------------|
-| `POST /index` | Text Splitters + Vector Store (разделы 3, 5) | Chunking документов и индексация embedding'ов в ChromaDB |
-| `POST /search` | Retriever + Similarity Search (раздел 6) | Поиск по семантическому сходству с relevance score |
-| `POST /assess` | RAG Chain (раздел 7) | Полный пайплайн: retrieve → format → prompt → LLM |
-| `POST /compare` | RAG vs no-RAG | Измеримое влияние RAG на качество оценки |
-
-Сервис `vector_store.py` инкапсулирует работу с Chroma и embedding-моделью (разделы 2, 3), а функция `format_retrieved_docs` реализует этап форматирования контекста из раздела 7.
+| Шаг | Теоретический концепт | Что демонстрирует |
+|-----|----------------------|-------------------|
+| 1–2 | Document Loaders + Text Splitters (разделы 4, 5) | Создание документов и chunking |
+| 3 | Embeddings + Vector Store (разделы 2, 3) | Индексация в ChromaDB, similarity search, metadata filtering |
+| 4 | Retriever (раздел 6) | similarity и MMR retriever'ы через `as_retriever()` |
+| 5 | RAG Chain (раздел 7) | Полный пайплайн: retrieve → format → prompt → LLM |
+| 6–7 | Отладка (раздел 7) | Проверка каждого этапа, сравнение RAG vs no-RAG |
 
 ---
 
@@ -1125,7 +960,7 @@ curl -s -X POST http://localhost:8000/api/v1/rag/compare \
 - [ ] RAG vs fine-tuning: назови три преимущества каждого подхода
 - [ ] Что произойдёт, если использовать разные embedding-модели при индексации и поиске?
 - [ ] Как metadata filtering помогает в vector search?
-- [ ] Запусти `/compare` — в чём разница между normal и RAG-оценками?
+- [ ] Сравни ответ LLM без RAG и с RAG на одном и том же эссе — в чём разница?
 
 ---
 

@@ -1,7 +1,6 @@
 # Тема 16: Langfuse Deep Dive — платформа для LLM observability
 
 > **Пререквизиты:** [Тема 8: Observability](topic_08_observability.md)
-> **Что добавляем в проект:** `app/api/v1/langfuse.py`, расширение `app/services/langfuse_service.py`, `app/schemas/langfuse.py`
 > **Зависимости:** `langfuse`, `langchain-core`, `langchain-anthropic`
 
 ---
@@ -594,278 +593,287 @@ langfuse.flush()
 
 ---
 
-## Практика: роутер `/api/v1/langfuse`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/langfuse.py`
+### Пример 1. Prompt Management — версионирование промптов
 
-Создаём Pydantic-модели для запросов и ответов четырёх эндпоинтов.
+Создаём промпт в Langfuse, загружаем его по имени и метке, компилируем с переменными и используем в LangChain chain.
 
 ```python
+from langfuse import Langfuse
+
+langfuse = Langfuse()
+
+langfuse.create_prompt(
+    name="assessment-prompt",
+    prompt=[
+        {
+            "role": "system",
+            "content": (
+                "You are an expert educator and assessment specialist.\n"
+                "Evaluate the student work carefully against each criterion "
+                "in the rubric.\n"
+                "Be specific in your feedback and provide actionable suggestions.\n\n"
+                "Rubric:\n{{rubric}}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Please assess the following student work:\n\n{{student_work}}",
+        },
+    ],
+    labels=["production"],
+    type="chat",
+    config={"model": "claude-sonnet-4-20250514", "temperature": 0.3},
+)
+
+langfuse.flush()
+print("Prompt created")
+```
+
+Загрузка промпта и компиляция с переменными:
+
+```python
+prompt = langfuse.get_prompt(
+    name="assessment-prompt",
+    label="production",
+    type="chat",
+    cache_ttl_seconds=300,
+)
+
+print(f"Version: {prompt.version}")
+print(f"Labels: {prompt.labels}")
+print(f"Config: {prompt.config}")
+
+messages = prompt.compile(
+    student_work="Climate change is a significant global challenge...",
+    rubric="Clarity: 0-25, Argumentation: 0-25, Evidence: 0-25, Structure: 0-25",
+)
+for msg in messages:
+    print(f"[{msg['role']}] {msg['content'][:80]}...")
+```
+
+Загружаем промпт как LangChain `ChatPromptTemplate` и прогоняем chain:
+
+```python
+from langfuse.callback import CallbackHandler
+from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel, Field
 
 
-class PromptTestRequest(BaseModel):
-    student_work: str = Field(min_length=10)
-    rubric_id: str = "essay_default"
-    prompt_name: str = "assessment-prompt"
-    prompt_label: str = "production"
-
-
-class PromptComparisonResult(BaseModel):
-    source: str
-    overall_score: int
+class AssessmentResult(BaseModel):
+    overall_score: int = Field(ge=0, le=100)
     summary: str
-    latency_ms: float
-    token_usage: dict[str, int]
+    strengths: list[str]
+    improvements: list[str]
 
 
-class PromptTestResponse(BaseModel):
-    langfuse_prompt: PromptComparisonResult
-    hardcoded_prompt: PromptComparisonResult
-    trace_id: str
-    trace_url: str
+prompt = langfuse.get_prompt(
+    name="assessment-prompt", label="production", type="chat",
+)
+lc_prompt = prompt.get_langchain_prompt()
 
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
+chain = lc_prompt | llm.with_structured_output(AssessmentResult)
 
-class DatasetItem(BaseModel):
-    student_work: str = Field(min_length=10)
-    expected_score: int = Field(ge=0, le=100)
-    metadata: dict | None = None
+handler = CallbackHandler(
+    trace_name="prompt-test",
+    tags=["prompt-management", "notebook"],
+)
 
+result = chain.invoke(
+    {
+        "student_work": (
+            "Climate change is a significant global challenge. "
+            "Rising temperatures lead to melting ice caps, rising sea levels, "
+            "and extreme weather events. Governments must implement carbon "
+            "reduction policies. Renewable energy adoption is critical."
+        ),
+        "rubric": (
+            "Clarity: 0-25, Argumentation: 0-25, "
+            "Evidence: 0-25, Structure: 0-25"
+        ),
+    },
+    config={"callbacks": [handler]},
+)
 
-class DatasetRunRequest(BaseModel):
-    dataset_name: str = "assessment-golden"
-    items: list[DatasetItem] = Field(min_length=1, max_length=50)
-    prompt_versions: list[str] = Field(
-        default=["v1", "v2"],
-        min_length=1,
-        max_length=5,
-    )
-    run_prefix: str = "experiment"
-
-
-class ExperimentResult(BaseModel):
-    run_name: str
-    prompt_version: str
-    avg_score_diff: float
-    items_processed: int
-    total_cost_usd: float
-    avg_latency_ms: float
-
-
-class ExperimentResponse(BaseModel):
-    dataset_name: str
-    runs: list[ExperimentResult]
-    trace_ids: list[str]
-
-
-class ScoreEntry(BaseModel):
-    name: str
-    value: float = Field(ge=0, le=1)
-    comment: str | None = None
-
-
-class ScoreRequest(BaseModel):
-    student_work: str = Field(min_length=10)
-    rubric_id: str = "essay_default"
-    auto_score: bool = True
-    custom_scores: list[ScoreEntry] | None = None
-
-
-class ScoreResponse(BaseModel):
-    trace_id: str
-    assessment_result: dict
-    scores: list[dict[str, str | float]]
-    trace_url: str
-
-
-class AnalyticsRequest(BaseModel):
-    limit: int = Field(default=50, ge=1, le=500)
-    tags: list[str] | None = None
-
-
-class CostBreakdown(BaseModel):
-    model: str
-    total_cost_usd: float
-    input_tokens: int
-    output_tokens: int
-    call_count: int
-
-
-class LatencyStats(BaseModel):
-    p50_ms: float
-    p95_ms: float
-    p99_ms: float
-    avg_ms: float
-
-
-class AnalyticsResponse(BaseModel):
-    total_traces: int
-    total_cost_usd: float
-    cost_by_model: list[CostBreakdown]
-    latency: LatencyStats
-    avg_scores: dict[str, float]
-    period: str
+print(f"Score: {result.overall_score}")
+print(f"Summary: {result.summary}")
+print(f"Trace URL: {handler.get_trace_url()}")
+langfuse.flush()
 ```
 
-### Шаг 2. Сервис — расширение `app/services/langfuse_service.py`
-
-Расширяем сервис из темы 8 четырьмя функциями для новых эндпоинтов.
+Сравнение Langfuse-managed промпта с hardcoded:
 
 ```python
 import time
-import statistics
-from collections import defaultdict
+from langchain_core.prompts import ChatPromptTemplate
 
+hardcoded_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Assess the student work.\nRubric:\n{rubric}"),
+    ("human", "{student_work}"),
+])
+
+managed_prompt = langfuse.get_prompt(
+    name="assessment-prompt", label="production", type="chat",
+)
+
+student_text = (
+    "The water cycle describes how water moves through the environment. "
+    "Water evaporates from oceans, forms clouds through condensation, "
+    "and returns as precipitation."
+)
+rubric_text = (
+    "Clarity: 0-25, Argumentation: 0-25, "
+    "Evidence: 0-25, Structure: 0-25"
+)
+
+for label, prompt_tpl in [
+    ("hardcoded", hardcoded_prompt),
+    ("managed", managed_prompt.get_langchain_prompt()),
+]:
+    handler = CallbackHandler(
+        trace_name=f"compare-{label}",
+        tags=["comparison", label],
+    )
+    chain = prompt_tpl | llm.with_structured_output(AssessmentResult)
+    start = time.perf_counter()
+    res = chain.invoke(
+        {"student_work": student_text, "rubric": rubric_text},
+        config={"callbacks": [handler]},
+    )
+    elapsed = (time.perf_counter() - start) * 1000
+    print(f"[{label}] score={res.overall_score}, latency={elapsed:.0f}ms")
+
+langfuse.flush()
+```
+
+### Пример 2. Datasets и эксперименты
+
+Создаём golden dataset, прогоняем chain на каждом item, связываем trace с dataset через `item.link()` и сравниваем runs.
+
+```python
 from langfuse import Langfuse
+
+langfuse = Langfuse()
+
+langfuse.create_dataset(
+    name="assessment-golden-v1",
+    description="Golden dataset for assessment quality testing",
+    metadata={"version": "1.0"},
+)
+
+test_items = [
+    {
+        "input": {
+            "student_work": (
+                "The water cycle describes how water moves through "
+                "the environment. Water evaporates from oceans, "
+                "forms clouds, returns as rain."
+            ),
+            "rubric": (
+                "Clarity: 0-25, Argumentation: 0-25, "
+                "Evidence: 0-25, Structure: 0-25"
+            ),
+        },
+        "expected": {"overall_score": 65},
+    },
+    {
+        "input": {
+            "student_work": (
+                "Photosynthesis is the process by which plants convert "
+                "sunlight into energy. Using chlorophyll, plants absorb "
+                "CO2 and water to produce glucose and oxygen. This process "
+                "is fundamental to life on Earth."
+            ),
+            "rubric": (
+                "Clarity: 0-25, Argumentation: 0-25, "
+                "Evidence: 0-25, Structure: 0-25"
+            ),
+        },
+        "expected": {"overall_score": 82},
+    },
+    {
+        "input": {
+            "student_work": "Shakespeare wrote plays.",
+            "rubric": (
+                "Clarity: 0-25, Argumentation: 0-25, "
+                "Evidence: 0-25, Structure: 0-25"
+            ),
+        },
+        "expected": {"overall_score": 15},
+    },
+]
+
+for item in test_items:
+    langfuse.create_dataset_item(
+        dataset_name="assessment-golden-v1",
+        input=item["input"],
+        expected_output=item["expected"],
+    )
+
+langfuse.flush()
+print(f"Dataset created with {len(test_items)} items")
+```
+
+Прогон эксперимента — chain обрабатывает каждый item, результат связывается с dataset:
+
+```python
+import statistics
 from langfuse.callback import CallbackHandler
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
-
-from app.config import Settings
-from app.schemas.assessment import AssessmentResponse
+from pydantic import BaseModel, Field
 
 
-def create_langfuse_client(settings: Settings) -> Langfuse:
-    return Langfuse(
-        public_key=settings.langfuse_public_key,
-        secret_key=settings.langfuse_secret_key,
-        host=settings.langfuse_host,
-    )
+class AssessmentResult(BaseModel):
+    overall_score: int = Field(ge=0, le=100)
+    summary: str
+    strengths: list[str]
+    improvements: list[str]
 
 
-def create_callback_handler(
-    settings: Settings,
-    trace_name: str | None = None,
-    session_id: str | None = None,
-    user_id: str | None = None,
-    metadata: dict | None = None,
-    tags: list[str] | None = None,
-) -> CallbackHandler:
-    return CallbackHandler(
-        public_key=settings.langfuse_public_key,
-        secret_key=settings.langfuse_secret_key,
-        host=settings.langfuse_host,
-        trace_name=trace_name,
-        session_id=session_id,
-        user_id=user_id,
-        metadata=metadata,
-        tags=tags,
-    )
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
 
+prompt_versions = {
+    "v1": ChatPromptTemplate.from_messages([
+        ("system", "Assess the student work.\nRubric:\n{rubric}"),
+        ("human", "{student_work}"),
+    ]),
+    "v2": ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "You are an expert educator. Assess the student work against "
+            "each criterion. Be specific and constructive.\n"
+            "Rubric:\n{rubric}",
+        ),
+        ("human", "Student work:\n{student_work}"),
+    ]),
+}
 
-async def get_or_create_prompt(
-    langfuse: Langfuse,
-    name: str,
-    template: list[dict[str, str]],
-    label: str = "production",
-    config: dict | None = None,
-) -> object:
-    try:
-        prompt = langfuse.get_prompt(name=name, label=label, type="chat")
-    except Exception:
-        langfuse.create_prompt(
-            name=name,
-            prompt=template,
-            labels=[label],
-            type="chat",
-            config=config or {},
-        )
-        prompt = langfuse.get_prompt(name=name, label=label, type="chat")
-    return prompt
+dataset = langfuse.get_dataset("assessment-golden-v1")
 
-
-async def run_with_prompt(
-    student_work: str,
-    rubric_text: str,
-    prompt_messages: list,
-    llm: ChatAnthropic,
-    handler: CallbackHandler,
-) -> tuple[AssessmentResponse, float, dict[str, int]]:
-    prompt = ChatPromptTemplate.from_messages(prompt_messages)
-    chain: Runnable = prompt | llm.with_structured_output(AssessmentResponse)
-
-    start = time.perf_counter()
-    result = await chain.ainvoke(
-        {"student_work": student_work, "rubric": rubric_text},
-        config={"callbacks": [handler]},
-    )
-    elapsed_ms = (time.perf_counter() - start) * 1000
-
-    usage = {"input_tokens": 0, "output_tokens": 0}
-    if hasattr(handler, "trace") and handler.trace:
-        try:
-            trace_data = handler.trace
-            usage = {
-                "input_tokens": getattr(trace_data, "input_tokens", 0) or 0,
-                "output_tokens": getattr(trace_data, "output_tokens", 0) or 0,
-            }
-        except Exception:
-            pass
-
-    return result, elapsed_ms, usage
-
-
-async def create_dataset_with_items(
-    langfuse: Langfuse,
-    name: str,
-    items: list[dict],
-    description: str | None = None,
-) -> str:
-    langfuse.create_dataset(
-        name=name,
-        description=description or f"Dataset {name}",
-    )
-
-    for item in items:
-        langfuse.create_dataset_item(
-            dataset_name=name,
-            input={"student_work": item["student_work"]},
-            expected_output={"overall_score": item["expected_score"]},
-            metadata=item.get("metadata"),
-        )
-
-    langfuse.flush()
-    return name
-
-
-async def run_experiment(
-    langfuse: Langfuse,
-    settings: Settings,
-    dataset_name: str,
-    llm: ChatAnthropic,
-    prompt_template: list[dict[str, str]],
-    run_name: str,
-) -> dict:
-    dataset = langfuse.get_dataset(dataset_name)
-    results = []
-    trace_ids = []
-
-    prompt = ChatPromptTemplate.from_messages(prompt_template)
-    chain = prompt | llm.with_structured_output(AssessmentResponse)
+for version_name, prompt_tpl in prompt_versions.items():
+    run_name = f"experiment-{version_name}"
+    chain = prompt_tpl | llm.with_structured_output(AssessmentResult)
+    diffs = []
 
     for item in dataset.items:
-        handler = create_callback_handler(
-            settings,
+        handler = CallbackHandler(
             trace_name=f"{run_name}-{item.id}",
             tags=["experiment", run_name],
         )
-
-        start = time.perf_counter()
-        result = await chain.ainvoke(
-            item.input,
-            config={"callbacks": [handler]},
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000
-
+        result = chain.invoke(item.input, config={"callbacks": [handler]})
         handler.trace.update(output=result.model_dump())
 
-        expected_score = item.expected_output.get("overall_score", 0)
-        score_diff = abs(result.overall_score - expected_score)
+        expected_score = item.expected_output["overall_score"]
+        diff = abs(result.overall_score - expected_score)
+        diffs.append(diff)
+
         langfuse.score(
             trace_id=handler.get_trace_id(),
             name="score_accuracy",
-            value=max(0, 1 - score_diff / 100),
+            value=max(0, 1 - diff / 100),
         )
 
         item.link(
@@ -873,710 +881,243 @@ async def run_experiment(
             run_name=run_name,
         )
 
-        trace_ids.append(handler.get_trace_id())
-        results.append({
-            "score_diff": score_diff,
-            "latency_ms": elapsed_ms,
-            "predicted": result.overall_score,
-            "expected": expected_score,
-        })
+    avg_diff = statistics.mean(diffs)
+    print(f"[{version_name}] avg_score_diff={avg_diff:.1f}, items={len(diffs)}")
 
-    langfuse.flush()
-
-    avg_diff = statistics.mean(r["score_diff"] for r in results)
-    avg_latency = statistics.mean(r["latency_ms"] for r in results)
-
-    return {
-        "run_name": run_name,
-        "avg_score_diff": round(avg_diff, 2),
-        "items_processed": len(results),
-        "avg_latency_ms": round(avg_latency, 1),
-        "trace_ids": trace_ids,
-    }
-
-
-async def score_trace(
-    langfuse: Langfuse,
-    trace_id: str,
-    scores: list[dict],
-) -> list[dict]:
-    posted = []
-    for s in scores:
-        langfuse.score(
-            trace_id=trace_id,
-            name=s["name"],
-            value=s["value"],
-            comment=s.get("comment"),
-            data_type="NUMERIC",
-        )
-        posted.append({
-            "name": s["name"],
-            "value": s["value"],
-            "trace_id": trace_id,
-        })
-    langfuse.flush()
-    return posted
-
-
-async def llm_judge_score(
-    student_work: str,
-    assessment_result: dict,
-    llm: ChatAnthropic,
-    handler: CallbackHandler,
-) -> list[dict]:
-    judge_prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            "You are a quality evaluator. Given a student work and an AI assessment, "
-            "rate the assessment quality on three dimensions.\n"
-            "Return JSON with exactly these fields:\n"
-            "- accuracy (0.0-1.0): how accurate is the score\n"
-            "- completeness (0.0-1.0): does feedback cover all aspects\n"
-            "- helpfulness (0.0-1.0): how actionable is the feedback",
-        ),
-        (
-            "human",
-            "Student work:\n{student_work}\n\n"
-            "Assessment result:\n{assessment_result}\n\n"
-            "Rate the assessment quality as JSON:",
-        ),
-    ])
-
-    from pydantic import BaseModel, Field
-
-    class JudgeScores(BaseModel):
-        accuracy: float = Field(ge=0, le=1)
-        completeness: float = Field(ge=0, le=1)
-        helpfulness: float = Field(ge=0, le=1)
-
-    chain = judge_prompt | llm.with_structured_output(JudgeScores)
-    judge_result = await chain.ainvoke(
-        {
-            "student_work": student_work,
-            "assessment_result": str(assessment_result),
-        },
-        config={"callbacks": [handler]},
-    )
-
-    return [
-        {"name": "accuracy", "value": judge_result.accuracy},
-        {"name": "completeness", "value": judge_result.completeness},
-        {"name": "helpfulness", "value": judge_result.helpfulness},
-    ]
-
-
-def compute_analytics(
-    langfuse: Langfuse,
-    limit: int = 50,
-    tags: list[str] | None = None,
-) -> dict:
-    traces = langfuse.fetch_traces(limit=limit)
-
-    if not traces.data:
-        return {
-            "total_traces": 0,
-            "total_cost_usd": 0,
-            "cost_by_model": [],
-            "latency": {"p50_ms": 0, "p95_ms": 0, "p99_ms": 0, "avg_ms": 0},
-            "avg_scores": {},
-            "period": "no data",
-        }
-
-    model_costs = defaultdict(lambda: {
-        "total_cost": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "count": 0,
-    })
-    latencies = []
-    score_values = defaultdict(list)
-    total_cost = 0
-
-    for trace in traces.data:
-        if tags and not any(t in (trace.tags or []) for t in tags):
-            continue
-
-        if trace.latency:
-            latencies.append(trace.latency * 1000)
-
-        observations = langfuse.fetch_observations(trace_id=trace.id)
-        for obs in observations.data:
-            if obs.type == "GENERATION":
-                model_name = obs.model or "unknown"
-                cost = obs.calculated_total_cost or 0
-                total_cost += cost
-                model_costs[model_name]["total_cost"] += cost
-                model_costs[model_name]["count"] += 1
-                if obs.usage:
-                    model_costs[model_name]["input_tokens"] += (
-                        obs.usage.input or 0
-                    )
-                    model_costs[model_name]["output_tokens"] += (
-                        obs.usage.output or 0
-                    )
-
-        scores = langfuse.fetch_scores(trace_id=trace.id)
-        for sc in scores.data if hasattr(scores, "data") else []:
-            if sc.value is not None:
-                score_values[sc.name].append(sc.value)
-
-    sorted_latencies = sorted(latencies) if latencies else [0]
-    n = len(sorted_latencies)
-
-    cost_breakdown = [
-        {
-            "model": model,
-            "total_cost_usd": round(data["total_cost"], 6),
-            "input_tokens": data["input_tokens"],
-            "output_tokens": data["output_tokens"],
-            "call_count": data["count"],
-        }
-        for model, data in model_costs.items()
-    ]
-
-    avg_scores = {
-        name: round(statistics.mean(vals), 3)
-        for name, vals in score_values.items()
-    }
-
-    return {
-        "total_traces": len(traces.data),
-        "total_cost_usd": round(total_cost, 6),
-        "cost_by_model": cost_breakdown,
-        "latency": {
-            "p50_ms": round(sorted_latencies[n // 2], 1),
-            "p95_ms": round(sorted_latencies[int(n * 0.95)], 1),
-            "p99_ms": round(sorted_latencies[int(n * 0.99)], 1),
-            "avg_ms": round(statistics.mean(sorted_latencies), 1),
-        },
-        "avg_scores": avg_scores,
-        "period": f"last {len(traces.data)} traces",
-    }
+langfuse.flush()
 ```
 
-### Шаг 3. Router — `app/api/v1/langfuse.py`
+### Пример 3. Online evaluation — scoring
 
-Четыре эндпоинта, каждый демонстрирует отдельный аспект Langfuse.
+Запускаем chain с трейсингом, затем оцениваем результат тремя способами: эвристика, LLM-as-judge, кастомный score.
 
 ```python
-from fastapi import APIRouter, HTTPException
+from langfuse import Langfuse
+from langfuse.callback import CallbackHandler
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
-from app.dependencies import LLMDep, RubricStoreDep
-from app.config import get_settings
-from app.schemas.langfuse import (
-    PromptTestRequest,
-    PromptTestResponse,
-    PromptComparisonResult,
-    DatasetRunRequest,
-    ExperimentResponse,
-    ExperimentResult,
-    ScoreRequest,
-    ScoreResponse,
-    AnalyticsRequest,
-    AnalyticsResponse,
-    CostBreakdown,
-    LatencyStats,
-)
-from app.services.langfuse_service import (
-    create_langfuse_client,
-    create_callback_handler,
-    get_or_create_prompt,
-    run_with_prompt,
-    create_dataset_with_items,
-    run_experiment,
-    score_trace,
-    llm_judge_score,
-    compute_analytics,
-)
 
-router = APIRouter(prefix="/langfuse", tags=["langfuse"])
+class AssessmentResult(BaseModel):
+    overall_score: int = Field(ge=0, le=100)
+    summary: str
+    strengths: list[str]
+    improvements: list[str]
 
-HARDCODED_ASSESSMENT_PROMPT = [
+
+langfuse = Langfuse()
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
+
+prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are an expert educator. Assess the student work against the rubric.\n"
-        "Rubric:\n{rubric}",
+        "You are an expert educator. Assess the student work "
+        "against the rubric.\nRubric:\n{rubric}",
+    ),
+    ("human", "Student work:\n{student_work}"),
+])
+chain = prompt | llm.with_structured_output(AssessmentResult)
+
+handler = CallbackHandler(
+    trace_name="assess-and-score",
+    tags=["scoring", "notebook"],
+)
+
+result = chain.invoke(
+    {
+        "student_work": (
+            "The French Revolution began in 1789 and fundamentally "
+            "transformed French society. Key causes included fiscal crisis, "
+            "social inequality, and Enlightenment ideas. The storming of "
+            "the Bastille symbolized the uprising."
+        ),
+        "rubric": "Clarity: 0-25, Argumentation: 0-25, Evidence: 0-25, Structure: 0-25",
+    },
+    config={"callbacks": [handler]},
+)
+
+trace_id = handler.get_trace_id()
+print(f"Assessment score: {result.overall_score}")
+print(f"Trace ID: {trace_id}")
+```
+
+Эвристические scores — простые программные проверки без LLM:
+
+```python
+langfuse.score(
+    trace_id=trace_id,
+    name="format_valid",
+    value=1 if 0 <= result.overall_score <= 100 else 0,
+    data_type="BOOLEAN",
+    comment="Score within valid range",
+)
+
+langfuse.score(
+    trace_id=trace_id,
+    name="feedback_length",
+    value=min(1.0, len(result.summary) / 200),
+    data_type="NUMERIC",
+    comment="Summary length normalized to 200 chars",
+)
+
+print(f"Heuristic scores posted for trace {trace_id}")
+```
+
+LLM-as-judge — отдельный LLM оценивает качество результата:
+
+```python
+class JudgeScores(BaseModel):
+    accuracy: float = Field(ge=0, le=1)
+    completeness: float = Field(ge=0, le=1)
+    helpfulness: float = Field(ge=0, le=1)
+
+
+judge_prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are a quality evaluator. Given a student work and an AI "
+        "assessment, rate the assessment quality on three dimensions.\n"
+        "Return JSON with fields: accuracy (0-1), completeness (0-1), "
+        "helpfulness (0-1).",
     ),
     (
         "human",
-        "Student work:\n{student_work}",
+        "Student work:\n{student_work}\n\n"
+        "Assessment:\n{assessment}\n\nRate:",
     ),
-]
+])
 
-LANGFUSE_PROMPT_TEMPLATE = [
+judge_chain = judge_prompt | llm.with_structured_output(JudgeScores)
+
+judge_handler = CallbackHandler(
+    trace_name="llm-judge",
+    tags=["scoring", "judge"],
+)
+
+judge_result = judge_chain.invoke(
     {
-        "role": "system",
-        "content": "You are an expert educator and assessment specialist.\n"
-        "Evaluate the student work carefully against each criterion in the rubric.\n"
-        "Be specific in your feedback and provide actionable suggestions.\n\n"
-        "Rubric:\n{{rubric}}",
-    },
-    {
-        "role": "user",
-        "content": "Please assess the following student work:\n\n{{student_work}}",
-    },
-]
-
-
-def _format_rubric(rubric_id: str, rubrics) -> str:
-    if rubric_id not in rubrics:
-        raise HTTPException(status_code=404, detail=f"Rubric '{rubric_id}' not found")
-    rubric = rubrics[rubric_id]
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-@router.post("/prompt-test")
-async def prompt_test(
-    request: PromptTestRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> PromptTestResponse:
-    settings = get_settings()
-    langfuse = create_langfuse_client(settings)
-    rubric_text = _format_rubric(request.rubric_id, rubrics)
-
-    prompt = await get_or_create_prompt(
-        langfuse,
-        name=request.prompt_name,
-        template=LANGFUSE_PROMPT_TEMPLATE,
-        label=request.prompt_label,
-    )
-
-    langfuse_messages = []
-    compiled = prompt.compile(student_work="{student_work}", rubric="{rubric}")
-    for msg in compiled:
-        langfuse_messages.append((msg["role"], msg["content"]))
-
-    handler_lf = create_callback_handler(
-        settings,
-        trace_name="prompt-test-langfuse",
-        tags=["prompt-test", "langfuse-managed"],
-    )
-    lf_result, lf_latency, lf_usage = await run_with_prompt(
-        request.student_work, rubric_text, langfuse_messages, llm, handler_lf,
-    )
-
-    handler_hc = create_callback_handler(
-        settings,
-        trace_name="prompt-test-hardcoded",
-        tags=["prompt-test", "hardcoded"],
-    )
-    hc_result, hc_latency, hc_usage = await run_with_prompt(
-        request.student_work, rubric_text, HARDCODED_ASSESSMENT_PROMPT, llm, handler_hc,
-    )
-
-    trace_id = handler_lf.get_trace_id()
-    langfuse.flush()
-
-    return PromptTestResponse(
-        langfuse_prompt=PromptComparisonResult(
-            source="langfuse",
-            overall_score=lf_result.overall_score,
-            summary=lf_result.summary,
-            latency_ms=round(lf_latency, 1),
-            token_usage=lf_usage,
+        "student_work": (
+            "The French Revolution began in 1789 and fundamentally "
+            "transformed French society..."
         ),
-        hardcoded_prompt=PromptComparisonResult(
-            source="hardcoded",
-            overall_score=hc_result.overall_score,
-            summary=hc_result.summary,
-            latency_ms=round(hc_latency, 1),
-            token_usage=hc_usage,
-        ),
+        "assessment": result.model_dump_json(),
+    },
+    config={"callbacks": [judge_handler]},
+)
+
+for score_name in ["accuracy", "completeness", "helpfulness"]:
+    langfuse.score(
         trace_id=trace_id,
-        trace_url=handler_lf.get_trace_url(),
+        name=score_name,
+        value=getattr(judge_result, score_name),
+        data_type="NUMERIC",
     )
 
-
-@router.post("/experiment")
-async def run_dataset_experiment(
-    request: DatasetRunRequest,
-    llm: LLMDep,
-) -> ExperimentResponse:
-    settings = get_settings()
-    langfuse = create_langfuse_client(settings)
-
-    items = [
-        {
-            "student_work": item.student_work,
-            "expected_score": item.expected_score,
-            "metadata": item.metadata,
-        }
-        for item in request.items
-    ]
-
-    await create_dataset_with_items(
-        langfuse,
-        name=request.dataset_name,
-        items=items,
-        description="Experiment dataset for prompt comparison",
-    )
-
-    runs = []
-    all_trace_ids = []
-
-    prompt_templates = {
-        "v1": [
-            ("system", "Assess the student work.\nRubric:\n{rubric}"),
-            ("human", "{student_work}"),
-        ],
-        "v2": [
-            (
-                "system",
-                "You are an expert educator. Assess the student work against "
-                "each criterion. Be specific and constructive.\nRubric:\n{rubric}",
-            ),
-            ("human", "Student work:\n{student_work}"),
-        ],
-    }
-
-    for version in request.prompt_versions:
-        template = prompt_templates.get(version, prompt_templates["v1"])
-        run_name = f"{request.run_prefix}-{version}"
-
-        result = await run_experiment(
-            langfuse, settings, request.dataset_name, llm, template, run_name,
-        )
-
-        runs.append(ExperimentResult(
-            run_name=result["run_name"],
-            prompt_version=version,
-            avg_score_diff=result["avg_score_diff"],
-            items_processed=result["items_processed"],
-            total_cost_usd=0.0,
-            avg_latency_ms=result["avg_latency_ms"],
-        ))
-        all_trace_ids.extend(result["trace_ids"])
-
-    langfuse.flush()
-
-    return ExperimentResponse(
-        dataset_name=request.dataset_name,
-        runs=runs,
-        trace_ids=all_trace_ids,
-    )
-
-
-@router.post("/score")
-async def assess_and_score(
-    request: ScoreRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> ScoreResponse:
-    settings = get_settings()
-    langfuse = create_langfuse_client(settings)
-    rubric_text = _format_rubric(request.rubric_id, rubrics)
-
-    handler = create_callback_handler(
-        settings,
-        trace_name="assess-and-score",
-        tags=["scoring", "llm-judge"],
-    )
-
-    from app.schemas.assessment import AssessmentResponse
-    from langchain_core.prompts import ChatPromptTemplate
-
-    prompt = ChatPromptTemplate.from_messages(HARDCODED_ASSESSMENT_PROMPT)
-    chain = prompt | llm.with_structured_output(AssessmentResponse)
-
-    result = await chain.ainvoke(
-        {"student_work": request.student_work, "rubric": rubric_text},
-        config={"callbacks": [handler]},
-    )
-
-    trace_id = handler.get_trace_id()
-    all_scores = []
-
-    if request.auto_score:
-        judge_handler = create_callback_handler(
-            settings,
-            trace_name="llm-judge",
-            tags=["scoring", "judge"],
-        )
-        judge_scores = await llm_judge_score(
-            request.student_work,
-            result.model_dump(),
-            llm,
-            judge_handler,
-        )
-        posted = await score_trace(langfuse, trace_id, judge_scores)
-        all_scores.extend(posted)
-
-    if request.custom_scores:
-        custom = [
-            {"name": s.name, "value": s.value, "comment": s.comment}
-            for s in request.custom_scores
-        ]
-        posted = await score_trace(langfuse, trace_id, custom)
-        all_scores.extend(posted)
-
-    langfuse.flush()
-
-    return ScoreResponse(
-        trace_id=trace_id,
-        assessment_result=result.model_dump(),
-        scores=all_scores,
-        trace_url=handler.get_trace_url(),
-    )
-
-
-@router.get("/analytics")
-async def get_analytics(
-    limit: int = 50,
-    tags: str | None = None,
-) -> AnalyticsResponse:
-    settings = get_settings()
-    langfuse = create_langfuse_client(settings)
-
-    tag_list = tags.split(",") if tags else None
-    data = compute_analytics(langfuse, limit=limit, tags=tag_list)
-
-    return AnalyticsResponse(
-        total_traces=data["total_traces"],
-        total_cost_usd=data["total_cost_usd"],
-        cost_by_model=[CostBreakdown(**c) for c in data["cost_by_model"]],
-        latency=LatencyStats(**data["latency"]),
-        avg_scores=data["avg_scores"],
-        period=data["period"],
-    )
+print(f"accuracy={judge_result.accuracy}")
+print(f"completeness={judge_result.completeness}")
+print(f"helpfulness={judge_result.helpfulness}")
 ```
 
-### Шаг 4. Регистрация в роутере
-
-В `app/api/router.py` добавляем новый модуль:
+Кастомный score — оценка из кода (или user feedback):
 
 ```python
-from fastapi import APIRouter
+langfuse.score(
+    trace_id=trace_id,
+    name="relevance",
+    value=0.9,
+    data_type="NUMERIC",
+    comment="On topic and comprehensive",
+)
 
-from app.api.v1 import assessment, rubrics, prompts, langfuse
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(langfuse.router)
+langfuse.flush()
+print("All scores posted")
 ```
 
-В `app/config.py` добавляем настройки Langfuse:
+### Пример 4. Dashboard queries — аналитика
+
+Загружаем traces и observations через API для расчёта стоимости по моделям, латентности и средних scores.
 
 ```python
-from functools import lru_cache
+import statistics
+from collections import defaultdict
+from langfuse import Langfuse
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+langfuse = Langfuse()
 
+traces = langfuse.fetch_traces(limit=50)
+print(f"Total traces: {len(traces.data)}")
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+model_costs = defaultdict(lambda: {
+    "cost": 0, "input_tokens": 0, "output_tokens": 0, "count": 0,
+})
+latencies = []
+score_values = defaultdict(list)
+total_cost = 0
 
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
-    model_name: str = "claude-sonnet-4-20250514"
-    temperature: float = 0.3
-    max_tokens: int = 4096
+for trace in traces.data:
+    if trace.latency:
+        latencies.append(trace.latency * 1000)
 
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-    langfuse_host: str = "https://cloud.langfuse.com"
+    observations = langfuse.fetch_observations(trace_id=trace.id)
+    for obs in observations.data:
+        if obs.type == "GENERATION":
+            model_name = obs.model or "unknown"
+            cost = obs.calculated_total_cost or 0
+            total_cost += cost
+            model_costs[model_name]["cost"] += cost
+            model_costs[model_name]["count"] += 1
+            if obs.usage:
+                model_costs[model_name]["input_tokens"] += obs.usage.input or 0
+                model_costs[model_name]["output_tokens"] += obs.usage.output or 0
 
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
+    scores = langfuse.fetch_scores(trace_id=trace.id)
+    for sc in scores.data if hasattr(scores, "data") else []:
+        if sc.value is not None:
+            score_values[sc.name].append(sc.value)
 ```
 
-В `.env` добавляем ключи:
+```python
+print(f"Total cost: ${total_cost:.4f}\n")
 
-```
-LANGFUSE_PUBLIC_KEY=pk-lf-your-public-key
-LANGFUSE_SECRET_KEY=sk-lf-your-secret-key
-LANGFUSE_HOST=https://cloud.langfuse.com
-```
+for model, data in model_costs.items():
+    print(f"Model: {model}")
+    print(f"  Calls: {data['count']}")
+    print(f"  Cost: ${data['cost']:.4f}")
+    print(f"  Input tokens: {data['input_tokens']}")
+    print(f"  Output tokens: {data['output_tokens']}")
+    print()
 
-### Шаг 5. Тестирование с curl
+if latencies:
+    sorted_lat = sorted(latencies)
+    n = len(sorted_lat)
+    print(f"Latency p50: {sorted_lat[n // 2]:.0f}ms")
+    print(f"Latency p95: {sorted_lat[int(n * 0.95)]:.0f}ms")
+    print(f"Latency p99: {sorted_lat[int(n * 0.99)]:.0f}ms")
+    print(f"Latency avg: {statistics.mean(sorted_lat):.0f}ms\n")
 
-**1. Тест промптов — сравнение Langfuse-managed vs hardcoded:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/langfuse/prompt-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a significant global challenge. Rising temperatures lead to melting ice caps, rising sea levels, and extreme weather events. Governments must implement carbon reduction policies. Renewable energy adoption is critical for sustainability.",
-    "rubric_id": "essay_default",
-    "prompt_name": "assessment-prompt",
-    "prompt_label": "production"
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "langfuse_prompt": {
-    "source": "langfuse",
-    "overall_score": 72,
-    "summary": "Solid overview of climate change with clear structure...",
-    "latency_ms": 3450.2,
-    "token_usage": {"input_tokens": 1250, "output_tokens": 800}
-  },
-  "hardcoded_prompt": {
-    "source": "hardcoded",
-    "overall_score": 70,
-    "summary": "Good general overview but lacks depth...",
-    "latency_ms": 3120.8,
-    "token_usage": {"input_tokens": 1100, "output_tokens": 750}
-  },
-  "trace_id": "abc-123-def",
-  "trace_url": "https://cloud.langfuse.com/trace/abc-123-def"
-}
-```
-
-**2. Эксперимент — прогон dataset с двумя версиями промпта:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/langfuse/experiment \
-  -H "Content-Type: application/json" \
-  -d '{
-    "dataset_name": "assessment-test-001",
-    "items": [
-      {
-        "student_work": "The water cycle describes how water moves through the environment. Water evaporates from oceans, forms clouds through condensation, and returns as precipitation.",
-        "expected_score": 65
-      },
-      {
-        "student_work": "Photosynthesis is the process by which plants convert sunlight into energy. Using chlorophyll in their leaves, plants absorb CO2 and water to produce glucose and oxygen. This process is fundamental to life on Earth, forming the base of most food chains and producing the oxygen we breathe.",
-        "expected_score": 82
-      },
-      {
-        "student_work": "Shakespeare wrote plays.",
-        "expected_score": 15
-      }
-    ],
-    "prompt_versions": ["v1", "v2"],
-    "run_prefix": "bootcamp-exp"
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "dataset_name": "assessment-test-001",
-  "runs": [
-    {
-      "run_name": "bootcamp-exp-v1",
-      "prompt_version": "v1",
-      "avg_score_diff": 12.3,
-      "items_processed": 3,
-      "total_cost_usd": 0.0,
-      "avg_latency_ms": 3200.5
-    },
-    {
-      "run_name": "bootcamp-exp-v2",
-      "prompt_version": "v2",
-      "avg_score_diff": 8.1,
-      "items_processed": 3,
-      "total_cost_usd": 0.0,
-      "avg_latency_ms": 3450.2
-    }
-  ],
-  "trace_ids": ["id-1", "id-2", "id-3", "id-4", "id-5", "id-6"]
-}
-```
-
-**3. Оценка с auto-scoring (LLM-as-judge):**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/langfuse/score \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The French Revolution began in 1789 and fundamentally transformed French society. Key causes included fiscal crisis, social inequality under the Estates system, and Enlightenment ideas. The storming of the Bastille symbolized the uprising. The revolution led to the Declaration of the Rights of Man and eventually Napoleons rise to power.",
-    "rubric_id": "essay_default",
-    "auto_score": true,
-    "custom_scores": [
-      {"name": "relevance", "value": 0.9, "comment": "On topic and comprehensive"}
-    ]
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "trace_id": "trace-xyz",
-  "assessment_result": {
-    "overall_score": 78,
-    "max_overall_score": 100,
-    "criterion_scores": [...],
-    "summary": "Well-structured essay on the French Revolution...",
-    "strengths": ["Clear chronological structure", "Key events identified"],
-    "improvements": ["Add more specific dates", "Discuss social impacts"]
-  },
-  "scores": [
-    {"name": "accuracy", "value": 0.85, "trace_id": "trace-xyz"},
-    {"name": "completeness", "value": 0.78, "trace_id": "trace-xyz"},
-    {"name": "helpfulness", "value": 0.82, "trace_id": "trace-xyz"},
-    {"name": "relevance", "value": 0.9, "trace_id": "trace-xyz"}
-  ],
-  "trace_url": "https://cloud.langfuse.com/trace/trace-xyz"
-}
-```
-
-**4. Аналитика — стоимость и латентность:**
-
-```bash
-curl "http://localhost:8000/api/v1/langfuse/analytics?limit=100&tags=production"
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "total_traces": 87,
-  "total_cost_usd": 1.234567,
-  "cost_by_model": [
-    {
-      "model": "claude-sonnet-4-20250514",
-      "total_cost_usd": 1.15,
-      "input_tokens": 125000,
-      "output_tokens": 80000,
-      "call_count": 87
-    }
-  ],
-  "latency": {
-    "p50_ms": 3200.0,
-    "p95_ms": 8100.0,
-    "p99_ms": 15400.0,
-    "avg_ms": 4150.3
-  },
-  "avg_scores": {
-    "accuracy": 0.856,
-    "completeness": 0.791,
-    "helpfulness": 0.823
-  },
-  "period": "last 87 traces"
-}
+for name, vals in score_values.items():
+    print(f"Score '{name}': avg={statistics.mean(vals):.3f} (n={len(vals)})")
 ```
 
 ### Связь с теорией
 
-| Эндпоинт | Секции теории |
-|----------|--------------|
-| `POST /langfuse/prompt-test` | §2 Prompt Management — загрузка промпта через `get_prompt`, сравнение с hardcoded |
-| `POST /langfuse/experiment` | §3 Datasets — создание dataset, запуск experiment, `item.link()` |
-| `POST /langfuse/score` | §4 Scores — LLM-as-judge, `langfuse.score()`, evaluation pipeline |
-| `GET /langfuse/analytics` | §6 Cost Analytics — cost by model, latency percentiles |
+| Пример | Секции теории |
+|--------|--------------|
+| Пример 1: Prompt Management | §2 — загрузка промпта через `get_prompt`, `compile`, `get_langchain_prompt` |
+| Пример 2: Datasets и эксперименты | §3 — создание dataset, запуск experiment, `item.link()` |
+| Пример 3: Online evaluation | §4 — Scores, LLM-as-judge, heuristic scoring, `langfuse.score()` |
+| Пример 4: Dashboard queries | §6 — Cost analytics, latency percentiles, score aggregation |
 
-Каждый эндпоинт демонстрирует конкретный столп Langfuse из §1:
+Каждый пример демонстрирует конкретный столп Langfuse из §1:
 
-- **prompt-test** → Prompt Management + Tracing
-- **experiment** → Datasets + Evaluation
-- **score** → Evaluation (automated + manual)
-- **analytics** → Cost Analytics
+- **Пример 1** → Prompt Management + Tracing
+- **Пример 2** → Datasets + Evaluation
+- **Пример 3** → Evaluation (automated + manual)
+- **Пример 4** → Cost Analytics
 
 ---
+
 
 ## Чеклист самопроверки
 
@@ -1584,7 +1125,7 @@ curl "http://localhost:8000/api/v1/langfuse/analytics?limit=100&tags=production"
 - [ ] Чем `get_prompt(label="production")` отличается от `get_prompt(version=3)`? Когда использовать каждый вариант?
 - [ ] Опишите workflow эксперимента: от создания dataset до сравнения runs. Какие API-вызовы нужны на каждом шаге?
 - [ ] Какие типы scores поддерживает Langfuse? Приведите пример использования каждого типа в контексте assessment системы.
-- [ ] Что произойдёт, если не вызвать `langfuse.flush()` при shutdown FastAPI-приложения?
+- [ ] Что произойдёт, если не вызвать `langfuse.flush()` в конце скрипта или эксперимента?
 - [ ] Как `session_id` помогает при анализе traces? Приведите пример для multi-turn interaction.
 - [ ] Почему `cache_ttl_seconds=300` рекомендуется для production, а не `cache_ttl_seconds=0`?
 - [ ] Чем LLM-as-judge отличается от heuristic scoring? Когда выбрать какой подход?
@@ -1595,22 +1136,20 @@ curl "http://localhost:8000/api/v1/langfuse/analytics?limit=100&tags=production"
 
 ## Частые ошибки
 
-### 1. Забытый flush при shutdown
+### 1. Забытый flush
 
 ```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
+result = chain.invoke(...)
+langfuse.score(trace_id=trace_id, name="accuracy", value=0.9)
 ```
 
 ```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    langfuse.flush()
+result = chain.invoke(...)
+langfuse.score(trace_id=trace_id, name="accuracy", value=0.9)
+langfuse.flush()
 ```
 
-Langfuse SDK буферизует данные и отправляет их батчами. Без `flush()` при shutdown последние traces могут потеряться. Особенно критично для коротких скриптов и экспериментов.
+Langfuse SDK буферизует данные и отправляет их батчами. Без `flush()` в конце скрипта или notebook-ячейки последние traces и scores могут потеряться. Вызывайте `flush()` после завершения эксперимента или в `finally`-блоке.
 
 ### 2. Hardcoded ключи вместо env vars
 

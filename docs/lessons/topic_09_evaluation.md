@@ -1,8 +1,7 @@
 # Тема 9: Evaluation
 
 > **Пререквизиты:** [Тема 1–4](topic_01_prompt_engineering.md), [Тема 3 (Structured Output)](topic_03_structured_output.md), рекомендуется [Тема 5 (RAG)](topic_05_rag.md), [Тема 8 (Observability)](topic_08_observability.md)  
-> **Что добавляем в проект:** роутер `app/api/v1/eval.py`, сервис `app/services/evaluation.py`, схемы `app/schemas/evaluation.py`, директория `data/golden/`  
-> **Зависимости:** `langfuse`, `ragas`, `langsmith`, `numpy`, `scipy` (группа `eval` в pyproject.toml)
+> **Зависимости:** `langchain-anthropic`, `langfuse`, `ragas`, `langsmith`, `numpy`, `scipy`
 
 ---
 
@@ -395,32 +394,17 @@ json_str = entry.model_dump_json(indent=2)
 
 ---
 
-## Практика: роутер `/api/v1/eval`
+## Практика
 
-Создаём evaluation API, интегрированный в FastAPI-проект. Четыре эндпоинта: загрузка golden dataset, прогон eval pipeline, LLM-as-judge, A/B тест промптов.
+Все примеры — самодостаточные: определяют данные и модели прямо в ячейке, не требуют внешних импортов из проекта.
 
-Архитектура:
+### Пример 1: Golden dataset
 
-```
-POST /api/v1/eval/golden-dataset  →  сохранить golden entry
-POST /api/v1/eval/run             →  прогнать pipeline, вернуть метрики
-POST /api/v1/eval/judge           →  LLM-as-judge для одной записи
-POST /api/v1/eval/ab-test         →  сравнить два промпта
-```
-
-### Шаг 1: Схемы (`app/schemas/evaluation.py`)
-
-Создаём Pydantic-модели для всех данных evaluation. `GoldenEntry` описывает структуру golden dataset (раздел 3 теории). `EvalReport` содержит агрегированные метрики (раздел 4). `JudgeResponse` — структурированный вывод LLM-as-judge (раздел 5) и одновременно `with_structured_output`-схема.
+Создаём Pydantic-модели для golden dataset и загружаем записи. Каждая запись содержит входные данные, эталонные оценки от эксперта и метаданные.
 
 ```python
+import json
 from pydantic import BaseModel, Field
-
-from app.schemas.assessment import AssessmentResponse
-
-
-class GoldenEntryInput(BaseModel):
-    student_work: str
-    rubric_id: str = "essay_default"
 
 
 class ExpectedCriterionScore(BaseModel):
@@ -432,6 +416,11 @@ class ExpectedCriterionScore(BaseModel):
 class ExpectedOutput(BaseModel):
     overall_score: int
     criterion_scores: list[ExpectedCriterionScore]
+
+
+class GoldenEntryInput(BaseModel):
+    student_work: str
+    rubric_id: str = "essay_default"
 
 
 class GoldenEntryMetadata(BaseModel):
@@ -446,16 +435,77 @@ class GoldenEntry(BaseModel):
     metadata: GoldenEntryMetadata
 
 
-class EvalRunRequest(BaseModel):
-    rubric_id: str = "essay_default"
+golden_data = [
+    {
+        "id": "golden_001",
+        "input": {
+            "student_work": (
+                "Climate change represents one of the most significant challenges "
+                "facing humanity today. Multiple studies from the IPCC and NASA confirm "
+                "that global temperatures have risen by 1.1 degrees Celsius since "
+                "pre-industrial times. This essay argues that carbon taxation is the "
+                "most effective policy mechanism to reduce emissions, supported by "
+                "evidence from the EU ETS and the British Columbia carbon tax."
+            ),
+            "rubric_id": "essay_default",
+        },
+        "expected_output": {
+            "overall_score": 72,
+            "criterion_scores": [
+                {"criterion_name": "Thesis & Argument", "score": 18, "max_score": 25},
+                {"criterion_name": "Evidence & Support", "score": 19, "max_score": 25},
+                {"criterion_name": "Structure & Organization", "score": 15, "max_score": 20},
+                {"criterion_name": "Critical Thinking", "score": 12, "max_score": 20},
+                {"criterion_name": "Language & Style", "score": 8, "max_score": 10},
+            ],
+        },
+        "metadata": {"quality_level": "medium", "description": "Decent essay on climate policy"},
+    },
+    {
+        "id": "golden_002",
+        "input": {
+            "student_work": "AI is cool. It does stuff. The end.",
+            "rubric_id": "essay_default",
+        },
+        "expected_output": {
+            "overall_score": 25,
+            "criterion_scores": [
+                {"criterion_name": "Thesis & Argument", "score": 5, "max_score": 25},
+                {"criterion_name": "Evidence & Support", "score": 3, "max_score": 25},
+                {"criterion_name": "Structure & Organization", "score": 8, "max_score": 20},
+                {"criterion_name": "Critical Thinking", "score": 5, "max_score": 20},
+                {"criterion_name": "Language & Style", "score": 4, "max_score": 10},
+            ],
+        },
+        "metadata": {"quality_level": "weak", "description": "Minimal effort, no evidence"},
+    },
+]
+
+entries = [GoldenEntry.model_validate(item) for item in golden_data]
+
+for e in entries:
+    print(f"{e.id}: overall={e.expected_output.overall_score}, "
+          f"quality={e.metadata.quality_level}")
+    for cs in e.expected_output.criterion_scores:
+        print(f"  {cs.criterion_name}: {cs.score}/{cs.max_score}")
+
+print(f"\nСериализация в JSON:\n{entries[0].model_dump_json(indent=2)[:200]}...")
+```
+
+### Пример 2: Eval pipeline — вычисление метрик
+
+Имитируем прогон assessment-цепочки на golden dataset: для каждой записи получаем предсказания модели (здесь захардкожены для демонстрации), затем считаем MAE, exact match, within-N и Pearson correlation.
+
+```python
+import numpy as np
+from scipy.stats import pearsonr
+from pydantic import BaseModel
 
 
-class CriterionMetrics(BaseModel):
+class CriterionResult(BaseModel):
     criterion_name: str
-    mae: float
-    exact_match_rate: float
-    within_3_rate: float
-    within_5_rate: float
+    expected: list[int]
+    predicted: list[int]
 
 
 class EvalReport(BaseModel):
@@ -464,12 +514,70 @@ class EvalReport(BaseModel):
     overall_exact_match_rate: float
     overall_within_5_rate: float
     pearson_correlation: float
-    criterion_metrics: list[CriterionMetrics]
+    criterion_reports: list[dict]
 
 
-class JudgeRequest(BaseModel):
-    system_output: AssessmentResponse
-    expected_output: ExpectedOutput
+criterion_names = [
+    "Thesis & Argument",
+    "Evidence & Support",
+    "Structure & Organization",
+    "Critical Thinking",
+    "Language & Style",
+]
+
+expected_overall = np.array([72, 25, 88, 55, 41])
+predicted_overall = np.array([68, 30, 85, 60, 38])
+
+expected_by_criterion = {
+    "Thesis & Argument":        np.array([18, 5, 22, 14, 10]),
+    "Evidence & Support":       np.array([19, 3, 23, 12, 8]),
+    "Structure & Organization": np.array([15, 8, 18, 13, 10]),
+    "Critical Thinking":        np.array([12, 5, 17, 10, 7]),
+    "Language & Style":         np.array([8,  4,  8,  6, 6]),
+}
+
+predicted_by_criterion = {
+    "Thesis & Argument":        np.array([16, 7, 21, 15, 9]),
+    "Evidence & Support":       np.array([17, 5, 22, 14, 7]),
+    "Structure & Organization": np.array([14, 9, 17, 12, 11]),
+    "Critical Thinking":        np.array([13, 4, 16, 11, 6]),
+    "Language & Style":         np.array([8,  5,  9,  8, 5]),
+}
+
+overall_diffs = np.abs(predicted_overall - expected_overall)
+overall_mae = float(np.mean(overall_diffs))
+overall_exact_match = float(np.mean(overall_diffs == 0))
+overall_within_5 = float(np.mean(overall_diffs <= 5))
+corr, p_value = pearsonr(expected_overall.tolist(), predicted_overall.tolist())
+
+print(f"Overall MAE:          {overall_mae:.2f}")
+print(f"Overall Exact Match:  {overall_exact_match:.1%}")
+print(f"Overall Within-5:     {overall_within_5:.1%}")
+print(f"Pearson correlation:  {corr:.3f} (p={p_value:.4f})")
+print()
+
+for cname in criterion_names:
+    exp = expected_by_criterion[cname]
+    pred = predicted_by_criterion[cname]
+    diffs = np.abs(pred - exp)
+
+    mae = float(np.mean(diffs))
+    exact = float(np.mean(diffs == 0))
+    w3 = float(np.mean(diffs <= 3))
+    w5 = float(np.mean(diffs <= 5))
+
+    print(f"{cname:30s}  MAE={mae:.2f}  exact={exact:.0%}  "
+          f"within-3={w3:.0%}  within-5={w5:.0%}")
+```
+
+### Пример 3: LLM-as-judge
+
+Reference-based LLM-as-judge: передаём системные и эталонные оценки judge-модели, получаем структурированный анализ alignment через `with_structured_output`.
+
+```python
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
 
 
 class CriterionJudgment(BaseModel):
@@ -487,423 +595,239 @@ class JudgeResponse(BaseModel):
     discrepancies: list[str]
 
 
-class ABTestRequest(BaseModel):
-    prompt_a: str
-    prompt_b: str
-    rubric_id: str = "essay_default"
+JUDGE_SYSTEM_PROMPT = (
+    "You are an expert meta-assessor. Compare a student work assessment "
+    "against an expert reference assessment. For each criterion, evaluate "
+    "whether the system's score aligns with the expected score. "
+    "Identify any significant discrepancies (|diff| > 5) and explain why "
+    "they matter."
+)
 
+prompt = ChatPromptTemplate.from_messages([
+    ("system", JUDGE_SYSTEM_PROMPT),
+    ("human",
+     "System assessment:\n{system_output}\n\n"
+     "Expected assessment (expert reference):\n{expected_output}\n\n"
+     "Analyze the alignment between these two assessments."),
+])
 
-class PromptMetrics(BaseModel):
-    prompt_label: str
-    overall_mae: float
-    overall_within_5_rate: float
-    avg_criterion_mae: float
-    pearson_correlation: float
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+judge_chain = prompt | llm.with_structured_output(JudgeResponse)
 
+system_output = {
+    "overall_score": 68,
+    "criterion_scores": [
+        {"criterion_name": "Thesis & Argument", "score": 16, "max_score": 25,
+         "feedback": "Clear thesis but lacks depth"},
+        {"criterion_name": "Evidence & Support", "score": 17, "max_score": 25,
+         "feedback": "Some citations but insufficient"},
+        {"criterion_name": "Structure & Organization", "score": 14, "max_score": 20,
+         "feedback": "Logical flow with minor gaps"},
+        {"criterion_name": "Critical Thinking", "score": 13, "max_score": 20,
+         "feedback": "Surface-level analysis"},
+        {"criterion_name": "Language & Style", "score": 8, "max_score": 10,
+         "feedback": "Academic tone maintained"},
+    ],
+}
 
-class ABTestResponse(BaseModel):
-    prompt_a_metrics: PromptMetrics
-    prompt_b_metrics: PromptMetrics
-    winner: str
-    details: list[dict]
+expected_output = {
+    "overall_score": 72,
+    "criterion_scores": [
+        {"criterion_name": "Thesis & Argument", "score": 18, "max_score": 25},
+        {"criterion_name": "Evidence & Support", "score": 19, "max_score": 25},
+        {"criterion_name": "Structure & Organization", "score": 15, "max_score": 20},
+        {"criterion_name": "Critical Thinking", "score": 12, "max_score": 20},
+        {"criterion_name": "Language & Style", "score": 8, "max_score": 10},
+    ],
+}
+
+import json
+result = judge_chain.invoke({
+    "system_output": json.dumps(system_output, indent=2),
+    "expected_output": json.dumps(expected_output, indent=2),
+})
+
+print(f"Alignment score: {result.alignment_score}/100")
+print(f"Overall judgment: {result.overall_judgment}")
+print()
+for ca in result.criterion_analysis:
+    print(f"  {ca.criterion_name}: expected={ca.expected_score} actual={ca.actual_score} "
+          f"diff={ca.difference} — {ca.judgment}")
+if result.discrepancies:
+    print(f"\nDiscrepancies:")
+    for d in result.discrepancies:
+        print(f"  - {d}")
 ```
 
-### Шаг 2: Сервис (`app/services/evaluation.py`)
+### Пример 4: A/B тестирование промптов
 
-Вся evaluation-логика вынесена в сервис: хранение golden entries, вычисление метрик, judge chain, A/B test. Роутер вызывает сервис, не содержит бизнес-логики.
+Два промпта прогоняются на одном golden dataset, метрики сравниваются. Здесь используем реальные LLM-вызовы: каждый промпт оценивает все записи, затем считаем MAE и выбираем winner.
 
-Golden entries хранятся in-memory (module-level list). Для production стоит заменить на БД, но для обучения и экспериментов этого достаточно.
+```python
+import json
+import numpy as np
+from scipy.stats import pearsonr
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
 
-Директория `data/golden/` — для хранения JSON-файлов golden dataset в Git. Загрузка через API (`POST /golden-dataset`) или напрямую из файлов.
+
+class CriterionScore(BaseModel):
+    criterion_name: str
+    score: int
+    max_score: int
+    feedback: str
+
+
+class AssessmentResult(BaseModel):
+    overall_score: int
+    criterion_scores: list[CriterionScore]
+    summary: str
+
+
+golden_entries = [
+    {
+        "student_work": (
+            "Climate change represents one of the most significant challenges "
+            "facing humanity today. Multiple studies from the IPCC confirm that "
+            "global temperatures have risen by 1.1°C since pre-industrial times."
+        ),
+        "expected_overall": 72,
+    },
+    {
+        "student_work": "AI is cool. It does stuff. The end.",
+        "expected_overall": 25,
+    },
+    {
+        "student_work": (
+            "The French Revolution of 1789 fundamentally transformed European "
+            "political structures. Through analysis of primary sources including "
+            "the Declaration of the Rights of Man and contemporaneous parliamentary "
+            "records, this essay demonstrates that economic inequality was the "
+            "primary catalyst, while Enlightenment philosophy provided the "
+            "intellectual framework for revolutionary action."
+        ),
+        "expected_overall": 88,
+    },
+]
+
+RUBRIC_TEXT = """Rubric: Essay Assessment
+- Thesis & Argument (max 25): Clear thesis with logical argumentation
+- Evidence & Support (max 25): Use of citations and supporting evidence
+- Structure & Organization (max 20): Logical flow and paragraph structure
+- Critical Thinking (max 20): Depth of analysis and original insight
+- Language & Style (max 10): Academic tone, grammar, vocabulary"""
+
+prompt_a_text = (
+    "You are an expert academic assessor. Evaluate student work against "
+    "the rubric:\n{rubric}\n\nProvide scores and specific feedback for "
+    "each criterion. The overall_score is the sum of all criterion scores."
+)
+
+prompt_b_text = (
+    "You are a strict academic evaluator. Analyze each criterion step by "
+    "step:\n{rubric}\n\nFor each criterion: (1) quote specific evidence "
+    "from the text, (2) identify strengths, (3) identify weaknesses, "
+    "(4) assign a score. The overall_score must equal the sum of criterion scores."
+)
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+
+
+def build_chain(system_prompt: str):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Rubric:\n{rubric}\n\nStudent work:\n{student_work}"),
+    ])
+    return prompt | llm.with_structured_output(AssessmentResult)
+
+
+chain_a = build_chain(prompt_a_text)
+chain_b = build_chain(prompt_b_text)
+
+expected_scores = np.array([e["expected_overall"] for e in golden_entries])
+
+for label, chain in [("A", chain_a), ("B", chain_b)]:
+    predicted = []
+    for entry in golden_entries:
+        result = chain.invoke({
+            "rubric": RUBRIC_TEXT,
+            "student_work": entry["student_work"],
+        })
+        predicted.append(result.overall_score)
+
+    pred_arr = np.array(predicted)
+    diffs = np.abs(pred_arr - expected_scores)
+    mae = float(np.mean(diffs))
+    within_5 = float(np.mean(diffs <= 5))
+
+    if len(expected_scores) >= 2:
+        corr, _ = pearsonr(expected_scores.tolist(), pred_arr.tolist())
+    else:
+        corr = 0.0
+
+    print(f"Prompt {label}:  MAE={mae:.2f}  Within-5={within_5:.0%}  "
+          f"Pearson r={corr:.3f}")
+    for i, entry in enumerate(golden_entries):
+        print(f"  [{entry['expected_overall']}] expected  vs  "
+              f"[{predicted[i]}] predicted  (diff={diffs[i]})")
+    print()
+```
+
+### Пример 5: Вычисление метрик (MAE, exact match, within-N, Pearson)
+
+Функции для подсчёта всех основных evaluation-метрик. Работают с любыми числовыми массивами оценок.
 
 ```python
 import numpy as np
 from scipy.stats import pearsonr
 
-from langchain_anthropic import ChatAnthropic
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable
 
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.evaluation import (
-    CriterionMetrics,
-    EvalReport,
-    ExpectedOutput,
-    GoldenEntry,
-    JudgeResponse,
-    PromptMetrics,
-)
-from app.schemas.rubric import Rubric
+def compute_metrics(expected: list[int], predicted: list[int]) -> dict:
+    exp = np.array(expected)
+    pred = np.array(predicted)
+    diffs = np.abs(pred - exp)
 
-_golden_store: list[GoldenEntry] = []
+    mae = float(np.mean(diffs))
+    exact_match = float(np.mean(diffs == 0))
+    within_3 = float(np.mean(diffs <= 3))
+    within_5 = float(np.mean(diffs <= 5))
 
-JUDGE_SYSTEM_PROMPT = (
-    "You are an expert meta-assessor. Compare a student work assessment "
-    "against an expert reference assessment. For each criterion, evaluate "
-    "whether the system's score aligns with the expected score. "
-    "Identify any significant discrepancies and explain why they matter."
-)
-
-
-def add_golden_entry(entry: GoldenEntry) -> None:
-    _golden_store.append(entry)
-
-
-def get_golden_entries() -> list[GoldenEntry]:
-    return list(_golden_store)
-
-
-def format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-async def run_eval_pipeline(
-    chain: Runnable,
-    rubric: Rubric,
-    entries: list[GoldenEntry],
-) -> EvalReport:
-    rubric_text = format_rubric(rubric)
-    predictions: list[AssessmentResponse] = []
-
-    for entry in entries:
-        result = await chain.ainvoke({
-            "student_work": entry.input.student_work,
-            "rubric": rubric_text,
-        })
-        predictions.append(result)
-
-    criterion_names = [c.name for c in rubric.criteria]
-    criterion_metrics = []
-
-    for cname in criterion_names:
-        expected_scores = []
-        predicted_scores = []
-        for entry, pred in zip(entries, predictions):
-            exp_cs = next(
-                (cs for cs in entry.expected_output.criterion_scores
-                 if cs.criterion_name == cname),
-                None,
-            )
-            pred_cs = next(
-                (cs for cs in pred.criterion_scores if cs.criterion_name == cname),
-                None,
-            )
-            if exp_cs and pred_cs:
-                expected_scores.append(exp_cs.score)
-                predicted_scores.append(pred_cs.score)
-
-        if not expected_scores:
-            continue
-
-        exp_arr = np.array(expected_scores)
-        pred_arr = np.array(predicted_scores)
-        diffs = np.abs(pred_arr - exp_arr)
-
-        criterion_metrics.append(CriterionMetrics(
-            criterion_name=cname,
-            mae=round(float(np.mean(diffs)), 2),
-            exact_match_rate=round(float(np.mean(diffs == 0)), 3),
-            within_3_rate=round(float(np.mean(diffs <= 3)), 3),
-            within_5_rate=round(float(np.mean(diffs <= 5)), 3),
-        ))
-
-    overall_expected = np.array([e.expected_output.overall_score for e in entries])
-    overall_predicted = np.array([p.overall_score for p in predictions])
-    overall_diffs = np.abs(overall_predicted - overall_expected)
-
-    if len(overall_expected) >= 2:
-        corr, _ = pearsonr(overall_expected.tolist(), overall_predicted.tolist())
+    if len(exp) >= 2:
+        corr, p_value = pearsonr(exp.tolist(), pred.tolist())
     else:
-        corr = 0.0
+        corr, p_value = 0.0, 1.0
 
-    return EvalReport(
-        total_entries=len(entries),
-        overall_mae=round(float(np.mean(overall_diffs)), 2),
-        overall_exact_match_rate=round(float(np.mean(overall_diffs == 0)), 3),
-        overall_within_5_rate=round(float(np.mean(overall_diffs <= 5)), 3),
-        pearson_correlation=round(float(corr), 3),
-        criterion_metrics=criterion_metrics,
-    )
-
-
-async def run_judge(
-    system_output: AssessmentResponse,
-    expected_output: ExpectedOutput,
-    llm: ChatAnthropic,
-) -> JudgeResponse:
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", JUDGE_SYSTEM_PROMPT),
-        ("human",
-         "System assessment:\n{system_output}\n\n"
-         "Expected assessment (expert reference):\n{expected_output}\n\n"
-         "Analyze the alignment between these two assessments."),
-    ])
-    judge_chain = prompt | llm.with_structured_output(JudgeResponse)
-    return await judge_chain.ainvoke({
-        "system_output": system_output.model_dump_json(indent=2),
-        "expected_output": expected_output.model_dump_json(indent=2),
-    })
-
-
-async def run_ab_test(
-    prompt_a: str,
-    prompt_b: str,
-    entries: list[GoldenEntry],
-    rubric: Rubric,
-    llm: ChatAnthropic,
-) -> tuple[PromptMetrics, PromptMetrics]:
-    def build_chain(system_prompt: str) -> Runnable:
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "Please assess the following student work:\n\n{student_work}"),
-        ])
-        return prompt | llm.with_structured_output(AssessmentResponse)
-
-    chain_a = build_chain(prompt_a)
-    chain_b = build_chain(prompt_b)
-
-    report_a = await run_eval_pipeline(chain_a, rubric, entries)
-    report_b = await run_eval_pipeline(chain_b, rubric, entries)
-
-    def to_prompt_metrics(label: str, report: EvalReport) -> PromptMetrics:
-        avg_mae = (
-            sum(cm.mae for cm in report.criterion_metrics)
-            / len(report.criterion_metrics)
-            if report.criterion_metrics else 0.0
-        )
-        return PromptMetrics(
-            prompt_label=label,
-            overall_mae=report.overall_mae,
-            overall_within_5_rate=report.overall_within_5_rate,
-            avg_criterion_mae=round(avg_mae, 2),
-            pearson_correlation=report.pearson_correlation,
-        )
-
-    return to_prompt_metrics("A", report_a), to_prompt_metrics("B", report_b)
-```
-
-Связь с теорией: `run_eval_pipeline` вычисляет все метрики из раздела 4 (MAE, exact match, within-N, Pearson). `run_judge` реализует reference-based LLM-as-judge из раздела 5 — используем `with_structured_output(JudgeResponse)` для получения структурированного анализа. `run_ab_test` — A/B тестирование из раздела 7: два промпта прогоняются на одном датасете, результаты сравниваются по всем метрикам.
-
-### Шаг 3: Роутер (`app/api/v1/eval.py`)
-
-Роутер связывает HTTP-эндпоинты с сервисными функциями через dependency injection. Каждый эндпоинт: валидация входных данных → вызов сервиса → возврат результата.
-
-```python
-from fastapi import APIRouter, HTTPException
-
-from app.dependencies import ChainDep, LLMDep, RubricStoreDep
-from app.schemas.evaluation import (
-    ABTestRequest,
-    ABTestResponse,
-    EvalReport,
-    EvalRunRequest,
-    GoldenEntry,
-    JudgeRequest,
-    JudgeResponse,
-)
-from app.services.evaluation import (
-    add_golden_entry,
-    get_golden_entries,
-    run_ab_test,
-    run_eval_pipeline,
-    run_judge,
-)
-
-router = APIRouter(prefix="/eval", tags=["lesson-9-eval"])
-
-
-@router.post("/golden-dataset")
-async def upload_golden_entry(entry: GoldenEntry) -> GoldenEntry:
-    add_golden_entry(entry)
-    return entry
-
-
-@router.post("/run")
-async def run_evaluation(
-    request: EvalRunRequest,
-    chain: ChainDep,
-    rubrics: RubricStoreDep,
-) -> EvalReport:
-    entries = get_golden_entries()
-    if not entries:
-        raise HTTPException(status_code=400, detail="No golden entries uploaded")
-    rubric = rubrics.get(request.rubric_id)
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
-    return await run_eval_pipeline(chain, rubric, entries)
-
-
-@router.post("/judge")
-async def judge_output(
-    request: JudgeRequest,
-    llm: LLMDep,
-) -> JudgeResponse:
-    return await run_judge(request.system_output, request.expected_output, llm)
-
-
-@router.post("/ab-test")
-async def ab_test(
-    request: ABTestRequest,
-    rubrics: RubricStoreDep,
-    llm: LLMDep,
-) -> ABTestResponse:
-    entries = get_golden_entries()
-    if not entries:
-        raise HTTPException(status_code=400, detail="No golden entries uploaded")
-    rubric = rubrics.get(request.rubric_id)
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
-
-    metrics_a, metrics_b = await run_ab_test(
-        request.prompt_a, request.prompt_b, entries, rubric, llm,
-    )
-    winner = "A" if metrics_a.overall_mae <= metrics_b.overall_mae else "B"
-
-    return ABTestResponse(
-        prompt_a_metrics=metrics_a,
-        prompt_b_metrics=metrics_b,
-        winner=winner,
-        details=[
-            {
-                "metric": "overall_mae",
-                "prompt_a": metrics_a.overall_mae,
-                "prompt_b": metrics_b.overall_mae,
-                "winner": "A" if metrics_a.overall_mae <= metrics_b.overall_mae else "B",
-            },
-            {
-                "metric": "within_5_rate",
-                "prompt_a": metrics_a.overall_within_5_rate,
-                "prompt_b": metrics_b.overall_within_5_rate,
-                "winner": "A" if metrics_a.overall_within_5_rate >= metrics_b.overall_within_5_rate else "B",
-            },
-            {
-                "metric": "pearson_correlation",
-                "prompt_a": metrics_a.pearson_correlation,
-                "prompt_b": metrics_b.pearson_correlation,
-                "winner": "A" if metrics_a.pearson_correlation >= metrics_b.pearson_correlation else "B",
-            },
-        ],
-    )
-```
-
-### Шаг 4: Регистрация в `app/api/router.py`
-
-Добавляем eval-роутер к существующему api_router:
-
-```python
-from fastapi import APIRouter
-
-from app.api.v1 import assessment, eval, rubrics
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(eval.router)
-```
-
-Также создайте директорию `data/golden/` для хранения golden dataset файлов:
-
-```bash
-mkdir -p data/golden
-```
-
-### Шаг 5: Тестирование
-
-Запускаем сервер и тестируем каждый эндпоинт.
-
-```bash
-uvicorn app.main:app --reload
-```
-
-**1. Загрузка golden entry:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/eval/golden-dataset \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "golden_001",
-    "input": {
-      "student_work": "Climate change represents one of the most significant challenges facing humanity today. Multiple studies from the IPCC and NASA confirm that global temperatures have risen by 1.1 degrees Celsius since pre-industrial times. This essay argues that carbon taxation is the most effective policy mechanism to reduce emissions, supported by evidence from the European Union Emissions Trading System and the British Columbia carbon tax. However, the economic impact on developing nations requires careful consideration and graduated implementation timelines.",
-      "rubric_id": "essay_default"
-    },
-    "expected_output": {
-      "overall_score": 72,
-      "criterion_scores": [
-        {"criterion_name": "Thesis & Argument", "score": 18, "max_score": 25},
-        {"criterion_name": "Evidence & Support", "score": 19, "max_score": 25},
-        {"criterion_name": "Structure & Organization", "score": 15, "max_score": 20},
-        {"criterion_name": "Critical Thinking", "score": 12, "max_score": 20},
-        {"criterion_name": "Language & Style", "score": 8, "max_score": 10}
-      ]
-    },
-    "metadata": {
-      "quality_level": "medium",
-      "description": "Decent essay on climate policy with some citations"
+    return {
+        "mae": round(mae, 2),
+        "exact_match_rate": round(exact_match, 3),
+        "within_3_rate": round(within_3, 3),
+        "within_5_rate": round(within_5, 3),
+        "pearson_r": round(float(corr), 3),
+        "p_value": round(float(p_value), 4),
     }
-  }'
+
+
+expected_thesis = [18, 5, 22, 14, 10, 20, 8, 16, 23, 12]
+predicted_thesis = [16, 7, 21, 15, 9, 18, 10, 14, 22, 13]
+
+expected_evidence = [19, 3, 23, 12, 8, 21, 6, 17, 24, 10]
+predicted_evidence = [17, 5, 22, 14, 7, 19, 8, 15, 23, 11]
+
+expected_overall = [72, 25, 88, 55, 41, 80, 30, 65, 90, 48]
+predicted_overall = [68, 30, 85, 60, 38, 76, 34, 62, 87, 50]
+
+for name, exp, pred in [
+    ("Thesis & Argument", expected_thesis, predicted_thesis),
+    ("Evidence & Support", expected_evidence, predicted_evidence),
+    ("Overall Score", expected_overall, predicted_overall),
+]:
+    m = compute_metrics(exp, pred)
+    print(f"{name}:")
+    print(f"  MAE={m['mae']}  Exact={m['exact_match_rate']:.0%}  "
+          f"Within-3={m['within_3_rate']:.0%}  Within-5={m['within_5_rate']:.0%}  "
+          f"r={m['pearson_r']} (p={m['p_value']})")
 ```
-
-**2. Запуск evaluation pipeline:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/eval/run \
-  -H "Content-Type: application/json" \
-  -d '{"rubric_id": "essay_default"}'
-```
-
-Ответ содержит `EvalReport` с метриками по каждому критерию и overall. Для надёжных результатов загрузите 20+ golden entries перед запуском.
-
-**3. LLM-as-judge:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/eval/judge \
-  -H "Content-Type: application/json" \
-  -d '{
-    "system_output": {
-      "overall_score": 68,
-      "max_overall_score": 100,
-      "criterion_scores": [
-        {"criterion_name": "Thesis & Argument", "score": 16, "max_score": 25, "feedback": "Clear thesis but lacks depth in reasoning"},
-        {"criterion_name": "Evidence & Support", "score": 17, "max_score": 25, "feedback": "Some citations provided but insufficient"},
-        {"criterion_name": "Structure & Organization", "score": 14, "max_score": 20, "feedback": "Logical flow with minor gaps"},
-        {"criterion_name": "Critical Thinking", "score": 13, "max_score": 20, "feedback": "Surface-level analysis"},
-        {"criterion_name": "Language & Style", "score": 8, "max_score": 10, "feedback": "Academic tone maintained"}
-      ],
-      "summary": "Average essay with room for improvement in evidence and analysis",
-      "strengths": ["Clear thesis statement", "Academic tone"],
-      "improvements": ["Add more citations", "Deeper critical analysis"]
-    },
-    "expected_output": {
-      "overall_score": 72,
-      "criterion_scores": [
-        {"criterion_name": "Thesis & Argument", "score": 18, "max_score": 25},
-        {"criterion_name": "Evidence & Support", "score": 19, "max_score": 25},
-        {"criterion_name": "Structure & Organization", "score": 15, "max_score": 20},
-        {"criterion_name": "Critical Thinking", "score": 12, "max_score": 20},
-        {"criterion_name": "Language & Style", "score": 8, "max_score": 10}
-      ]
-    }
-  }'
-```
-
-**4. A/B тест промптов:**
-
-Оба промпта должны содержать `{rubric}` как placeholder — сервис подставит текст рубрики при вызове chain.
-
-```bash
-curl -X POST http://localhost:8000/api/v1/eval/ab-test \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt_a": "You are an expert academic assessor. Evaluate student work against the rubric:\n{rubric}\n\nProvide scores and specific feedback for each criterion. The overall_score is the sum of all criterion scores.",
-    "prompt_b": "You are a strict academic evaluator. Analyze each criterion step by step:\n{rubric}\n\nFor each criterion: (1) quote specific evidence from the text, (2) identify strengths, (3) identify weaknesses, (4) assign a score. The overall_score must equal the sum of criterion scores.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Ответ содержит метрики для обоих промптов и winner — промпт с меньшим MAE.
 
 ---
 

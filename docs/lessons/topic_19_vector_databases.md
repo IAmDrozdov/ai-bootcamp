@@ -1,8 +1,7 @@
 # Тема 19: Vector Databases — сравнение и выбор
 
 > **Пререквизиты:** [Тема 5: RAG](topic_05_rag.md)
-> **Что добавляем в проект:** `app/api/v1/vector.py`, `app/services/vector_stores/chroma_store.py`, `app/services/vector_stores/pgvector_store.py`, `app/services/vector_stores/qdrant_store.py`, `app/schemas/vector.py`
-> **Зависимости:** `langchain-chroma`, `langchain-postgres`, `langchain-qdrant`, `pgvector`, `qdrant-client`, `asyncpg`
+> **Зависимости:** `langchain-chroma`, `langchain-postgres`, `langchain-qdrant`, `pgvector`, `qdrant-client`, `psycopg2-binary`, `rank-bm25`
 
 ---
 
@@ -23,8 +22,8 @@
 В этой теме мы:
 1. Разберём, как vector search работает на уровне алгоритмов
 2. Сравним 5 vector databases: ChromaDB, pgvector, Pinecone, Qdrant, Weaviate
-3. Реализуем унифицированный интерфейс для 3 из них (Chroma, pgvector, Qdrant)
-4. Добавим benchmark-эндпоинт для сравнения latency
+3. Попрактикуемся с 3 из них (Chroma, pgvector, Qdrant)
+4. Сравним latency разных vector stores
 5. Реализуем hybrid search (keyword + semantic)
 
 ### 2. Как работает vector search — основы
@@ -933,724 +932,386 @@ from langchain_core.documents import Document
 
 ---
 
-## Практика: роутер `/api/v1/vector`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/vector.py`
+### Подготовка окружения
 
-Создаём Pydantic-модели для всех эндпоинтов.
+Для примеров с pgvector и Qdrant нужны Docker-контейнеры:
 
-```python
-from pydantic import BaseModel, Field
+```bash
+docker run -d --name pgvector-demo \
+  -e POSTGRES_USER=demo -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=demo \
+  -p 5433:5432 pgvector/pgvector:pg16
 
-
-class DocumentInput(BaseModel):
-    content: str = Field(min_length=1)
-    metadata: dict = Field(default_factory=dict)
-
-
-class IndexRequest(BaseModel):
-    documents: list[DocumentInput] = Field(min_length=1)
-    store: str = Field(pattern="^(chroma|pgvector|qdrant)$")
-    collection_name: str = Field(default="student_essays")
-
-
-class IndexResponse(BaseModel):
-    store: str
-    collection_name: str
-    indexed_count: int
-    ids: list[str]
-
-
-class SearchRequest(BaseModel):
-    query: str = Field(min_length=1)
-    store: str = Field(pattern="^(chroma|pgvector|qdrant)$")
-    collection_name: str = Field(default="student_essays")
-    k: int = Field(default=5, ge=1, le=50)
-    filter: dict | None = None
-
-
-class SearchResult(BaseModel):
-    content: str
-    metadata: dict
-    score: float
-
-
-class SearchResponse(BaseModel):
-    store: str
-    query: str
-    results: list[SearchResult]
-    total: int
-
-
-class HybridSearchRequest(BaseModel):
-    query: str = Field(min_length=1)
-    collection_name: str = Field(default="student_essays")
-    k: int = Field(default=5, ge=1, le=50)
-    semantic_weight: float = Field(default=0.6, ge=0.0, le=1.0)
-
-
-class HybridSearchResponse(BaseModel):
-    query: str
-    results: list[SearchResult]
-    semantic_weight: float
-    keyword_weight: float
-    total: int
-
-
-class BenchmarkRequest(BaseModel):
-    query: str = Field(min_length=1)
-    collection_name: str = Field(default="student_essays")
-    stores: list[str] = Field(default=["chroma", "pgvector", "qdrant"])
-    k: int = Field(default=5, ge=1, le=50)
-
-
-class StoreLatency(BaseModel):
-    store: str
-    latency_ms: float
-    results_count: int
-    top_score: float | None = None
-    error: str | None = None
-
-
-class BenchmarkResponse(BaseModel):
-    query: str
-    benchmarks: list[StoreLatency]
-    fastest_store: str
+docker run -d --name qdrant-demo \
+  -p 6333:6333 -p 6334:6334 qdrant/qdrant:latest
 ```
 
-### Шаг 2. Vector store implementations
+Все примеры ниже — самодостаточные скрипты. Запускайте как ячейки Jupyter-ноутбука или как `.py`-файлы.
 
-Создаём унифицированный интерфейс для трёх vector stores. Все три модуля реализуют одинаковые функции: `init_store`, `add_documents`, `search`, `delete`.
-
-#### `app/services/vector_stores/chroma_store.py`
+### Пример 1. ChromaDB — базовое использование
 
 ```python
-import uuid
-
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
 
-from app.config import get_settings
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-_stores: dict[str, Chroma] = {}
+docs = [
+    Document(
+        page_content="Эссе про влияние искусственного интеллекта на современное образование. ИИ трансформирует методы преподавания.",
+        metadata={"subject": "ai", "year": 2024},
+    ),
+    Document(
+        page_content="Математический анализ: пределы и производные. Предел функции в точке определяется через эпсилон-дельта определение.",
+        metadata={"subject": "math", "year": 2024},
+    ),
+    Document(
+        page_content="Влияние машинного обучения на медицинскую диагностику. Нейросети анализируют снимки МРТ.",
+        metadata={"subject": "ai", "year": 2025},
+    ),
+    Document(
+        page_content="Квантовая механика: принцип неопределённости Гейзенберга и волновая функция.",
+        metadata={"subject": "physics", "year": 2024},
+    ),
+    Document(
+        page_content="Применение нейронных сетей в обработке естественного языка. Трансформеры произвели революцию в NLP.",
+        metadata={"subject": "ai", "year": 2025},
+    ),
+]
 
+vectorstore = Chroma.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name="essay_demo",
+    persist_directory="./chroma_demo",
+)
 
-def _get_embeddings() -> OpenAIEmbeddings:
-    settings = get_settings()
-    return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.openai_api_key,
-    )
+results = vectorstore.similarity_search_with_score("как ИИ влияет на образование", k=3)
 
-
-def get_store(collection_name: str) -> Chroma:
-    if collection_name not in _stores:
-        _stores[collection_name] = Chroma(
-            collection_name=collection_name,
-            embedding_function=_get_embeddings(),
-            persist_directory="./chroma_data",
-        )
-    return _stores[collection_name]
-
-
-def add_documents(
-    collection_name: str,
-    documents: list[Document],
-) -> list[str]:
-    store = get_store(collection_name)
-    ids = [str(uuid.uuid4()) for _ in documents]
-    store.add_documents(documents, ids=ids)
-    return ids
-
-
-def search(
-    collection_name: str,
-    query: str,
-    k: int = 5,
-    filter: dict | None = None,
-) -> list[tuple[Document, float]]:
-    store = get_store(collection_name)
-    return store.similarity_search_with_score(
-        query,
-        k=k,
-        filter=filter,
-    )
-
-
-def delete(collection_name: str, ids: list[str]) -> None:
-    store = get_store(collection_name)
-    store.delete(ids=ids)
+for doc, score in results:
+    print(f"[score={score:.4f}] {doc.page_content[:80]}...")
+    print(f"  metadata: {doc.metadata}")
 ```
 
-#### `app/services/vector_stores/pgvector_store.py`
+Ожидаемый вывод — три наиболее релевантных документа, отсортированных по cosine distance (меньше = ближе). Документы про ИИ получают наименьшее расстояние.
+
+### Пример 2. ChromaDB — фильтрация по метаданным
 
 ```python
-import uuid
+import chromadb
 
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_postgres import PGVector
+client = chromadb.PersistentClient(path="./chroma_filter_demo")
 
-from app.config import get_settings
+collection = client.get_or_create_collection(
+    name="filtering_demo",
+    metadata={"hnsw:space": "cosine"},
+)
 
-_stores: dict[str, PGVector] = {}
+collection.add(
+    documents=[
+        "Эссе про влияние ИИ на образование",
+        "Математический анализ: пределы",
+        "Нейросети в медицинской диагностике",
+        "Квантовая механика: принцип Гейзенберга",
+        "Трансформеры в NLP",
+    ],
+    metadatas=[
+        {"subject": "ai", "year": 2024},
+        {"subject": "math", "year": 2024},
+        {"subject": "ai", "year": 2025},
+        {"subject": "physics", "year": 2024},
+        {"subject": "ai", "year": 2025},
+    ],
+    ids=["e1", "e2", "e3", "e4", "e5"],
+)
 
+results = collection.query(
+    query_texts=["искусственный интеллект"],
+    n_results=5,
+    where={"subject": "ai"},
+)
 
-def _get_embeddings() -> OpenAIEmbeddings:
-    settings = get_settings()
-    return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.openai_api_key,
-    )
+print("Фильтр subject=ai:")
+for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+    print(f"  {doc[:60]}... | {meta}")
 
+results = collection.query(
+    query_texts=["наука"],
+    n_results=5,
+    where={
+        "$and": [
+            {"year": {"$gte": 2025}},
+            {"subject": {"$eq": "ai"}},
+        ]
+    },
+)
 
-def _get_connection_string() -> str:
-    settings = get_settings()
-    return (
-        f"postgresql+asyncpg://{settings.pg_user}:{settings.pg_password}"
-        f"@{settings.pg_host}:{settings.pg_port}/{settings.pg_database}"
-    )
-
-
-def get_store(collection_name: str) -> PGVector:
-    if collection_name not in _stores:
-        _stores[collection_name] = PGVector(
-            embeddings=_get_embeddings(),
-            collection_name=collection_name,
-            connection=_get_connection_string(),
-            use_jsonb=True,
-        )
-    return _stores[collection_name]
-
-
-def add_documents(
-    collection_name: str,
-    documents: list[Document],
-) -> list[str]:
-    store = get_store(collection_name)
-    ids = [str(uuid.uuid4()) for _ in documents]
-    store.add_documents(documents, ids=ids)
-    return ids
-
-
-async def search(
-    collection_name: str,
-    query: str,
-    k: int = 5,
-    filter: dict | None = None,
-) -> list[tuple[Document, float]]:
-    store = get_store(collection_name)
-    return await store.asimilarity_search_with_score(
-        query,
-        k=k,
-        filter=filter,
-    )
-
-
-async def delete(collection_name: str, ids: list[str]) -> None:
-    store = get_store(collection_name)
-    await store.adelete(ids=ids)
+print("\nФильтр year>=2025 AND subject=ai:")
+for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+    print(f"  {doc[:60]}... | {meta}")
 ```
 
-#### `app/services/vector_stores/qdrant_store.py`
+Фильтрация в ChromaDB — post-filtering: сначала находятся ближайшие соседи, затем отфильтровываются по метаданным. При агрессивной фильтрации может вернуться меньше `n_results` документов.
+
+### Пример 3. pgvector — SQL-запросы с векторным поиском
 
 ```python
-import uuid
-
-from langchain_core.documents import Document
+import psycopg2
 from langchain_openai import OpenAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
+
+conn = psycopg2.connect(
+    host="localhost", port=5433, user="demo", password="demo", dbname="demo"
+)
+conn.autocommit = True
+cur = conn.cursor()
+
+cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+cur.execute("""
+    DROP TABLE IF EXISTS essay_embeddings;
+    CREATE TABLE essay_embeddings (
+        id SERIAL PRIMARY KEY,
+        content TEXT NOT NULL,
+        subject VARCHAR(100),
+        year INTEGER,
+        embedding vector(1536)
+    )
+""")
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+texts = [
+    ("Эссе про влияние ИИ на образование", "ai", 2024),
+    ("Математический анализ: пределы и производные", "math", 2024),
+    ("Нейросети в медицинской диагностике", "ai", 2025),
+    ("Квантовая механика: принцип Гейзенберга", "physics", 2024),
+    ("Трансформеры произвели революцию в NLP", "ai", 2025),
+]
+
+for text, subject, year in texts:
+    vector = embeddings.embed_query(text)
+    cur.execute(
+        "INSERT INTO essay_embeddings (content, subject, year, embedding) VALUES (%s, %s, %s, %s)",
+        (text, subject, year, str(vector)),
+    )
+
+cur.execute("""
+    CREATE INDEX IF NOT EXISTS essay_hnsw_idx ON essay_embeddings
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
+""")
+
+query_vector = embeddings.embed_query("как ИИ влияет на образование")
+
+cur.execute("""
+    SELECT content, subject, year,
+           1 - (embedding <=> %s::vector) AS similarity
+    FROM essay_embeddings
+    WHERE subject = 'ai'
+    ORDER BY embedding <=> %s::vector
+    LIMIT 3
+""", (str(query_vector), str(query_vector)))
+
+print("pgvector — поиск с фильтром subject='ai':")
+for content, subject, year, similarity in cur.fetchall():
+    print(f"  [{similarity:.4f}] {content} | subject={subject}, year={year}")
+
+cur.close()
+conn.close()
+```
+
+Ключевое преимущество pgvector — полный SQL. `WHERE subject = 'ai'` выполняется совместно с vector search. Можно добавлять JOIN'ы, подзапросы, агрегации — всё, что умеет PostgreSQL.
+
+### Пример 4. Qdrant — использование и pre-filtering
+
+```python
 from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue, Range,
+)
+from langchain_openai import OpenAIEmbeddings
 
-from app.config import get_settings
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+client = QdrantClient(host="localhost", port=6333)
 
-_stores: dict[str, QdrantVectorStore] = {}
-_client: QdrantClient | None = None
+client.recreate_collection(
+    collection_name="essay_demo",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+)
 
+texts = [
+    ("Эссе про влияние ИИ на образование", {"subject": "ai", "year": 2024}),
+    ("Математический анализ: пределы", {"subject": "math", "year": 2024}),
+    ("Нейросети в медицинской диагностике", {"subject": "ai", "year": 2025}),
+    ("Квантовая механика: принцип Гейзенберга", {"subject": "physics", "year": 2024}),
+    ("Трансформеры в NLP", {"subject": "ai", "year": 2025}),
+]
 
-def _get_embeddings() -> OpenAIEmbeddings:
-    settings = get_settings()
-    return OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=settings.openai_api_key,
-    )
+points = []
+for i, (text, meta) in enumerate(texts):
+    vector = embeddings.embed_query(text)
+    points.append(PointStruct(id=i + 1, vector=vector, payload={"content": text, **meta}))
 
+client.upsert(collection_name="essay_demo", points=points)
 
-def _get_client() -> QdrantClient:
-    global _client
-    if _client is None:
-        settings = get_settings()
-        _client = QdrantClient(
-            host=settings.qdrant_host,
-            port=settings.qdrant_port,
-        )
-    return _client
+query_vector = embeddings.embed_query("влияние ИИ на образование")
 
+results = client.query_points(
+    collection_name="essay_demo",
+    query=query_vector,
+    query_filter=Filter(
+        must=[
+            FieldCondition(key="subject", match=MatchValue(value="ai")),
+            FieldCondition(key="year", range=Range(gte=2025)),
+        ]
+    ),
+    limit=3,
+)
 
-def get_store(collection_name: str) -> QdrantVectorStore:
-    if collection_name not in _stores:
-        _stores[collection_name] = QdrantVectorStore(
-            client=_get_client(),
-            collection_name=collection_name,
-            embedding=_get_embeddings(),
-        )
-    return _stores[collection_name]
-
-
-def add_documents(
-    collection_name: str,
-    documents: list[Document],
-) -> list[str]:
-    store = get_store(collection_name)
-    ids = [str(uuid.uuid4()) for _ in documents]
-    store.add_documents(documents, ids=ids)
-    return ids
-
-
-def search(
-    collection_name: str,
-    query: str,
-    k: int = 5,
-    filter: dict | None = None,
-) -> list[tuple[Document, float]]:
-    store = get_store(collection_name)
-    return store.similarity_search_with_score(
-        query,
-        k=k,
-    )
-
-
-def delete(collection_name: str, ids: list[str]) -> None:
-    store = get_store(collection_name)
-    store.delete(ids=ids)
+print("Qdrant — pre-filtering (subject=ai, year>=2025):")
+for point in results.points:
+    print(f"  [score={point.score:.4f}] {point.payload['content']}")
+    print(f"    subject={point.payload['subject']}, year={point.payload['year']}")
 ```
 
-Обратите внимание на единообразие интерфейса: каждый модуль предоставляет `get_store`, `add_documents`, `search`, `delete`. Это позволяет роутеру выбирать backend по строковому параметру `store`.
+Qdrant выполняет pre-filtering — фильтрация происходит **до** vector search. Это гарантирует ровно `limit` результатов (если столько документов проходит фильтр), в отличие от post-filtering, который может вернуть меньше.
 
-### Шаг 3. Router — `app/api/v1/vector.py`
+### Пример 5. Hybrid search — keyword + semantic
 
-Роутер с 4 эндпоинтами, использующий store implementations из шага 2.
+```python
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+
+docs = [
+    Document(
+        page_content="HNSW (Hierarchical Navigable Small World) — графовый алгоритм ANN-поиска.",
+        metadata={"topic": "algorithms"},
+    ),
+    Document(
+        page_content="Влияние искусственного интеллекта на школьное образование.",
+        metadata={"topic": "ai"},
+    ),
+    Document(
+        page_content="Алгоритм HNSW строит многоуровневый граф для навигации по точкам.",
+        metadata={"topic": "algorithms"},
+    ),
+    Document(
+        page_content="Нейронные сети используют backpropagation для обучения.",
+        metadata={"topic": "ai"},
+    ),
+    Document(
+        page_content="IVF-индекс разбивает пространство на кластеры через k-means.",
+        metadata={"topic": "algorithms"},
+    ),
+]
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+vectorstore = Chroma.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name="hybrid_demo",
+)
+
+bm25_retriever = BM25Retriever.from_documents(docs, k=3)
+vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+ensemble = EnsembleRetriever(
+    retrievers=[bm25_retriever, vector_retriever],
+    weights=[0.4, 0.6],
+)
+
+query = "HNSW алгоритм в vector database"
+
+print("=== Только semantic search ===")
+for i, doc in enumerate(vectorstore.similarity_search(query, k=3), 1):
+    print(f"  {i}. {doc.page_content[:80]}")
+
+print("\n=== Только keyword search (BM25) ===")
+for i, doc in enumerate(bm25_retriever.invoke(query), 1):
+    print(f"  {i}. {doc.page_content[:80]}")
+
+print("\n=== Hybrid search (BM25 0.4 + semantic 0.6) ===")
+for i, doc in enumerate(ensemble.invoke(query), 1):
+    print(f"  {i}. {doc.page_content[:80]}")
+```
+
+Сравните результаты трёх подходов. Для запроса «HNSW алгоритм» BM25 точно найдёт документы с этим термином, semantic search — документы близкие по смыслу. Hybrid search объединяет оба рейтинга через Reciprocal Rank Fusion.
+
+### Пример 6. Бенчмарк latency — сравнение vector stores
+
+Для этого примера нужны запущенные Docker-контейнеры pgvector и Qdrant (см. «Подготовка окружения»).
 
 ```python
 import time
-
-from fastapi import APIRouter, HTTPException
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 
-from app.schemas.vector import (
-    BenchmarkRequest,
-    BenchmarkResponse,
-    HybridSearchRequest,
-    HybridSearchResponse,
-    IndexRequest,
-    IndexResponse,
-    SearchRequest,
-    SearchResponse,
-    SearchResult,
-    StoreLatency,
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+docs = [
+    Document(
+        page_content=f"Документ #{i}: текст для бенчмарка vector search по теме {topic}.",
+        metadata={"subject": topic, "index": i},
+    )
+    for i, topic in enumerate(["ai", "math", "physics", "ai", "math"] * 20)
+]
+
+chroma_store = Chroma.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name="bench_chroma",
 )
-from app.services.vector_stores import chroma_store, pgvector_store, qdrant_store
 
-router = APIRouter(prefix="/vector", tags=["lesson-19-vector-databases"])
+qdrant_client = QdrantClient(host="localhost", port=6333)
+qdrant_client.recreate_collection(
+    collection_name="bench_qdrant",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+)
+qdrant_store = QdrantVectorStore.from_documents(
+    documents=docs,
+    embedding=embeddings,
+    collection_name="bench_qdrant",
+    url="http://localhost:6333",
+)
 
-STORE_MAP = {
-    "chroma": chroma_store,
-    "pgvector": pgvector_store,
-    "qdrant": qdrant_store,
-}
+query = "влияние ИИ на образование"
+n_runs = 5
 
+stores = {"ChromaDB": chroma_store, "Qdrant": qdrant_store}
 
-def _get_store_module(store_name: str):
-    if store_name not in STORE_MAP:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown store: {store_name}. Available: {list(STORE_MAP.keys())}",
-        )
-    return STORE_MAP[store_name]
-
-
-@router.post("/index") 
-async def index_documents(request: IndexRequest) -> IndexResponse:
-    store_module = _get_store_module(request.store)
-
-    documents = [
-        Document(page_content=doc.content, metadata=doc.metadata)
-        for doc in request.documents
-    ]
-
-    ids = store_module.add_documents(request.collection_name, documents)
-
-    return IndexResponse(
-        store=request.store,
-        collection_name=request.collection_name,
-        indexed_count=len(ids),
-        ids=ids,
-    )
-
-
-@router.post("/search")
-async def search_documents(request: SearchRequest) -> SearchResponse:
-    store_module = _get_store_module(request.store)
-
-    results = store_module.search(
-        collection_name=request.collection_name,
-        query=request.query,
-        k=request.k,
-        filter=request.filter,
-    )
-
-    if hasattr(results, "__await__"):
-        results = await results
-
-    search_results = [
-        SearchResult(
-            content=doc.page_content,
-            metadata=doc.metadata,
-            score=float(score),
-        )
-        for doc, score in results
-    ]
-
-    return SearchResponse(
-        store=request.store,
-        query=request.query,
-        results=search_results,
-        total=len(search_results),
-    )
-
-
-@router.post("/hybrid")
-async def hybrid_search(request: HybridSearchRequest) -> HybridSearchResponse:
-    from langchain.retrievers import EnsembleRetriever
-    from langchain_community.retrievers import BM25Retriever
-
-    chroma_vs = chroma_store.get_store(request.collection_name)
-
-    existing_docs = chroma_vs.similarity_search("", k=1000)
-    if not existing_docs:
-        raise HTTPException(status_code=404, detail="Collection is empty")
-
-    bm25_retriever = BM25Retriever.from_documents(existing_docs, k=request.k)
-    vector_retriever = chroma_vs.as_retriever(search_kwargs={"k": request.k})
-
-    keyword_weight = round(1.0 - request.semantic_weight, 2)
-
-    ensemble = EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever],
-        weights=[keyword_weight, request.semantic_weight],
-    )
-
-    results = await ensemble.ainvoke(request.query)
-
-    search_results = [
-        SearchResult(
-            content=doc.page_content,
-            metadata=doc.metadata,
-            score=1.0 / (i + 1),
-        )
-        for i, doc in enumerate(results[: request.k])
-    ]
-
-    return HybridSearchResponse(
-        query=request.query,
-        results=search_results,
-        semantic_weight=request.semantic_weight,
-        keyword_weight=keyword_weight,
-        total=len(search_results),
-    )
-
-
-@router.post("/benchmark")
-async def benchmark_stores(request: BenchmarkRequest) -> BenchmarkResponse:
-    benchmarks: list[StoreLatency] = []
-    min_latency = float("inf")
-    fastest = ""
-
-    for store_name in request.stores:
-        try:
-            store_module = _get_store_module(store_name)
-
-            start = time.perf_counter()
-            results = store_module.search(
-                collection_name=request.collection_name,
-                query=request.query,
-                k=request.k,
-            )
-            if hasattr(results, "__await__"):
-                results = await results
-            elapsed_ms = (time.perf_counter() - start) * 1000
-
-            top_score = float(results[0][1]) if results else None
-
-            benchmarks.append(
-                StoreLatency(
-                    store=store_name,
-                    latency_ms=round(elapsed_ms, 2),
-                    results_count=len(results),
-                    top_score=top_score,
-                )
-            )
-
-            if elapsed_ms < min_latency:
-                min_latency = elapsed_ms
-                fastest = store_name
-
-        except Exception as e:
-            benchmarks.append(
-                StoreLatency(
-                    store=store_name,
-                    latency_ms=-1,
-                    results_count=0,
-                    error=str(e),
-                )
-            )
-
-    if not fastest:
-        fastest = "none"
-
-    return BenchmarkResponse(
-        query=request.query,
-        benchmarks=benchmarks,
-        fastest_store=fastest,
-    )
+for name, store in stores.items():
+    latencies = []
+    for _ in range(n_runs):
+        start = time.perf_counter()
+        store.similarity_search_with_score(query, k=5)
+        elapsed = (time.perf_counter() - start) * 1000
+        latencies.append(elapsed)
+    avg = sum(latencies) / len(latencies)
+    mn, mx = min(latencies), max(latencies)
+    print(f"{name}: avg={avg:.1f}ms  min={mn:.1f}ms  max={mx:.1f}ms  (n={n_runs})")
 ```
 
-### Шаг 4. Docker setup для pgvector и Qdrant
-
-Для запуска pgvector и Qdrant используем Docker Compose.
-
-`docker-compose.vector.yml`:
-
-```yaml
-services:
-  pgvector:
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: bootcamp
-      POSTGRES_PASSWORD: bootcamp
-      POSTGRES_DB: bootcamp
-    ports:
-      - "5433:5432"
-    volumes:
-      - pgvector_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bootcamp"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    environment:
-      QDRANT__SERVICE__GRPC_PORT: 6334
-
-volumes:
-  pgvector_data:
-  qdrant_data:
-```
-
-Запуск:
-
-```bash
-docker compose -f docker-compose.vector.yml up -d
-```
-
-Проверка pgvector:
-
-```bash
-docker exec -it $(docker ps -qf "ancestor=pgvector/pgvector:pg16") \
-  psql -U bootcamp -c "CREATE EXTENSION IF NOT EXISTS vector; SELECT extversion FROM pg_extension WHERE extname = 'vector';"
-```
-
-Проверка Qdrant:
-
-```bash
-curl http://localhost:6333/healthz
-```
-
-Добавьте в `.env`:
-
-```
-PG_USER=bootcamp
-PG_PASSWORD=bootcamp
-PG_HOST=localhost
-PG_PORT=5433
-PG_DATABASE=bootcamp
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-```
-
-И обновите `app/config.py`:
-
-```python
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
-
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
-    model_name: str = "claude-sonnet-4-20250514"
-    temperature: float = 0.3
-    max_tokens: int = 4096
-
-    pg_user: str = "bootcamp"
-    pg_password: str = "bootcamp"
-    pg_host: str = "localhost"
-    pg_port: int = 5433
-    pg_database: str = "bootcamp"
-    qdrant_host: str = "localhost"
-    qdrant_port: int = 6333
-```
-
-### Шаг 5. Регистрация роутера и тестирование
-
-Добавьте роутер в `app/api/router.py`:
-
-```python
-from app.api.v1 import assessment, rubrics, prompts, vector
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(vector.router)
-```
-
-#### Тестирование: индексация
-
-```bash
-curl -X POST http://localhost:8000/api/v1/vector/index \
-  -H "Content-Type: application/json" \
-  -d '{
-    "documents": [
-      {"content": "Эссе про влияние искусственного интеллекта на современное образование. ИИ трансформирует методы преподавания.", "metadata": {"subject": "ai", "year": 2024}},
-      {"content": "Математический анализ: пределы и производные. Предел функции в точке определяется через эпсилон-дельта определение.", "metadata": {"subject": "math", "year": 2024}},
-      {"content": "Влияние машинного обучения на медицинскую диагностику. Нейросети анализируют снимки МРТ.", "metadata": {"subject": "ai", "year": 2025}},
-      {"content": "Квантовая механика: принцип неопределённости Гейзенберга и волновая функция.", "metadata": {"subject": "physics", "year": 2024}},
-      {"content": "Применение нейронных сетей в обработке естественного языка. Трансформеры произвели революцию в NLP.", "metadata": {"subject": "ai", "year": 2025}}
-    ],
-    "store": "chroma",
-    "collection_name": "test_essays"
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "store": "chroma",
-  "collection_name": "test_essays",
-  "indexed_count": 5,
-  "ids": ["uuid-1", "uuid-2", "uuid-3", "uuid-4", "uuid-5"]
-}
-```
-
-#### Тестирование: поиск
-
-```bash
-curl -X POST http://localhost:8000/api/v1/vector/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "как ИИ влияет на образование",
-    "store": "chroma",
-    "collection_name": "test_essays",
-    "k": 3
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "store": "chroma",
-  "query": "как ИИ влияет на образование",
-  "results": [
-    {
-      "content": "Эссе про влияние искусственного интеллекта на современное образование...",
-      "metadata": {"subject": "ai", "year": 2024},
-      "score": 0.92
-    },
-    {
-      "content": "Влияние машинного обучения на медицинскую диагностику...",
-      "metadata": {"subject": "ai", "year": 2025},
-      "score": 0.78
-    },
-    {
-      "content": "Применение нейронных сетей в обработке естественного языка...",
-      "metadata": {"subject": "ai", "year": 2025},
-      "score": 0.71
-    }
-  ],
-  "total": 3
-}
-```
-
-#### Тестирование: hybrid search
-
-```bash
-curl -X POST http://localhost:8000/api/v1/vector/hybrid \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "HNSW алгоритм в vector database",
-    "collection_name": "test_essays",
-    "k": 3,
-    "semantic_weight": 0.6
-  }'
-```
-
-#### Тестирование: benchmark
-
-```bash
-curl -X POST http://localhost:8000/api/v1/vector/benchmark \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "влияние ИИ на образование",
-    "collection_name": "test_essays",
-    "stores": ["chroma"],
-    "k": 3
-  }'
-```
-
-Ожидаемый ответ:
-
-```json
-{
-  "query": "влияние ИИ на образование",
-  "benchmarks": [
-    {
-      "store": "chroma",
-      "latency_ms": 12.45,
-      "results_count": 3,
-      "top_score": 0.92,
-      "error": null
-    }
-  ],
-  "fastest_store": "chroma"
-}
-```
-
-Для полного бенчмарка с pgvector и Qdrant — запустите Docker Compose из шага 4, проиндексируйте данные в оба store, и используйте `"stores": ["chroma", "pgvector", "qdrant"]`.
+На 100 документах разница между ChromaDB и Qdrant минимальна. Различия проявляются на сотнях тысяч документов — Qdrant с HNSW + quantization значительно быстрее.
 
 ### Связь с теорией
 
-| Эндпоинт | Теоретический раздел | Что демонстрирует |
-|----------|---------------------|-------------------|
-| `POST /vector/index` | §3–6: ChromaDB, pgvector, Qdrant | Унифицированный интерфейс для разных vector DB |
-| `POST /vector/search` | §2: similarity metrics, ANN | Vector search с выбором backend |
-| `POST /vector/hybrid` | §9: Hybrid search, EnsembleRetriever | Комбинация BM25 + semantic |
-| `POST /vector/benchmark` | §8: сравнительная таблица | Количественное сравнение latency |
-
-Каждый эндпоинт — практическая демонстрация теоретических концепций:
-
-- **Index** показывает, как один и тот же набор документов сохраняется в разных backend'ах с единым API.
-- **Search** демонстрирует работу ANN-алгоритмов (HNSW в Chroma и Qdrant, HNSW/IVF в pgvector) через единый интерфейс.
-- **Hybrid** реализует EnsembleRetriever из §9 — комбинация BM25Retriever (keyword) и VectorStoreRetriever (semantic) с настраиваемыми весами.
-- **Benchmark** позволяет количественно проверить сравнительную таблицу из §8 на реальных данных вашего проекта.
+| Пример | Теоретический раздел | Что демонстрирует |
+|--------|---------------------|-------------------|
+| Пример 1 (ChromaDB) | §3: ChromaDB — embedded store | Базовый workflow: индексация → similarity search |
+| Пример 2 (Фильтрация) | §3: Filtering | Metadata-фильтры `$and`, `$gte`, `$eq` |
+| Пример 3 (pgvector) | §4: pgvector — PostgreSQL extension | SQL + vector search, HNSW-индекс, WHERE-фильтры |
+| Пример 4 (Qdrant) | §6: Qdrant — pre-filtering | Payload-based filtering, must/must_not условия |
+| Пример 5 (Hybrid) | §9: Hybrid search, EnsembleRetriever | BM25 + semantic через RRF с настраиваемыми весами |
+| Пример 6 (Бенчмарк) | §8: Сравнительная таблица | Количественное сравнение latency на реальных данных |
 
 ---
 
@@ -1771,20 +1432,18 @@ Cosine similarity — в диапазоне [0, 1] (для нормализов�
 ### 6. Отсутствие обработки ошибок при недоступном vector store
 
 ```python
-results = store_module.search(collection_name=name, query=query, k=k)
+results = client.query_points(collection_name=name, query=vector, limit=k)
 ```
 
 ```python
 try:
-    results = store_module.search(collection_name=name, query=query, k=k)
+    results = client.query_points(collection_name=name, query=vector, limit=k)
 except Exception as e:
-    raise HTTPException(
-        status_code=503,
-        detail=f"Vector store '{store_name}' unavailable: {str(e)}",
-    )
+    print(f"Vector store недоступен: {e}")
+    results = []
 ```
 
-В production pgvector или Qdrant могут быть временно недоступны (network, restart, OOM). Всегда обрабатывайте ошибки подключения и возвращайте осмысленный HTTP-ответ, а не 500 с трейсбеком.
+В production pgvector или Qdrant могут быть временно недоступны (network, restart, OOM). Всегда обрабатывайте ошибки подключения — иначе один упавший vector store сломает весь pipeline.
 
 ---
 

@@ -1,7 +1,6 @@
 # Тема 14: Multi-Agent Systems — команды агентов
 
 > **Пререквизиты:** [Тема 6 (LangGraph)](topic_06_langgraph_agents.md), [Тема 11 (Tool Use)](topic_11_tool_use.md), [Тема 13 (Agentic Patterns)](topic_13_agentic_patterns.md)
-> **Что добавляем в проект:** `app/api/v1/multi_agent.py`, `app/graph/agents/analyzer.py`, `app/graph/agents/scorer.py`, `app/graph/agents/reviewer.py`, `app/graph/multi_agent.py`, `app/schemas/multi_agent.py`
 > **Зависимости:** `langgraph`, `langchain-core`, `langchain-anthropic`
 
 ---
@@ -782,124 +781,20 @@ class MultiAgentState(TypedDict):
 
 ---
 
-## Практика: роутер `/api/v1/multi-agent`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/multi_agent.py`
+### Пример 1: Специализированные агенты с инструментами
 
-Определяем Pydantic-модели для входных и выходных данных мульти-агентного assessment'а.
-
-```python
-from pydantic import BaseModel, Field
-
-
-class AgentResult(BaseModel):
-    agent_name: str = Field(description="Name of the agent that produced this result")
-    status: str = Field(description="completed, failed, or skipped")
-    result: dict = Field(default_factory=dict)
-    duration_ms: float = Field(default=0.0)
-
-
-class MultiAgentAssessmentRequest(BaseModel):
-    student_work: str = Field(min_length=1)
-    rubric: str = Field(default="Score the work on content (1-10), structure (1-10), and language (1-10).")
-    mode: str = Field(default="supervisor", pattern="^(supervisor|pipeline|parallel)$")
-
-
-class AnalysisResult(BaseModel):
-    word_count: int = Field(default=0)
-    paragraph_count: int = Field(default=0)
-    citation_count: int = Field(default=0)
-    structure_notes: str = Field(default="")
-    vocabulary_level: str = Field(default="unknown")
-
-
-class CriterionScore(BaseModel):
-    name: str
-    score: int = Field(ge=0, le=10)
-    max_score: int = Field(default=10)
-    justification: str = Field(default="")
-
-
-class ScoringResult(BaseModel):
-    criteria_scores: list[CriterionScore] = Field(default_factory=list)
-    total_score: int = Field(default=0)
-    max_total_score: int = Field(default=0)
-    scoring_notes: str = Field(default="")
-
-
-class ReviewResult(BaseModel):
-    is_consistent: bool = Field(default=True)
-    issues_found: list[str] = Field(default_factory=list)
-    suggested_adjustments: list[str] = Field(default_factory=list)
-    confidence: float = Field(ge=0.0, le=1.0, default=0.8)
-    review_notes: str = Field(default="")
-
-
-class MultiAgentAssessmentResponse(BaseModel):
-    analysis: AnalysisResult | None = None
-    scoring: ScoringResult | None = None
-    review: ReviewResult | None = None
-    agent_trace: list[AgentResult] = Field(default_factory=list)
-    final_summary: str = Field(default="")
-    total_duration_ms: float = Field(default=0.0)
-
-
-class SupervisorRequest(BaseModel):
-    student_work: str = Field(min_length=1)
-    rubric: str = Field(default="Score the work on content (1-10), structure (1-10), and language (1-10).")
-    max_iterations: int = Field(default=5, ge=1, le=10)
-
-
-class SupervisorResponse(BaseModel):
-    decisions: list[dict] = Field(default_factory=list)
-    agent_results: list[AgentResult] = Field(default_factory=list)
-    final_result: dict = Field(default_factory=dict)
-
-
-class PipelineRequest(BaseModel):
-    student_work: str = Field(min_length=1)
-    rubric: str = Field(default="Score the work on content (1-10), structure (1-10), and language (1-10).")
-
-
-class PipelineResponse(BaseModel):
-    analysis: AnalysisResult
-    scoring: ScoringResult
-    review: ReviewResult
-    agent_trace: list[AgentResult] = Field(default_factory=list)
-
-
-class ParallelScoringRequest(BaseModel):
-    student_work: str = Field(min_length=1)
-    rubric: str = Field(default="Score the work on content (1-10), structure (1-10), and language (1-10).")
-    analysis: str = Field(default="")
-
-
-class ParallelScoringResponse(BaseModel):
-    scorer_a_result: ScoringResult
-    scorer_b_result: ScoringResult
-    final_result: ScoringResult
-    resolution_method: str = Field(description="average or arbiter_llm")
-    agent_trace: list[AgentResult] = Field(default_factory=list)
-```
-
-Обрати внимание на `AgentResult` — модель для трейсинга каждого агента. Она содержит имя агента, статус, результат и время выполнения. Это даёт клиенту полную прозрачность: какие агенты были вызваны, в каком порядке, сколько времени заняли.
-
-### Шаг 2. Agent: Analyzer — `app/graph/agents/analyzer.py`
-
-Analyzer специализируется на текстовом анализе: подсчёт слов, определение структуры, анализ словарного запаса, подсчёт цитирований. Он не выставляет оценки — только собирает фактическую информацию о работе.
+Каждый агент в мульти-агентной системе получает свой набор инструментов и фокусированный промпт. Создаём Analyzer — агента для текстового анализа с четырьмя tools.
 
 ```python
-import time
+import os
+import re
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AnyMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent
-from typing import TypedDict, Annotated
-
-from app.config import get_settings
 
 
 @tool
@@ -918,7 +813,6 @@ def count_paragraphs(text: str) -> int:
 @tool
 def count_citations(text: str) -> int:
     """Count citation references like [1], (Author, 2024), etc."""
-    import re
     bracket_refs = re.findall(r"\[\d+\]", text)
     paren_refs = re.findall(r"\([A-Z][a-z]+(?:\s+(?:et\s+al\.)?)?,\s*\d{4}\)", text)
     return len(bracket_refs) + len(paren_refs)
@@ -941,301 +835,66 @@ def analyze_vocabulary(text: str) -> dict:
 
 
 ANALYZER_PROMPT = """You are a text analyzer for student work assessment.
-Your job is to analyze the given text thoroughly using the available tools.
+Your job is to analyze the given text using the available tools.
 
-Always perform these steps:
-1. Count words using count_words tool
-2. Count paragraphs using count_paragraphs tool
-3. Count citations using count_citations tool
-4. Analyze vocabulary using analyze_vocabulary tool
+Steps:
+1. Count words using count_words
+2. Count paragraphs using count_paragraphs
+3. Count citations using count_citations
+4. Analyze vocabulary using analyze_vocabulary
 
-After gathering all data, provide a comprehensive analysis summary.
-Do NOT score or grade the work — only analyze factual properties."""
+After gathering data, provide a comprehensive analysis summary.
+Do NOT score or grade — only analyze factual properties."""
 
+llm = ChatAnthropic(
+    model="claude-haiku-3-20250414",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    temperature=0,
+    max_tokens=2048,
+)
 
-class AnalyzerState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    student_work: str
-    analysis_result: str
+analyzer_agent = create_react_agent(
+    model=llm,
+    tools=[count_words, count_paragraphs, count_citations, analyze_vocabulary],
+    prompt=ANALYZER_PROMPT,
+)
 
+student_essay = """The impact of climate change on biodiversity is a pressing concern [1].
+Rising temperatures affect ecosystems globally.
+Species migration patterns are shifting as habitats change.
+Marine ecosystems face acidification (Smith, 2023).
 
-def create_analyzer_agent() -> create_react_agent:
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-haiku-3-20250414",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=2048,
-    )
-    return create_react_agent(
-        model=llm,
-        tools=[count_words, count_paragraphs, count_citations, analyze_vocabulary],
-        prompt=ANALYZER_PROMPT,
-    )
+Conservation efforts must adapt to these new realities.
+Research shows that 30% of species face extinction risk by 2050 [2]."""
 
+result = await analyzer_agent.ainvoke({
+    "messages": [HumanMessage(content=f"Analyze this student work:\n\n{student_essay}")],
+})
 
-async def run_analyzer(student_work: str) -> dict:
-    agent = create_analyzer_agent()
-    start = time.monotonic()
-    result = await agent.ainvoke({
-        "messages": [HumanMessage(content=f"Analyze this student work:\n\n{student_work}")],
-    })
-    duration_ms = (time.monotonic() - start) * 1000
-    last_message = result["messages"][-1]
-    return {
-        "analysis": last_message.content,
-        "duration_ms": round(duration_ms, 1),
-    }
+print("=== Analyzer Agent ===")
+print(result["messages"][-1].content)
 ```
 
-Analyzer использует `create_react_agent` — готовый ReAct-граф, который в цикле вызывает tools до тех пор, пока не получит достаточно информации. Промпт инструктирует агента вызвать все четыре tools последовательно, а затем сформировать итоговый анализ.
+Analyzer использует `create_react_agent` — готовый ReAct-граф, который в цикле вызывает tools до получения достаточной информации. Модель `claude-haiku-3-20250414` — Analyzer выполняет механическую работу (подсчёт слов, парсинг), для которой мощная модель не нужна.
 
-Модель — `claude-haiku-3-20250414`: Analyzer выполняет механическую работу (подсчёт слов, парсинг), для которой мощная модель не нужна.
+### Пример 2: Supervisor-паттерн — динамическая координация
 
-### Шаг 3. Agent: Scorer — `app/graph/agents/scorer.py`
-
-Scorer принимает анализ + рубрику и выставляет баллы по каждому критерию. Это самый ответственный агент — от точности оценки зависит качество всей системы.
+Supervisor принимает задачу, анализирует текущее состояние и решает, какому worker'у делегировать работу. После каждого worker'а управление возвращается supervisor'у — он оценивает результат и выбирает следующий шаг.
 
 ```python
-import time
+import os
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage, HumanMessage, AnyMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing import TypedDict, Annotated
-from pydantic import BaseModel, Field
-
-from app.config import get_settings
-
-
-class ScoringOutput(BaseModel):
-    criteria_scores: list[dict] = Field(description="List of {name, score, max_score, justification}")
-    total_score: int
-    max_total_score: int
-    scoring_notes: str
-
-
-SCORER_PROMPT = """You are an expert scorer for student work assessment.
-You receive text analysis results and a scoring rubric.
-
-For each criterion in the rubric:
-1. Evaluate the student work against the criterion
-2. Assign a score within the allowed range
-3. Provide a brief justification
-
-Be fair but rigorous. Base scores on evidence from the analysis, not assumptions."""
-
-
-class ScorerState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    student_work: str
-    rubric: str
-    analysis: str
-    scoring_result: str
-
-
-async def score_node(state: ScorerState) -> dict:
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=2048,
-    )
-    structured_llm = llm.with_structured_output(ScoringOutput)
-
-    response = await structured_llm.ainvoke([
-        SystemMessage(content=SCORER_PROMPT),
-        HumanMessage(content=(
-            f"Student work:\n{state['student_work']}\n\n"
-            f"Analysis:\n{state['analysis']}\n\n"
-            f"Rubric:\n{state['rubric']}\n\n"
-            "Score the work according to the rubric."
-        )),
-    ])
-
-    return {"scoring_result": response.model_dump_json(), "messages": []}
-
-
-scorer_graph = StateGraph(ScorerState)
-scorer_graph.add_node("score", score_node)
-scorer_graph.add_edge(START, "score")
-scorer_graph.add_edge("score", END)
-
-scorer_compiled = scorer_graph.compile()
-
-
-async def run_scorer(student_work: str, rubric: str, analysis: str, style: str = "balanced") -> dict:
-    start = time.monotonic()
-
-    prompt_suffix = ""
-    if style == "strict":
-        prompt_suffix = "\nBe especially strict. Deduct points for any minor issues."
-    elif style == "lenient":
-        prompt_suffix = "\nBe generous. Give benefit of the doubt to the student."
-
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=2048,
-    )
-    structured_llm = llm.with_structured_output(ScoringOutput)
-
-    response = await structured_llm.ainvoke([
-        SystemMessage(content=SCORER_PROMPT + prompt_suffix),
-        HumanMessage(content=(
-            f"Student work:\n{student_work}\n\n"
-            f"Analysis:\n{analysis}\n\n"
-            f"Rubric:\n{rubric}\n\n"
-            "Score the work according to the rubric."
-        )),
-    ])
-
-    duration_ms = (time.monotonic() - start) * 1000
-    return {
-        "scoring": response.model_dump(),
-        "duration_ms": round(duration_ms, 1),
-    }
-```
-
-Scorer использует `with_structured_output` для гарантированного получения типизированного результата. Модель — `claude-sonnet-4-20250514`, потому что точность оценки критически важна.
-
-Обрати внимание на параметр `style` в `run_scorer` — он позволяет запустить scorer с разными инструкциями (strict / lenient / balanced). Это используется в parallel-эндпоинте, где два scorer'а оценивают одну работу с разной строгостью.
-
-### Шаг 4. Agent: Reviewer — `app/graph/agents/reviewer.py`
-
-Reviewer — агент контроля качества. Он получает результаты анализа и оценки, проверяет консистентность и обоснованность. Это финальный gate перед выдачей результата.
-
-```python
-import time
-
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage, HumanMessage, AnyMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing import TypedDict, Annotated
-from pydantic import BaseModel, Field
-
-from app.config import get_settings
-
-
-class ReviewOutput(BaseModel):
-    is_consistent: bool = Field(description="Whether scores are consistent with analysis")
-    issues_found: list[str] = Field(default_factory=list)
-    suggested_adjustments: list[str] = Field(default_factory=list)
-    confidence: float = Field(ge=0.0, le=1.0)
-    review_notes: str
-
-
-REVIEWER_PROMPT = """You are a quality reviewer for student work assessments.
-You receive the original student work, text analysis, and scoring results.
-
-Your job:
-1. Check if scores are consistent with the analysis findings
-2. Identify any scoring issues (too harsh, too lenient, unjustified scores)
-3. Suggest adjustments if needed
-4. Rate your confidence in the overall assessment quality (0.0 to 1.0)
-
-Be objective. A good assessment has scores that logically follow from the analysis."""
-
-
-class ReviewerState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    student_work: str
-    analysis: str
-    scoring: str
-    review_result: str
-
-
-async def review_node(state: ReviewerState) -> dict:
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-haiku-3-20250414",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=2048,
-    )
-    structured_llm = llm.with_structured_output(ReviewOutput)
-
-    response = await structured_llm.ainvoke([
-        SystemMessage(content=REVIEWER_PROMPT),
-        HumanMessage(content=(
-            f"Student work:\n{state['student_work']}\n\n"
-            f"Analysis:\n{state['analysis']}\n\n"
-            f"Scoring:\n{state['scoring']}\n\n"
-            "Review the assessment quality."
-        )),
-    ])
-
-    return {"review_result": response.model_dump_json(), "messages": []}
-
-
-reviewer_graph = StateGraph(ReviewerState)
-reviewer_graph.add_node("review", review_node)
-reviewer_graph.add_edge(START, "review")
-reviewer_graph.add_edge("review", END)
-
-reviewer_compiled = reviewer_graph.compile()
-
-
-async def run_reviewer(student_work: str, analysis: str, scoring: str) -> dict:
-    start = time.monotonic()
-
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-haiku-3-20250414",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=2048,
-    )
-    structured_llm = llm.with_structured_output(ReviewOutput)
-
-    response = await structured_llm.ainvoke([
-        SystemMessage(content=REVIEWER_PROMPT),
-        HumanMessage(content=(
-            f"Student work:\n{student_work}\n\n"
-            f"Analysis:\n{analysis}\n\n"
-            f"Scoring:\n{scoring}\n\n"
-            "Review the assessment quality."
-        )),
-    ])
-
-    duration_ms = (time.monotonic() - start) * 1000
-    return {
-        "review": response.model_dump(),
-        "duration_ms": round(duration_ms, 1),
-    }
-```
-
-Reviewer использует `claude-haiku-3-20250414` — его задача формальная (проверка консистентности), не требует мощного reasoning. Выходная модель `ReviewOutput` включает флаг `is_consistent`, список найденных проблем и уровень уверенности.
-
-### Шаг 5. Multi-Agent Orchestrator — `app/graph/multi_agent.py`
-
-Центральный модуль — здесь собираются все агенты в единый граф. Реализуем три архитектуры: supervisor, pipeline и parallel.
-
-```python
-import json
-import time
-
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AnyMessage
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, AnyMessage
+from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
-from typing import TypedDict, Annotated, Literal
 from pydantic import BaseModel, Field
-
-from app.config import get_settings
-from app.graph.agents.analyzer import run_analyzer
-from app.graph.agents.scorer import run_scorer
-from app.graph.agents.reviewer import run_reviewer
+from typing import TypedDict, Annotated, Literal
 
 
 class SupervisorDecision(BaseModel):
-    next_agent: Literal["analyzer", "scorer", "reviewer", "FINISH"] = Field(
+    next_agent: Literal["analyzer", "scorer", "FINISH"] = Field(
         description="Which agent to call next"
     )
     reasoning: str = Field(description="Why this agent is needed next")
@@ -1247,82 +906,61 @@ class OrchestratorState(TypedDict):
     rubric: str
     analyzer_result: str
     scorer_result: str
-    reviewer_result: str
-    agent_trace: list[dict]
     iteration: int
 
 
 SUPERVISOR_SYSTEM = """You are a supervisor coordinating a student work assessment team.
 
 Your team:
-- analyzer: Analyzes text properties (word count, structure, citations, vocabulary).
-  Call first to gather factual data about the student work.
+- analyzer: Analyzes text properties (word count, structure, vocabulary).
+  Call first to gather factual data.
 - scorer: Scores the work against a rubric. Requires analysis results.
-  Call after analyzer has completed.
-- reviewer: Reviews scoring quality and consistency.
-  Call after scorer has completed.
+  Call after analyzer.
 
 Rules:
-1. Always call analyzer first unless analysis is already in state
-2. Always call scorer after analyzer
-3. Call reviewer after scorer to validate
-4. Respond FINISH when all three have completed
-5. If reviewer finds issues, you may re-call scorer
+1. Call analyzer first if analysis not done
+2. Call scorer after analyzer completes
+3. Respond FINISH when both have completed"""
 
-Current state will show which agents have already produced results."""
+supervisor_llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    temperature=0,
+    max_tokens=1024,
+)
 
 
 async def supervisor_node(
     state: OrchestratorState,
-) -> Command[Literal["analyzer_worker", "scorer_worker", "reviewer_worker", "__end__"]]:
-    settings = get_settings()
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        api_key=settings.anthropic_api_key,
-        temperature=0,
-        max_tokens=1024,
-    )
-    structured_llm = llm.with_structured_output(SupervisorDecision)
+) -> Command[Literal["analyzer_worker", "scorer_worker", "__end__"]]:
+    structured_llm = supervisor_llm.with_structured_output(SupervisorDecision)
 
     status_parts = []
     if state.get("analyzer_result"):
-        status_parts.append(f"Analyzer completed: {state['analyzer_result'][:200]}")
+        status_parts.append(f"Analyzer: {state['analyzer_result'][:200]}")
     if state.get("scorer_result"):
-        status_parts.append(f"Scorer completed: {state['scorer_result'][:200]}")
-    if state.get("reviewer_result"):
-        status_parts.append(f"Reviewer completed: {state['reviewer_result'][:200]}")
+        status_parts.append(f"Scorer: {state['scorer_result'][:200]}")
     status = "\n".join(status_parts) if status_parts else "No agents have run yet."
 
     decision = await structured_llm.ainvoke([
         SystemMessage(content=SUPERVISOR_SYSTEM),
         HumanMessage(content=(
-            f"Student work:\n{state['student_work'][:500]}\n\n"
-            f"Rubric:\n{state['rubric']}\n\n"
-            f"Current status:\n{status}\n\n"
-            "Which agent should act next?"
+            f"Student work: {state['student_work'][:300]}\n\n"
+            f"Rubric: {state['rubric']}\n\n"
+            f"Status:\n{status}\n\nWhich agent next?"
         )),
     ])
 
     agent_map = {
         "analyzer": "analyzer_worker",
         "scorer": "scorer_worker",
-        "reviewer": "reviewer_worker",
         "FINISH": "__end__",
     }
-
     target = agent_map[decision.next_agent]
-    trace_entry = {
-        "agent": "supervisor",
-        "decision": decision.next_agent,
-        "reasoning": decision.reasoning,
-        "iteration": state.get("iteration", 0),
-    }
-    new_trace = state.get("agent_trace", []) + [trace_entry]
 
     return Command(
         goto=target,
         update={
-            "agent_trace": new_trace,
             "iteration": state.get("iteration", 0) + 1,
             "messages": [AIMessage(content=f"Supervisor → {decision.next_agent}: {decision.reasoning}")],
         },
@@ -1330,120 +968,260 @@ async def supervisor_node(
 
 
 async def analyzer_worker(state: OrchestratorState) -> dict:
-    result = await run_analyzer(state["student_work"])
-    trace_entry = {
-        "agent": "analyzer",
-        "status": "completed",
-        "duration_ms": result["duration_ms"],
-    }
+    words = state["student_work"].split()
+    paragraphs = [p.strip() for p in state["student_work"].split("\n\n") if p.strip()]
+    analysis = (
+        f"Words: {len(words)}, "
+        f"Paragraphs: {len(paragraphs)}, "
+        f"Avg sentence length: {len(words) // max(state['student_work'].count('.'), 1)}"
+    )
     return {
-        "analyzer_result": result["analysis"],
-        "agent_trace": state.get("agent_trace", []) + [trace_entry],
-        "messages": [AIMessage(content=f"[Analyzer] {result['analysis']}", name="analyzer")],
+        "analyzer_result": analysis,
+        "messages": [AIMessage(content=f"[Analyzer] {analysis}", name="analyzer")],
     }
 
 
 async def scorer_worker(state: OrchestratorState) -> dict:
-    analysis = state.get("analyzer_result", "No analysis available")
-    result = await run_scorer(state["student_work"], state["rubric"], analysis)
-    scoring_json = json.dumps(result["scoring"], indent=2)
-    trace_entry = {
-        "agent": "scorer",
-        "status": "completed",
-        "duration_ms": result["duration_ms"],
-    }
+    scorer_llm = ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        temperature=0,
+        max_tokens=1024,
+    )
+    response = await scorer_llm.ainvoke([
+        SystemMessage(content="You are a scorer. Given analysis and rubric, produce scores as JSON with keys: content, structure, evidence (each 1-10), total, notes."),
+        HumanMessage(content=(
+            f"Work: {state['student_work'][:500]}\n"
+            f"Analysis: {state['analyzer_result']}\n"
+            f"Rubric: {state['rubric']}"
+        )),
+    ])
     return {
-        "scorer_result": scoring_json,
-        "agent_trace": state.get("agent_trace", []) + [trace_entry],
-        "messages": [AIMessage(content=f"[Scorer] {scoring_json}", name="scorer")],
+        "scorer_result": response.content,
+        "messages": [AIMessage(content=f"[Scorer] {response.content}", name="scorer")],
     }
 
 
-async def reviewer_worker(state: OrchestratorState) -> dict:
-    analysis = state.get("analyzer_result", "")
-    scoring = state.get("scorer_result", "")
-    result = await run_reviewer(state["student_work"], analysis, scoring)
-    review_json = json.dumps(result["review"], indent=2)
-    trace_entry = {
-        "agent": "reviewer",
-        "status": "completed",
-        "duration_ms": result["duration_ms"],
-    }
-    return {
-        "reviewer_result": review_json,
-        "agent_trace": state.get("agent_trace", []) + [trace_entry],
-        "messages": [AIMessage(content=f"[Reviewer] {review_json}", name="reviewer")],
-    }
+graph = StateGraph(OrchestratorState)
+graph.add_node("supervisor", supervisor_node)
+graph.add_node("analyzer_worker", analyzer_worker)
+graph.add_node("scorer_worker", scorer_worker)
+
+graph.add_edge(START, "supervisor")
+graph.add_edge("analyzer_worker", "supervisor")
+graph.add_edge("scorer_worker", "supervisor")
+
+app = graph.compile()
+
+result = await app.ainvoke({
+    "student_work": "Climate change affects biodiversity worldwide. Rising temperatures disrupt ecosystems globally. Species migrate to new habitats as conditions shift. Marine life faces ocean acidification. Conservation strategies must adapt to emerging challenges.",
+    "rubric": "Score on: content depth (1-10), structure (1-10), evidence use (1-10)",
+    "analyzer_result": "",
+    "scorer_result": "",
+    "iteration": 0,
+    "messages": [],
+})
+
+print("=== Supervisor Orchestration ===")
+for msg in result["messages"]:
+    name = getattr(msg, "name", None) or "supervisor"
+    print(f"  [{name}] {msg.content[:200]}")
+print(f"\nIterations: {result['iteration']}")
+print(f"Scorer result:\n{result['scorer_result']}")
+```
+
+Ключевые моменты:
+
+- От каждого worker'а идёт ребро обратно к supervisor — создаётся цикл
+- Маршрутизация от supervisor'а к workers через `Command(goto=...)` — явные рёбра от supervisor'а не нужны
+- `Literal` в type hint перечисляет возможные destination — LangGraph использует это для визуализации графа
+- Supervisor анализирует status каждого агента и принимает решение на основе текущего state
+
+### Пример 3: Subgraph composition — вложенные графы
+
+Каждый агент может быть полноценным `StateGraph` со своими узлами и логикой. Родительский граф композирует скомпилированные subgraph'ы, передавая данные через совпадающие имена полей.
+
+```python
+import os
+import json
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import SystemMessage, HumanMessage, AnyMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
+from typing import TypedDict, Annotated
 
 
-def build_supervisor_graph() -> StateGraph:
-    graph = StateGraph(OrchestratorState)
+class AnalyzerState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    student_work: str
+    analysis_result: str
 
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("analyzer_worker", analyzer_worker)
-    graph.add_node("scorer_worker", scorer_worker)
-    graph.add_node("reviewer_worker", reviewer_worker)
 
-    graph.add_edge(START, "supervisor")
-    graph.add_edge("analyzer_worker", "supervisor")
-    graph.add_edge("scorer_worker", "supervisor")
-    graph.add_edge("reviewer_worker", "supervisor")
+async def analyze_text(state: AnalyzerState) -> dict:
+    text = state["student_work"]
+    words = text.split()
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    return {"analysis_result": f"Words: {len(words)}, Paragraphs: {len(paragraphs)}"}
 
-    return graph
+
+analyzer_graph = StateGraph(AnalyzerState)
+analyzer_graph.add_node("analyze", analyze_text)
+analyzer_graph.add_edge(START, "analyze")
+analyzer_graph.add_edge("analyze", END)
+analyzer_compiled = analyzer_graph.compile()
+
+
+class ScoringOutput(BaseModel):
+    content: int = Field(ge=0, le=10)
+    structure: int = Field(ge=0, le=10)
+    evidence: int = Field(ge=0, le=10)
+    total: int
+    notes: str
+
+
+class ScorerState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    student_work: str
+    rubric: str
+    analysis_result: str
+    scoring_result: str
+
+
+async def score_work(state: ScorerState) -> dict:
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        temperature=0,
+        max_tokens=1024,
+    )
+    structured_llm = llm.with_structured_output(ScoringOutput)
+    response = await structured_llm.ainvoke([
+        SystemMessage(content="Score the student work based on analysis and rubric."),
+        HumanMessage(content=(
+            f"Work: {state['student_work'][:500]}\n"
+            f"Analysis: {state['analysis_result']}\n"
+            f"Rubric: {state['rubric']}"
+        )),
+    ])
+    return {"scoring_result": response.model_dump_json()}
+
+
+scorer_graph = StateGraph(ScorerState)
+scorer_graph.add_node("score", score_work)
+scorer_graph.add_edge(START, "score")
+scorer_graph.add_edge("score", END)
+scorer_compiled = scorer_graph.compile()
+
+
+class ReviewerState(TypedDict):
+    student_work: str
+    analysis_result: str
+    scoring_result: str
+    review_result: str
+
+
+async def review_assessment(state: ReviewerState) -> dict:
+    llm = ChatAnthropic(
+        model="claude-haiku-3-20250414",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        temperature=0,
+        max_tokens=1024,
+    )
+    response = await llm.ainvoke([
+        SystemMessage(content="Review the assessment. Check if scores are consistent with analysis. Return: is_consistent (bool), issues (list), confidence (0-1)."),
+        HumanMessage(content=(
+            f"Work: {state['student_work'][:300]}\n"
+            f"Analysis: {state['analysis_result']}\n"
+            f"Scoring: {state['scoring_result']}"
+        )),
+    ])
+    return {"review_result": response.content}
+
+
+reviewer_graph = StateGraph(ReviewerState)
+reviewer_graph.add_node("review", review_assessment)
+reviewer_graph.add_edge(START, "review")
+reviewer_graph.add_edge("review", END)
+reviewer_compiled = reviewer_graph.compile()
 
 
 class PipelineState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
     student_work: str
     rubric: str
-    analyzer_result: str
-    scorer_result: str
-    reviewer_result: str
-    agent_trace: list[dict]
+    analysis_result: str
+    scoring_result: str
+    review_result: str
 
 
-async def pipeline_analyze(state: PipelineState) -> dict:
-    result = await run_analyzer(state["student_work"])
-    return {
-        "analyzer_result": result["analysis"],
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "analyzer", "status": "completed", "duration_ms": result["duration_ms"],
-        }],
-    }
+parent_graph = StateGraph(PipelineState)
+parent_graph.add_node("analyzer", analyzer_compiled)
+parent_graph.add_node("scorer", scorer_compiled)
+parent_graph.add_node("reviewer", reviewer_compiled)
+
+parent_graph.add_edge(START, "analyzer")
+parent_graph.add_edge("analyzer", "scorer")
+parent_graph.add_edge("scorer", "reviewer")
+parent_graph.add_edge("reviewer", END)
+
+pipeline = parent_graph.compile()
+
+result = await pipeline.ainvoke({
+    "student_work": "The impact of climate change on biodiversity is significant [1]. Rising temperatures affect ecosystems.\n\nSpecies migration patterns shift as habitats change. Marine ecosystems face acidification (Smith, 2023).\n\nConservation efforts must adapt. Research shows 30% of species face extinction risk [2].",
+    "rubric": "content depth (1-10), structure (1-10), evidence use (1-10)",
+    "analysis_result": "",
+    "scoring_result": "",
+    "review_result": "",
+    "messages": [],
+})
+
+print("=== Pipeline: Subgraph Composition ===")
+print(f"Analysis: {result['analysis_result']}")
+print(f"Scoring: {result['scoring_result']}")
+print(f"Review: {result['review_result']}")
+```
+
+Каждый subgraph (analyzer, scorer, reviewer) тестируется независимо и композируется в parent graph. LangGraph передаёт данные между subgraph'ами через совпадение имён полей: `analysis_result` из analyzer автоматически попадает в scorer.
+
+Для изоляции internal state используй input/output schemas:
+
+```python
+class AnalyzerInput(TypedDict):
+    student_work: str
 
 
-async def pipeline_score(state: PipelineState) -> dict:
-    result = await run_scorer(state["student_work"], state["rubric"], state["analyzer_result"])
-    return {
-        "scorer_result": json.dumps(result["scoring"]),
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "scorer", "status": "completed", "duration_ms": result["duration_ms"],
-        }],
-    }
+class AnalyzerOutput(TypedDict):
+    analysis_result: str
 
 
-async def pipeline_review(state: PipelineState) -> dict:
-    result = await run_reviewer(state["student_work"], state["analyzer_result"], state["scorer_result"])
-    return {
-        "reviewer_result": json.dumps(result["review"]),
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "reviewer", "status": "completed", "duration_ms": result["duration_ms"],
-        }],
-    }
+analyzer_graph = StateGraph(AnalyzerState, input=AnalyzerInput, output=AnalyzerOutput)
+```
+
+Теперь parent видит только `student_work` (вход) и `analysis_result` (выход). Внутренние поля subgraph'а (например, `messages`) остаются приватными.
+
+### Пример 4: Параллельное выполнение и арбитраж
+
+Два scorer'а оценивают одну работу с разной строгостью. Arbiter сравнивает результаты: если расхождение ≤3 баллов — берёт среднее, иначе вызывает LLM для разрешения.
+
+```python
+import os
+import json
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph import StateGraph, START, END
+from pydantic import BaseModel, Field
+from typing import TypedDict
 
 
-def build_pipeline_graph() -> StateGraph:
-    graph = StateGraph(PipelineState)
-
-    graph.add_node("analyze", pipeline_analyze)
-    graph.add_node("score", pipeline_score)
-    graph.add_node("review", pipeline_review)
-
-    graph.add_edge(START, "analyze")
-    graph.add_edge("analyze", "score")
-    graph.add_edge("score", "review")
-    graph.add_edge("review", END)
-
-    return graph
+class ScoringOutput(BaseModel):
+    content: int = Field(ge=0, le=10)
+    structure: int = Field(ge=0, le=10)
+    evidence: int = Field(ge=0, le=10)
+    total: int
+    notes: str
 
 
 class ParallelState(TypedDict):
@@ -1453,426 +1231,143 @@ class ParallelState(TypedDict):
     scorer_a_result: str
     scorer_b_result: str
     final_result: str
-    agent_trace: list[dict]
 
 
-async def parallel_scorer_a(state: ParallelState) -> dict:
-    result = await run_scorer(state["student_work"], state["rubric"], state["analysis"], style="strict")
-    return {
-        "scorer_a_result": json.dumps(result["scoring"]),
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "scorer_a_strict", "status": "completed", "duration_ms": result["duration_ms"],
-        }],
-    }
+async def scorer_strict(state: ParallelState) -> dict:
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        temperature=0,
+        max_tokens=1024,
+    )
+    structured_llm = llm.with_structured_output(ScoringOutput)
+    response = await structured_llm.ainvoke([
+        SystemMessage(content="Score the student work strictly. Deduct points for any issues."),
+        HumanMessage(content=(
+            f"Work: {state['student_work'][:500]}\n"
+            f"Analysis: {state['analysis']}\n"
+            f"Rubric: {state['rubric']}"
+        )),
+    ])
+    return {"scorer_a_result": response.model_dump_json()}
 
 
-async def parallel_scorer_b(state: ParallelState) -> dict:
-    result = await run_scorer(state["student_work"], state["rubric"], state["analysis"], style="lenient")
-    return {
-        "scorer_b_result": json.dumps(result["scoring"]),
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "scorer_b_lenient", "status": "completed", "duration_ms": result["duration_ms"],
-        }],
-    }
+async def scorer_lenient(state: ParallelState) -> dict:
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        api_key=os.environ["ANTHROPIC_API_KEY"],
+        temperature=0,
+        max_tokens=1024,
+    )
+    structured_llm = llm.with_structured_output(ScoringOutput)
+    response = await structured_llm.ainvoke([
+        SystemMessage(content="Score the student work generously. Give benefit of the doubt."),
+        HumanMessage(content=(
+            f"Work: {state['student_work'][:500]}\n"
+            f"Analysis: {state['analysis']}\n"
+            f"Rubric: {state['rubric']}"
+        )),
+    ])
+    return {"scorer_b_result": response.model_dump_json()}
 
 
 async def arbiter_node(state: ParallelState) -> dict:
     score_a = json.loads(state["scorer_a_result"])
     score_b = json.loads(state["scorer_b_result"])
-
-    total_a = score_a.get("total_score", 0)
-    total_b = score_b.get("total_score", 0)
-    max_score = max(score_a.get("max_total_score", 30), score_b.get("max_total_score", 30))
+    total_a = score_a["total"]
+    total_b = score_b["total"]
 
     if abs(total_a - total_b) <= 3:
         final = {
-            "total_score": (total_a + total_b) // 2,
-            "max_total_score": max_score,
-            "resolution_method": "average",
-            "scoring_notes": f"Scores close enough (A={total_a}, B={total_b}). Averaged.",
+            "total": (total_a + total_b) // 2,
+            "method": "average",
+            "notes": f"Scores close (strict={total_a}, lenient={total_b}). Averaged.",
         }
     else:
-        settings = get_settings()
         llm = ChatAnthropic(
             model="claude-sonnet-4-20250514",
-            api_key=settings.anthropic_api_key,
+            api_key=os.environ["ANTHROPIC_API_KEY"],
             temperature=0,
             max_tokens=1024,
         )
         response = await llm.ainvoke([
-            SystemMessage(content="You are an arbiter. Two scorers gave different scores. Analyze both and produce a fair final score as JSON with keys: total_score, max_total_score, scoring_notes."),
-            HumanMessage(content=f"Scorer A (strict): {state['scorer_a_result']}\n\nScorer B (lenient): {state['scorer_b_result']}"),
+            SystemMessage(content="Two scorers disagree. Analyze both and produce a fair final score as JSON: {total, method, notes}."),
+            HumanMessage(content=f"Strict: {state['scorer_a_result']}\nLenient: {state['scorer_b_result']}"),
         ])
         try:
             final = json.loads(response.content)
-            final["resolution_method"] = "arbiter_llm"
+            final["method"] = "arbiter_llm"
         except json.JSONDecodeError:
             final = {
-                "total_score": (total_a + total_b) // 2,
-                "max_total_score": max_score,
-                "resolution_method": "average_fallback",
-                "scoring_notes": response.content,
+                "total": (total_a + total_b) // 2,
+                "method": "average_fallback",
+                "notes": response.content,
             }
 
-    return {
-        "final_result": json.dumps(final),
-        "agent_trace": state.get("agent_trace", []) + [{
-            "agent": "arbiter", "status": "completed",
-        }],
-    }
+    return {"final_result": json.dumps(final)}
 
 
-def build_parallel_graph() -> StateGraph:
-    graph = StateGraph(ParallelState)
+graph = StateGraph(ParallelState)
+graph.add_node("scorer_strict", scorer_strict)
+graph.add_node("scorer_lenient", scorer_lenient)
+graph.add_node("arbiter", arbiter_node)
 
-    graph.add_node("scorer_a", parallel_scorer_a)
-    graph.add_node("scorer_b", parallel_scorer_b)
-    graph.add_node("arbiter", arbiter_node)
+graph.add_edge(START, "scorer_strict")
+graph.add_edge(START, "scorer_lenient")
+graph.add_edge("scorer_strict", "arbiter")
+graph.add_edge("scorer_lenient", "arbiter")
+graph.add_edge("arbiter", END)
 
-    graph.add_edge(START, "scorer_a")
-    graph.add_edge(START, "scorer_b")
-    graph.add_edge("scorer_a", "arbiter")
-    graph.add_edge("scorer_b", "arbiter")
-    graph.add_edge("arbiter", END)
+parallel_app = graph.compile()
 
-    return graph
+result = await parallel_app.ainvoke({
+    "student_work": "Quantum computing represents a paradigm shift. Unlike classical bits, qubits exist in superposition. This enables parallel processing of multiple states. Major tech companies invest billions in quantum research.",
+    "rubric": "content depth (1-10), structure (1-10), evidence use (1-10)",
+    "analysis": "Words: 30, Paragraphs: 1, No citations found",
+    "scorer_a_result": "",
+    "scorer_b_result": "",
+    "final_result": "",
+})
+
+print("=== Parallel Scoring with Arbiter ===")
+print(f"Strict scorer: {result['scorer_a_result']}")
+print(f"Lenient scorer: {result['scorer_b_result']}")
+print(f"Final result: {result['final_result']}")
 ```
 
-Модуль содержит три builder-функции:
+Два ребра из START (`START → scorer_strict`, `START → scorer_lenient`) означают параллельный запуск. Оба scorer'а работают одновременно. Arbiter ждёт результатов обоих, затем разрешает расхождения.
 
-- `build_supervisor_graph()` — граф с supervisor-узлом, который через `Command(goto=...)` маршрутизирует к workers. Рёбра от workers ведут обратно к supervisor, создавая цикл.
-- `build_pipeline_graph()` — линейный граф `analyze → score → review`. Нет supervisor'а, фиксированный порядок.
-- `build_parallel_graph()` — два scorer'а запускаются от START параллельно (обрати внимание: два ребра из START к разным узлам). Результаты собирает arbiter.
-
-### Шаг 6. Router — `app/api/v1/multi_agent.py`
-
-Роутер предоставляет четыре эндпоинта — по одному для каждого паттерна мульти-агентного взаимодействия.
+Для динамического fan-out используй `Send`:
 
 ```python
-import json
-import time
-
-from fastapi import APIRouter, HTTPException
-
-from app.graph.multi_agent import (
-    build_supervisor_graph,
-    build_pipeline_graph,
-    build_parallel_graph,
-)
-from app.graph.agents.analyzer import run_analyzer
-from app.schemas.multi_agent import (
-    MultiAgentAssessmentRequest,
-    MultiAgentAssessmentResponse,
-    SupervisorRequest,
-    SupervisorResponse,
-    PipelineRequest,
-    PipelineResponse,
-    ParallelScoringRequest,
-    ParallelScoringResponse,
-    AnalysisResult,
-    ScoringResult,
-    ReviewResult,
-    AgentResult,
-)
-
-router = APIRouter(prefix="/multi-agent", tags=["multi-agent"])
+from langgraph.types import Send
 
 
-@router.post("/assess")
-async def multi_agent_assess(request: MultiAgentAssessmentRequest) -> MultiAgentAssessmentResponse:
-    start = time.monotonic()
-
-    if request.mode == "pipeline":
-        graph = build_pipeline_graph().compile()
-        result = await graph.ainvoke({
-            "student_work": request.student_work,
-            "rubric": request.rubric,
-            "analyzer_result": "",
-            "scorer_result": "",
-            "reviewer_result": "",
-            "agent_trace": [],
-        })
-    elif request.mode == "supervisor":
-        graph = build_supervisor_graph().compile()
-        result = await graph.ainvoke({
-            "student_work": request.student_work,
-            "rubric": request.rubric,
-            "analyzer_result": "",
-            "scorer_result": "",
-            "reviewer_result": "",
-            "agent_trace": [],
-            "iteration": 0,
-            "messages": [],
-        })
-    elif request.mode == "parallel":
-        analysis_data = await run_analyzer(request.student_work)
-        graph = build_parallel_graph().compile()
-        result = await graph.ainvoke({
-            "student_work": request.student_work,
-            "rubric": request.rubric,
-            "analysis": analysis_data["analysis"],
-            "scorer_a_result": "",
-            "scorer_b_result": "",
-            "final_result": "",
-            "agent_trace": [],
-        })
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown mode: {request.mode}")
-
-    duration_ms = (time.monotonic() - start) * 1000
-    agent_trace = [AgentResult(agent_name=t.get("agent", ""), status=t.get("status", "completed"), duration_ms=t.get("duration_ms", 0)) for t in result.get("agent_trace", [])]
-
-    analysis = None
-    if result.get("analyzer_result"):
-        analysis = AnalysisResult(structure_notes=result["analyzer_result"])
-
-    scoring = None
-    scorer_data = result.get("scorer_result", "") or result.get("final_result", "")
-    if scorer_data:
-        try:
-            parsed = json.loads(scorer_data) if isinstance(scorer_data, str) else scorer_data
-            scoring = ScoringResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            scoring = ScoringResult(scoring_notes=str(scorer_data))
-
-    review = None
-    if result.get("reviewer_result"):
-        try:
-            parsed = json.loads(result["reviewer_result"])
-            review = ReviewResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            review = ReviewResult(review_notes=str(result["reviewer_result"]))
-
-    return MultiAgentAssessmentResponse(
-        analysis=analysis,
-        scoring=scoring,
-        review=review,
-        agent_trace=agent_trace,
-        final_summary=f"Assessment completed in {request.mode} mode",
-        total_duration_ms=round(duration_ms, 1),
-    )
-
-
-@router.post("/supervisor")
-async def supervisor_assess(request: SupervisorRequest) -> SupervisorResponse:
-    graph = build_supervisor_graph().compile()
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": request.rubric,
-        "analyzer_result": "",
-        "scorer_result": "",
-        "reviewer_result": "",
-        "agent_trace": [],
-        "iteration": 0,
-        "messages": [],
-    })
-
-    trace = result.get("agent_trace", [])
-    decisions = [t for t in trace if t.get("agent") == "supervisor"]
-    agent_results = [
-        AgentResult(
-            agent_name=t.get("agent", ""),
-            status=t.get("status", "completed"),
-            duration_ms=t.get("duration_ms", 0),
-        )
-        for t in trace if t.get("agent") != "supervisor"
+def spawn_scorers(state) -> list[Send]:
+    return [
+        Send("scorer", {**state, "style": "strict"}),
+        Send("scorer", {**state, "style": "lenient"}),
     ]
 
-    final = {}
-    if result.get("scorer_result"):
-        try:
-            final = json.loads(result["scorer_result"])
-        except (json.JSONDecodeError, TypeError):
-            final = {"raw": result["scorer_result"]}
 
-    return SupervisorResponse(decisions=decisions, agent_results=agent_results, final_result=final)
-
-
-@router.post("/pipeline")
-async def pipeline_assess(request: PipelineRequest) -> PipelineResponse:
-    graph = build_pipeline_graph().compile()
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": request.rubric,
-        "analyzer_result": "",
-        "scorer_result": "",
-        "reviewer_result": "",
-        "agent_trace": [],
-    })
-
-    analysis = AnalysisResult(structure_notes=result.get("analyzer_result", ""))
-
-    scoring = ScoringResult()
-    if result.get("scorer_result"):
-        try:
-            parsed = json.loads(result["scorer_result"])
-            scoring = ScoringResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            scoring = ScoringResult(scoring_notes=str(result["scorer_result"]))
-
-    review = ReviewResult()
-    if result.get("reviewer_result"):
-        try:
-            parsed = json.loads(result["reviewer_result"])
-            review = ReviewResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            review = ReviewResult(review_notes=str(result["reviewer_result"]))
-
-    agent_trace = [
-        AgentResult(
-            agent_name=t.get("agent", ""),
-            status=t.get("status", "completed"),
-            duration_ms=t.get("duration_ms", 0),
-        )
-        for t in result.get("agent_trace", [])
-    ]
-
-    return PipelineResponse(analysis=analysis, scoring=scoring, review=review, agent_trace=agent_trace)
-
-
-@router.post("/parallel")
-async def parallel_assess(request: ParallelScoringRequest) -> ParallelScoringResponse:
-    analysis_text = request.analysis
-    if not analysis_text:
-        analysis_data = await run_analyzer(request.student_work)
-        analysis_text = analysis_data["analysis"]
-
-    graph = build_parallel_graph().compile()
-    result = await graph.ainvoke({
-        "student_work": request.student_work,
-        "rubric": request.rubric,
-        "analysis": analysis_text,
-        "scorer_a_result": "",
-        "scorer_b_result": "",
-        "final_result": "",
-        "agent_trace": [],
-    })
-
-    scorer_a = ScoringResult()
-    if result.get("scorer_a_result"):
-        try:
-            parsed = json.loads(result["scorer_a_result"])
-            scorer_a = ScoringResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            scorer_a = ScoringResult(scoring_notes=str(result["scorer_a_result"]))
-
-    scorer_b = ScoringResult()
-    if result.get("scorer_b_result"):
-        try:
-            parsed = json.loads(result["scorer_b_result"])
-            scorer_b = ScoringResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            scorer_b = ScoringResult(scoring_notes=str(result["scorer_b_result"]))
-
-    final = ScoringResult()
-    resolution_method = "average"
-    if result.get("final_result"):
-        try:
-            parsed = json.loads(result["final_result"])
-            resolution_method = parsed.pop("resolution_method", "average")
-            final = ScoringResult(**parsed)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            final = ScoringResult(scoring_notes=str(result["final_result"]))
-
-    agent_trace = [
-        AgentResult(
-            agent_name=t.get("agent", ""),
-            status=t.get("status", "completed"),
-            duration_ms=t.get("duration_ms", 0),
-        )
-        for t in result.get("agent_trace", [])
-    ]
-
-    return ParallelScoringResponse(
-        scorer_a_result=scorer_a,
-        scorer_b_result=scorer_b,
-        final_result=final,
-        resolution_method=resolution_method,
-        agent_trace=agent_trace,
-    )
+graph.add_conditional_edges("analyzer", spawn_scorers)
 ```
 
-**Четыре эндпоинта, четыре паттерна:**
-
-| Эндпоинт | Паттерн | Описание |
-|-----------|---------|----------|
-| `POST /multi-agent/assess` | Universal | Принимает `mode` (supervisor/pipeline/parallel), запускает соответствующий граф |
-| `POST /multi-agent/supervisor` | Supervisor | Supervisor-агент координирует workers, возвращает решения и трейс |
-| `POST /multi-agent/pipeline` | Sequential | Фиксированный пайплайн: analyzer → scorer → reviewer |
-| `POST /multi-agent/parallel` | Parallel + Arbiter | Два scorer'а параллельно, arbiter разрешает расхождения |
-
-### Шаг 7. Registration + Testing
-
-**Регистрация роутера.** Добавляем роутер в `app/api/router.py`:
-
-```python
-from fastapi import APIRouter
-
-from app.api.v1 import assessment, rubrics, prompts, multi_agent
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(multi_agent.router)
-```
-
-**Проверка эндпоинтов.** Запускаем сервер и тестируем:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-**Тест pipeline-эндпоинта:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/multi-agent/pipeline \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of climate change on biodiversity is a pressing concern. Rising temperatures affect ecosystems globally. Species migration patterns are shifting as habitats change. Marine ecosystems face acidification. Conservation efforts must adapt to these new realities. Research shows that 30% of species face extinction risk by 2050.",
-    "rubric": "Score on: content depth (1-10), structure (1-10), evidence use (1-10)"
-  }'
-```
-
-**Тест supervisor-эндпоинта:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/multi-agent/supervisor \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Machine learning has transformed many industries. Neural networks enable image recognition. Natural language processing powers chatbots and translation tools.",
-    "rubric": "Score on: content depth (1-10), structure (1-10), evidence use (1-10)",
-    "max_iterations": 5
-  }'
-```
-
-**Тест parallel-эндпоинта:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/multi-agent/parallel \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Quantum computing represents a paradigm shift in computation. Unlike classical bits, qubits can exist in superposition states. This enables parallel processing of multiple states simultaneously. Major tech companies are investing billions in quantum research.",
-    "rubric": "Score on: content depth (1-10), structure (1-10), evidence use (1-10)"
-  }'
-```
-
-Обрати внимание на `agent_trace` в ответах — он показывает, какие агенты были вызваны, в каком порядке и сколько времени заняли. В supervisor-ответе дополнительно есть `decisions` — решения supervisor'а о маршрутизации.
+`Send` создаёт независимые ветки выполнения с разными входными данными для одного и того же узла.
 
 ### Связь с теорией
 
-| Концепция из теории | Где реализовано |
+| Концепция из теории | Где в примерах |
 |---------------------|----------------|
-| Supervisor pattern (§3) | `build_supervisor_graph()` — supervisor_node маршрутизирует через `Command(goto=...)` |
-| Sequential pipeline (§2) | `build_pipeline_graph()` — фиксированный `analyze → score → review` |
-| Subgraphs (§4) | Каждый агент реализован как отдельный модуль со своим StateGraph |
-| Agent handoff (§5) | Workers пишут результат в state, следующий агент читает оттуда |
-| Shared state (§6) | `OrchestratorState` с полями `analyzer_result`, `scorer_result`, `reviewer_result` |
-| Message passing (§6) | Workers добавляют `AIMessage` с `name` в `messages` |
-| Parallel + arbiter (§7) | `build_parallel_graph()` — два scorer'а от START + arbiter_node |
-| Model selection (§8) | Analyzer/Reviewer → haiku (дешёвая), Supervisor/Scorer → sonnet (мощная) |
-| Observability (§8) | `agent_trace` — список AgentResult с duration_ms |
-| Error handling (§8) | try/except с fallback при парсинге JSON в router'е |
+| Supervisor pattern (§3) | Пример 2 — supervisor_node маршрутизирует через `Command(goto=...)` |
+| Sequential pipeline (§2) | Пример 3 — parent_graph: `analyzer → scorer → reviewer` |
+| Subgraphs (§4) | Пример 3 — каждый агент как отдельный `StateGraph`, вложен в parent |
+| Agent handoff (§5) | Примеры 2, 3 — workers пишут результат в state, следующий агент читает |
+| Shared state (§6) | Примеры 2, 3, 4 — общий state с именованными полями для каждого агента |
+| Message passing (§6) | Пример 2 — workers добавляют `AIMessage` с `name` в `messages` |
+| Parallel + arbiter (§7) | Пример 4 — два scorer'а от START + arbiter_node |
+| Model selection (§8) | Примеры 1, 3 — Analyzer → haiku (дешёвая), Scorer → sonnet (мощная) |
+| Input/Output schemas (§4) | Пример 3 — `AnalyzerInput`/`AnalyzerOutput` для изоляции |
 
 ---
 
@@ -1884,10 +1379,10 @@ curl -X POST http://localhost:8000/api/v1/multi-agent/parallel \
 - [ ] Зачем subgraph'у отдельные `input` и `output` schemas? Что будет без них?
 - [ ] Как работает handoff от Analyzer к Scorer через shared state? Какое поле связывает их?
 - [ ] В чём проблема shared state при параллельном выполнении агентов? Как `Annotated[list, add]` решает её?
-- [ ] Запусти `/multi-agent/pipeline` и `/multi-agent/supervisor` с одинаковой работой — сравни `agent_trace`
-- [ ] Запусти `/multi-agent/parallel` — в каком случае вызывается LLM-arbiter, а в каком берётся среднее?
+- [ ] Запусти Пример 2 (supervisor) и Пример 3 (pipeline) с одинаковым текстом — сравни порядок вызовов агентов
+- [ ] Запусти Пример 4 — в каком случае вызывается LLM-arbiter, а в каком берётся среднее?
 - [ ] Почему для Scorer используется sonnet, а для Analyzer — haiku? Когда можно сэкономить?
-- [ ] Как добавить нового агента (например, `plagiarism_checker`) в supervisor-граф? Какие файлы нужно изменить?
+- [ ] Как добавить нового агента (например, `plagiarism_checker`) в supervisor-граф? Какие изменения нужны?
 
 ---
 
@@ -1997,7 +1492,7 @@ async def analyzer_worker(state):
     return {"analyzer_result": result}
 ```
 
-Sync-вызов блокирует event loop. Если `run_analyzer_sync` содержит LLM-вызов — это может занять секунды, блокируя все остальные запросы FastAPI.
+Sync-вызов блокирует event loop. Если `run_analyzer_sync` содержит LLM-вызов — это может занять секунды, блокируя все остальные async-операции в графе.
 
 ```python
 async def analyzer_worker(state):

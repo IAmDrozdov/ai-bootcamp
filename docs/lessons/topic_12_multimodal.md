@@ -1,8 +1,7 @@
 # Тема 12: Multimodal AI — работа с изображениями
 
 > **Пререквизиты:** [Тема 1-3](topic_01_prompt_engineering.md), рекомендуется [Тема 6 (LangGraph)](topic_06_langgraph_agents.md)
-> **Что добавляем в проект:** `app/api/v1/multimodal.py`, `app/services/vision.py`, `app/schemas/multimodal.py`
-> **Зависимости:** `langchain-core`, `langchain-anthropic`, `langchain-openai`, `pillow`, `httpx`
+> **Зависимости:** `langchain-core`, `langchain-anthropic`, `langchain-openai`, `pillow`, `pymupdf`
 
 ---
 
@@ -436,7 +435,7 @@ def analyze_image(image_base64: str, analysis_prompt: str) -> str:
 5. Результат: единая структурированная оценка
 ```
 
-Архитектурно это реализуется через LangGraph-граф, где vision-анализ — отдельный узел. Но для нашего роутера достаточно прямого вызова vision LLM без полноценного агента.
+Архитектурно это реализуется через LangGraph-граф, где vision-анализ — отдельный узел. Но для простых задач достаточно прямого вызова vision LLM без полноценного агента.
 
 ### 8. Ограничения и подводные камни
 
@@ -806,7 +805,7 @@ def preprocess_for_vision(
 
 ### httpx (AsyncClient)
 
-**Описание:** Асинхронный HTTP-клиент для загрузки изображений по URL. В отличие от `requests`, httpx поддерживает `async/await` и лучше подходит для FastAPI-приложений.
+**Описание:** Асинхронный HTTP-клиент для загрузки изображений по URL. В отличие от `requests`, httpx поддерживает `async/await` и лучше подходит для асинхронных приложений.
 
 ```python
 import httpx
@@ -842,256 +841,95 @@ async def fetch_image_as_base64(url: str) -> tuple[str, str]:
 
 ---
 
-## Практика: роутер `/api/v1/multimodal`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/multimodal.py`
+### Пример 1. Отправка изображения в LLM
 
-Создаём Pydantic-модели для запросов и ответов всех эндпоинтов. Каждая схема ответа — это structured output, который vision LLM будет генерировать через `with_structured_output()`.
+Создадим тестовое изображение и отправим его в vision-модель двумя способами: через Base64 и по URL.
 
-```python
-from pydantic import BaseModel, Field
-
-
-class ImageInput(BaseModel):
-    image_base64: str | None = Field(
-        default=None,
-        description="Base64-encoded image data (without data URI prefix)",
-    )
-    image_url: str | None = Field(
-        default=None,
-        description="Public URL of the image to analyze",
-    )
-    media_type: str = Field(
-        default="image/jpeg",
-        description="MIME type of the image: image/jpeg, image/png, image/gif, image/webp",
-    )
-
-
-class ImageAnalysisRequest(ImageInput):
-    prompt: str = Field(description="What to analyze in the image")
-    detail: str = Field(
-        default="auto",
-        description="Vision detail level: auto, low, high",
-    )
-
-
-class ImageAnalysisResult(BaseModel):
-    description: str = Field(description="Detailed description of the image content")
-    key_elements: list[str] = Field(description="Key visual elements identified")
-    text_content: str | None = Field(
-        default=None,
-        description="Any text found in the image, None if no text present",
-    )
-    content_type: str = Field(
-        description="Type of content: photo, screenshot, diagram, handwriting, chart, other",
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Confidence in the analysis 0.0-1.0",
-    )
-
-
-class ImageAnalysisResponse(BaseModel):
-    analysis: ImageAnalysisResult
-    model: str
-    detail_level: str
-
-
-class HandwritingOCRRequest(ImageInput):
-    language_hint: str = Field(
-        default="auto",
-        description="Expected language: auto, en, ru, etc.",
-    )
-
-
-class HandwritingOCRResult(BaseModel):
-    recognized_text: str = Field(description="Full recognized text from the image")
-    legibility_score: int = Field(
-        ge=1, le=10,
-        description="Handwriting legibility: 1=illegible, 10=perfectly clear",
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Confidence in text recognition accuracy",
-    )
-    language: str = Field(description="Detected language of the text")
-    uncertain_fragments: list[str] = Field(
-        default_factory=list,
-        description="Fragments where recognition is uncertain, marked with [?]",
-    )
-
-
-class HandwritingOCRResponse(BaseModel):
-    ocr: HandwritingOCRResult
-    model: str
-
-
-class DiagramAnalysisRequest(ImageInput):
-    diagram_type_hint: str | None = Field(
-        default=None,
-        description="Expected diagram type: UML, ER, flowchart, etc.",
-    )
-    grading_criteria: str = Field(
-        default="correctness, completeness, clarity, notation",
-        description="Criteria to grade the diagram on",
-    )
-
-
-class DiagramElement(BaseModel):
-    name: str = Field(description="Element name or label")
-    element_type: str = Field(description="Type: class, entity, process, decision, etc.")
-
-
-class DiagramRelationship(BaseModel):
-    source: str = Field(description="Source element name")
-    target: str = Field(description="Target element name")
-    relationship_type: str = Field(
-        description="Type: association, inheritance, dependency, flow, etc.",
-    )
-    label: str | None = Field(default=None, description="Relationship label if present")
-
-
-class DiagramAnalysisResult(BaseModel):
-    diagram_type: str = Field(description="Detected diagram type: UML class, ER, flowchart, sequence, etc.")
-    elements: list[DiagramElement] = Field(description="All identified elements")
-    relationships: list[DiagramRelationship] = Field(description="All identified relationships")
-    correctness_score: int = Field(ge=0, le=100, description="Correctness of notation and semantics")
-    completeness_score: int = Field(ge=0, le=100, description="How complete the diagram is")
-    clarity_score: int = Field(ge=0, le=100, description="Visual clarity and readability")
-    overall_score: int = Field(ge=0, le=100, description="Overall diagram quality score")
-    issues: list[str] = Field(description="Found issues: incorrect notation, missing elements, etc.")
-    suggestions: list[str] = Field(description="Improvement suggestions")
-
-
-class DiagramAnalysisResponse(BaseModel):
-    analysis: DiagramAnalysisResult
-    model: str
-
-
-class MultiImageCompareRequest(BaseModel):
-    student_image: ImageInput
-    reference_image: ImageInput
-    comparison_prompt: str = Field(
-        default="Compare the student work with the reference example. "
-                "Evaluate accuracy, completeness, and quality.",
-        description="Instructions for comparison",
-    )
-
-
-class ComparisonResult(BaseModel):
-    similarity_score: int = Field(
-        ge=0, le=100,
-        description="How similar the student work is to the reference 0-100",
-    )
-    accuracy_score: int = Field(
-        ge=0, le=100,
-        description="Accuracy of the student work compared to reference",
-    )
-    completeness_score: int = Field(
-        ge=0, le=100,
-        description="How complete the student work is vs reference",
-    )
-    overall_score: int = Field(
-        ge=0, le=100,
-        description="Overall quality score",
-    )
-    matching_elements: list[str] = Field(
-        description="Elements present in both student work and reference",
-    )
-    missing_elements: list[str] = Field(
-        description="Elements in reference but missing in student work",
-    )
-    extra_elements: list[str] = Field(
-        description="Elements in student work but not in reference",
-    )
-    feedback: str = Field(description="Detailed comparison feedback, 3-5 sentences")
-    strengths: list[str] = Field(description="What the student did well")
-    improvements: list[str] = Field(description="What needs improvement")
-
-
-class MultiImageCompareResponse(BaseModel):
-    comparison: ComparisonResult
-    model: str
-```
-
-Обратите внимание: `ImageInput` — базовый класс, который принимает либо `image_base64`, либо `image_url`. Это позволяет эндпоинтам работать с обоими способами передачи изображений. Валидация (хотя бы одно из двух) выполняется в сервисе.
-
-### Шаг 2. Сервис — `app/services/vision.py`
-
-Сервисный слой инкапсулирует работу с изображениями: кодирование, загрузка, построение сообщений, вызов LLM.
+**Подготовка тестового изображения:**
 
 ```python
+from PIL import Image, ImageDraw
 import base64
 import io
 
-import httpx
+img = Image.new("RGB", (400, 200), "white")
+draw = ImageDraw.Draw(img)
+draw.text((50, 30), "Hello World!", fill="black")
+draw.text((50, 60), "Тестовое изображение", fill="gray")
+draw.text((50, 90), "Оценка: 85/100", fill="blue")
+draw.rectangle([20, 20, 380, 180], outline="black", width=2)
+
+buffer = io.BytesIO()
+img.save(buffer, format="PNG")
+test_image_bytes = buffer.getvalue()
+
+b64_data = base64.b64encode(test_image_bytes).decode("utf-8")
+print(f"Размер изображения: {len(test_image_bytes)} байт")
+print(f"Длина Base64: {len(b64_data)} символов")
+```
+
+**Base64 — отправка локального файла:**
+
+```python
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
-from PIL import Image
-from pydantic import BaseModel
+from langchain_core.messages import HumanMessage
 
-from app.config import Settings
-
-
-VISION_SYSTEM_PROMPT = (
-    "You are an expert visual analyst specializing in educational content assessment. "
-    "Analyze images carefully and provide detailed, accurate observations. "
-    "If text is present, read it carefully. If you are uncertain about any element, "
-    "indicate your uncertainty rather than guessing. "
-    "Focus on objective analysis over subjective interpretation."
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    max_tokens=4096,
+    temperature=0.0,
 )
 
-SUPPORTED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+message = HumanMessage(
+    content=[
+        {"type": "text", "text": "Опиши что изображено на картинке. Прочитай весь текст."},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64_data}"},
+        },
+    ]
+)
 
-MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
+result = llm.invoke([message])
+print(result.content)
+```
 
+**URL — публичное изображение:**
 
-def encode_image_file(file_path: str) -> tuple[str, str]:
-    with open(file_path, "rb") as f:
-        image_bytes = f.read()
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
-    image = Image.open(io.BytesIO(image_bytes))
-    fmt = (image.format or "JPEG").upper()
+llm_openai = ChatOpenAI(model="gpt-4o", max_tokens=4096, temperature=0.0)
 
-    media_type_map = {
-        "JPEG": "image/jpeg",
-        "JPG": "image/jpeg",
-        "PNG": "image/png",
-        "GIF": "image/gif",
-        "WEBP": "image/webp",
-    }
-    media_type = media_type_map.get(fmt, "image/jpeg")
+message = HumanMessage(
+    content=[
+        {"type": "text", "text": "Опиши что изображено на этой картинке."},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg",
+            },
+        },
+    ]
+)
 
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-    return encoded, media_type
+result = llm_openai.invoke([message])
+print(result.content)
+```
 
+Один и тот же формат `image_url` работает и с `ChatAnthropic`, и с `ChatOpenAI` — LangChain автоматически конвертирует в нативный формат провайдера.
 
-async def fetch_image(url: str) -> tuple[str, str]:
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        follow_redirects=True,
-        limits=httpx.Limits(max_connections=10),
-    ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+**Preprocessing перед отправкой:**
 
-        content_type = response.headers.get("content-type", "image/jpeg")
-        media_type = content_type.split(";")[0].strip()
+```python
+from PIL import Image
+import io
+import base64
 
-        if media_type not in SUPPORTED_MEDIA_TYPES:
-            raise ValueError(f"Unsupported media type: {media_type}")
-
-        if len(response.content) > MAX_IMAGE_SIZE_BYTES:
-            raise ValueError(
-                f"Image too large: {len(response.content)} bytes "
-                f"(max {MAX_IMAGE_SIZE_BYTES})"
-            )
-
-        encoded = base64.b64encode(response.content).decode("utf-8")
-        return encoded, media_type
-
-
-def preprocess_image(
+def preprocess_for_vision(
     image_bytes: bytes,
     max_dimension: int = 1536,
     quality: int = 85,
@@ -1101,7 +939,7 @@ def preprocess_image(
     if max(image.size) > max_dimension:
         image.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
 
-    if image.mode in ("RGBA", "P", "LA"):
+    if image.mode in ("RGBA", "P"):
         background = Image.new("RGB", image.size, (255, 255, 255))
         if image.mode == "P":
             image = image.convert("RGBA")
@@ -1115,417 +953,427 @@ def preprocess_image(
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return encoded, "image/jpeg"
 
+with open("large_photo.jpg", "rb") as f:
+    raw_bytes = f.read()
 
-def build_vision_message(
-    text: str,
-    images: list[tuple[str, str]],
-    detail: str = "auto",
-) -> HumanMessage:
-    content: list[dict] = [{"type": "text", "text": text}]
+b64_optimized, media_type = preprocess_for_vision(raw_bytes)
+print(f"Оригинал: {len(raw_bytes)} байт")
+print(f"После preprocessing: ~{len(b64_optimized) * 3 // 4} байт")
+print(f"Media type: {media_type}")
+```
 
-    for image_b64, media_type in images:
-        data_uri = f"data:{media_type};base64,{image_b64}"
-        block: dict = {
+**Управление detail level:**
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+
+message_low = HumanMessage(
+    content=[
+        {"type": "text", "text": "Что это — фото, скриншот или диаграмма?"},
+        {
             "type": "image_url",
-            "image_url": {"url": data_uri},
-        }
-        if detail != "auto":
-            block["image_url"]["detail"] = detail
-        content.append(block)
-
-    return HumanMessage(content=content)
-
-
-async def resolve_image(
-    image_base64: str | None,
-    image_url: str | None,
-    media_type: str = "image/jpeg",
-) -> tuple[str, str]:
-    if image_base64:
-        return image_base64, media_type
-    if image_url:
-        return await fetch_image(image_url)
-    raise ValueError("Either image_base64 or image_url must be provided")
-
-
-async def analyze_image(
-    llm: ChatAnthropic,
-    images: list[tuple[str, str]],
-    prompt: str,
-    response_model: type[BaseModel],
-    detail: str = "auto",
-    system_prompt: str = VISION_SYSTEM_PROMPT,
-) -> BaseModel:
-    structured_llm = llm.with_structured_output(response_model)
-    human_message = build_vision_message(prompt, images, detail=detail)
-    messages = [SystemMessage(content=system_prompt), human_message]
-    return await structured_llm.ainvoke(messages)
-```
-
-Разберём ключевые функции:
-
-- `encode_image_file` — читает файл с диска, определяет формат через Pillow, кодирует в base64. Возвращает кортеж `(base64_data, media_type)`.
-- `fetch_image` — асинхронно загружает изображение по URL через httpx. Проверяет media type и размер. Возвращает тот же кортеж.
-- `preprocess_image` — уменьшает изображение до `max_dimension`, конвертирует RGBA→RGB (для JPEG), сжимает с заданным quality. Уменьшает размер в 4-16 раз.
-- `build_vision_message` — собирает `HumanMessage` из текста и списка изображений. Формирует data URI для каждого изображения. Поддерживает `detail` параметр.
-- `resolve_image` — единая точка входа: принимает либо base64, либо URL, возвращает base64. Используется в роутере для унификации.
-- `analyze_image` — центральная функция: принимает LLM, изображения, промпт и Pydantic-модель ответа. Оборачивает LLM в `with_structured_output()`, собирает messages, вызывает `ainvoke`. Возвращает типизированный результат.
-
-### Шаг 3. Router — `app/api/v1/multimodal.py`
-
-Роутер с 4 эндпоинтами. Каждый эндпоинт демонстрирует отдельный аспект vision API.
-
-```python
-from fastapi import APIRouter, HTTPException
-
-from app.dependencies import LLMDep, SettingsDep
-from app.schemas.multimodal import (
-    ComparisonResult,
-    DiagramAnalysisRequest,
-    DiagramAnalysisResponse,
-    DiagramAnalysisResult,
-    HandwritingOCRRequest,
-    HandwritingOCRResponse,
-    HandwritingOCRResult,
-    ImageAnalysisRequest,
-    ImageAnalysisResponse,
-    ImageAnalysisResult,
-    MultiImageCompareRequest,
-    MultiImageCompareResponse,
+            "image_url": {
+                "url": f"data:image/png;base64,{b64_data}",
+                "detail": "low",
+            },
+        },
+    ]
 )
-from app.services.vision import analyze_image, resolve_image
 
-router = APIRouter(prefix="/multimodal", tags=["lesson-12-multimodal"])
+message_high = HumanMessage(
+    content=[
+        {"type": "text", "text": "Прочитай весь текст на изображении дословно."},
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{b64_data}",
+                "detail": "high",
+            },
+        },
+    ]
+)
 
+result_low = llm.invoke([message_low])
+print("=== detail=low (85 токенов) ===")
+print(result_low.content)
 
-@router.post("/analyze")
-async def analyze(
-    request: ImageAnalysisRequest,
-    llm: LLMDep,
-    settings: SettingsDep,
-) -> ImageAnalysisResponse:
-    try:
-        image_b64, media_type = await resolve_image(
-            request.image_base64, request.image_url, request.media_type,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    prompt = (
-        f"{request.prompt}\n\n"
-        "Provide a detailed analysis of the image. Identify all key visual elements. "
-        "If there is text in the image, read and include it. "
-        "Determine the content type (photo, screenshot, diagram, handwriting, chart, other)."
-    )
-
-    try:
-        result = await analyze_image(
-            llm=llm,
-            images=[(image_b64, media_type)],
-            prompt=prompt,
-            response_model=ImageAnalysisResult,
-            detail=request.detail,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Vision analysis failed: {e}")
-
-    return ImageAnalysisResponse(
-        analysis=result,
-        model=settings.model_name,
-        detail_level=request.detail,
-    )
-
-
-@router.post("/ocr")
-async def ocr_handwriting(
-    request: HandwritingOCRRequest,
-    llm: LLMDep,
-    settings: SettingsDep,
-) -> HandwritingOCRResponse:
-    try:
-        image_b64, media_type = await resolve_image(
-            request.image_base64, request.image_url, request.media_type,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    language_instruction = ""
-    if request.language_hint != "auto":
-        language_instruction = f"The text is expected to be in {request.language_hint}. "
-
-    prompt = (
-        "You are analyzing a handwritten document. "
-        f"{language_instruction}"
-        "Read ALL text from this handwritten image carefully. "
-        "Transcribe exactly what is written, preserving paragraph breaks. "
-        "If a word or fragment is illegible, write it as [неразборчиво] or [illegible]. "
-        "Rate the overall legibility of the handwriting from 1 (completely illegible) "
-        "to 10 (perfectly clear print-like writing). "
-        "List any fragments where you are uncertain about the reading."
-    )
-
-    try:
-        result = await analyze_image(
-            llm=llm,
-            images=[(image_b64, media_type)],
-            prompt=prompt,
-            response_model=HandwritingOCRResult,
-            detail="high",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OCR analysis failed: {e}")
-
-    return HandwritingOCRResponse(ocr=result, model=settings.model_name)
-
-
-@router.post("/diagram")
-async def analyze_diagram(
-    request: DiagramAnalysisRequest,
-    llm: LLMDep,
-    settings: SettingsDep,
-) -> DiagramAnalysisResponse:
-    try:
-        image_b64, media_type = await resolve_image(
-            request.image_base64, request.image_url, request.media_type,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    type_hint = ""
-    if request.diagram_type_hint:
-        type_hint = f"This is expected to be a {request.diagram_type_hint} diagram. "
-
-    prompt = (
-        f"Analyze this technical diagram in detail. {type_hint}"
-        "1. Determine the diagram type (UML class, ER, flowchart, sequence, etc.) "
-        "2. Identify ALL elements (classes, entities, processes, decisions, etc.) "
-        "3. Identify ALL relationships between elements "
-        "4. Check for correctness of notation and semantics "
-        "5. Evaluate completeness — are expected elements missing? "
-        "6. Evaluate visual clarity and readability "
-        f"Grading criteria: {request.grading_criteria}"
-    )
-
-    try:
-        result = await analyze_image(
-            llm=llm,
-            images=[(image_b64, media_type)],
-            prompt=prompt,
-            response_model=DiagramAnalysisResult,
-            detail="high",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Diagram analysis failed: {e}")
-
-    return DiagramAnalysisResponse(analysis=result, model=settings.model_name)
-
-
-@router.post("/compare")
-async def compare_with_reference(
-    request: MultiImageCompareRequest,
-    llm: LLMDep,
-    settings: SettingsDep,
-) -> MultiImageCompareResponse:
-    try:
-        student_b64, student_media = await resolve_image(
-            request.student_image.image_base64,
-            request.student_image.image_url,
-            request.student_image.media_type,
-        )
-        reference_b64, reference_media = await resolve_image(
-            request.reference_image.image_base64,
-            request.reference_image.image_url,
-            request.reference_image.media_type,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    prompt = (
-        "You are comparing two images. "
-        "IMAGE 1 is the student's work. IMAGE 2 is the reference/example. "
-        f"{request.comparison_prompt}\n\n"
-        "Identify elements that match between both, elements missing from the "
-        "student work, and extra elements the student added. "
-        "Score similarity, accuracy, completeness, and overall quality (0-100 each). "
-        "Provide specific, constructive feedback."
-    )
-
-    try:
-        result = await analyze_image(
-            llm=llm,
-            images=[
-                (student_b64, student_media),
-                (reference_b64, reference_media),
-            ],
-            prompt=prompt,
-            response_model=ComparisonResult,
-            detail="high",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Comparison failed: {e}")
-
-    return MultiImageCompareResponse(comparison=result, model=settings.model_name)
+result_high = llm.invoke([message_high])
+print("\n=== detail=high (765+ токенов) ===")
+print(result_high.content)
 ```
 
-Как каждый эндпоинт связан с теорией:
+`detail: low` — 85 токенов, достаточно для классификации. `detail: high` — 765-1745 токенов, нужен для чтения мелкого текста и деталей диаграмм.
 
-| Эндпоинт | Концепция из теории | Что демонстрирует |
-|---|---|---|
-| `POST /analyze` | §2, §3, §6 | Базовый vision: текст + изображение → structured analysis. Поддержка detail level. |
-| `POST /ocr` | §4, §8 | Vision + structured output для OCR. `detail: high` обязателен. Ограничения распознавания. |
-| `POST /diagram` | §4, §6 | Сложная Pydantic-схема с elements/relationships. Промпт-инжиниринг для vision. |
-| `POST /compare` | §5 | Multi-image input: два изображения в одном запросе. Порядок важен. |
+---
 
-### Шаг 4. Регистрация в `app/api/router.py`
+### Пример 2. Vision + Structured Output
 
-Добавляем импорт и подключение нового роутера:
+Комбинация vision + `with_structured_output()`: модель анализирует изображение и возвращает типизированный результат.
+
+**Анализ изображения со структурированным ответом:**
 
 ```python
-from fastapi import APIRouter
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.api.v1 import assessment, rubrics, prompts, multimodal
+class ImageAnalysis(BaseModel):
+    description: str = Field(description="Подробное описание содержания изображения")
+    key_elements: list[str] = Field(description="Ключевые визуальные элементы")
+    text_content: str | None = Field(
+        default=None,
+        description="Текст на изображении, None если текста нет",
+    )
+    content_type: str = Field(
+        description="Тип: photo, screenshot, diagram, handwriting, chart, other",
+    )
+    confidence: float = Field(ge=0.0, le=1.0, description="Уверенность в анализе")
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(multimodal.router)
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+structured_llm = llm.with_structured_output(ImageAnalysis)
+
+messages = [
+    SystemMessage(content="Ты — эксперт по анализу изображений. Анализируй внимательно и точно."),
+    HumanMessage(
+        content=[
+            {
+                "type": "text",
+                "text": "Проанализируй изображение. Определи тип контента, "
+                        "опиши ключевые элементы, прочитай текст если есть.",
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{b64_data}",
+                    "detail": "high",
+                },
+            },
+        ]
+    ),
+]
+
+result = structured_llm.invoke(messages)
+print(f"Тип контента: {result.content_type}")
+print(f"Описание: {result.description}")
+print(f"Элементы: {result.key_elements}")
+print(f"Текст: {result.text_content}")
+print(f"Уверенность: {result.confidence}")
 ```
 
-### Шаг 5. Тестирование с curl
+**OCR рукописного текста:**
 
-Для тестирования vision-эндпоинтов нужно реальное изображение в base64. Создадим минимальное тестовое изображение — белый квадрат с текстом «Hello World» через Python:
+```python
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+import base64
 
-```bash
-python3 -c "
-from PIL import Image, ImageDraw, ImageFont
-import base64, io, json
+class HandwritingOCR(BaseModel):
+    recognized_text: str = Field(
+        description="Распознанный текст, [неразборчиво] для нечитаемых частей",
+    )
+    legibility_score: int = Field(
+        ge=1, le=10,
+        description="Разборчивость: 1=нечитаемо, 10=идеально",
+    )
+    language: str = Field(description="Язык текста")
+    uncertain_fragments: list[str] = Field(
+        default_factory=list,
+        description="Фрагменты с неуверенным распознаванием",
+    )
+    confidence: float = Field(ge=0.0, le=1.0, description="Уверенность в распознавании")
 
-img = Image.new('RGB', (400, 200), 'white')
-draw = ImageDraw.Draw(img)
-draw.text((50, 30), 'Hello World!', fill='black')
-draw.text((50, 60), 'This is a test image', fill='gray')
-draw.text((50, 90), 'Score: 85/100', fill='blue')
-draw.rectangle([20, 20, 380, 180], outline='black', width=2)
+with open("handwriting.jpg", "rb") as f:
+    hw_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-buf = io.BytesIO()
-img.save(buf, format='PNG')
-b64 = base64.b64encode(buf.getvalue()).decode()
-print(b64)
-" > /tmp/test_image_b64.txt
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+structured_llm = llm.with_structured_output(HandwritingOCR)
+
+message = HumanMessage(
+    content=[
+        {
+            "type": "text",
+            "text": "Прочитай рукописный текст на изображении. "
+                    "Если слово неразборчиво — напиши [неразборчиво]. "
+                    "Оцени разборчивость почерка от 1 до 10.",
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{hw_b64}",
+                "detail": "high",
+            },
+        },
+    ]
+)
+
+result = structured_llm.invoke([message])
+print(f"Текст: {result.recognized_text}")
+print(f"Разборчивость: {result.legibility_score}/10")
+print(f"Язык: {result.language}")
+print(f"Уверенность: {result.confidence}")
+if result.uncertain_fragments:
+    print(f"Неуверенные фрагменты: {result.uncertain_fragments}")
 ```
 
-Сохраняем base64 в переменную:
+**Анализ диаграммы:**
 
-```bash
-TEST_IMAGE=$(cat /tmp/test_image_b64.txt)
+```python
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+import base64
+
+class DiagramElement(BaseModel):
+    name: str = Field(description="Имя элемента")
+    element_type: str = Field(description="Тип: class, entity, process, decision и т.д.")
+
+class DiagramRelationship(BaseModel):
+    source: str = Field(description="Исходный элемент")
+    target: str = Field(description="Целевой элемент")
+    relationship_type: str = Field(
+        description="Тип: association, inheritance, dependency, flow",
+    )
+    label: str | None = Field(default=None, description="Подпись связи")
+
+class DiagramAnalysis(BaseModel):
+    diagram_type: str = Field(
+        description="Тип диаграммы: UML class, ER, flowchart, sequence и т.д.",
+    )
+    elements: list[DiagramElement] = Field(description="Все найденные элементы")
+    relationships: list[DiagramRelationship] = Field(description="Все найденные связи")
+    correctness_score: int = Field(ge=0, le=100, description="Корректность нотации")
+    completeness_score: int = Field(ge=0, le=100, description="Полнота диаграммы")
+    issues: list[str] = Field(description="Найденные проблемы")
+    suggestions: list[str] = Field(description="Предложения по улучшению")
+
+
+with open("diagram.png", "rb") as f:
+    diagram_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+structured_llm = llm.with_structured_output(DiagramAnalysis)
+
+message = HumanMessage(
+    content=[
+        {
+            "type": "text",
+            "text": "Проанализируй эту техническую диаграмму. "
+                    "Определи тип, все элементы, связи между ними. "
+                    "Проверь корректность нотации. Оцени полноту.",
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{diagram_b64}",
+                "detail": "high",
+            },
+        },
+    ]
+)
+
+result = structured_llm.invoke([message])
+print(f"Тип диаграммы: {result.diagram_type}")
+print(f"Корректность: {result.correctness_score}/100")
+print(f"Полнота: {result.completeness_score}/100")
+print(f"\nЭлементы ({len(result.elements)}):")
+for el in result.elements:
+    print(f"  - {el.name} ({el.element_type})")
+print(f"\nСвязи ({len(result.relationships)}):")
+for rel in result.relationships:
+    label = f" [{rel.label}]" if rel.label else ""
+    print(f"  - {rel.source} → {rel.target} ({rel.relationship_type}){label}")
+if result.issues:
+    print(f"\nПроблемы:")
+    for issue in result.issues:
+        print(f"  - {issue}")
 ```
 
-**POST /multimodal/analyze** — базовый анализ изображения:
+---
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/multimodal/analyze \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"image_base64\": \"$TEST_IMAGE\",
-    \"media_type\": \"image/png\",
-    \"prompt\": \"Describe what you see in this image. Read any text.\",
-    \"detail\": \"high\"
-  }" | python -m json.tool
+### Пример 3. Multi-image input
+
+Отправка нескольких изображений в одном запросе — для сравнения, анализа многостраничных документов.
+
+**Сравнение работы студента с эталоном:**
+
+```python
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+import base64
+
+class ComparisonResult(BaseModel):
+    similarity_score: int = Field(ge=0, le=100, description="Сходство с эталоном 0-100")
+    matching_elements: list[str] = Field(
+        description="Элементы, присутствующие в обеих работах",
+    )
+    missing_elements: list[str] = Field(
+        description="Элементы эталона, отсутствующие в работе студента",
+    )
+    extra_elements: list[str] = Field(
+        description="Элементы студента, отсутствующие в эталоне",
+    )
+    overall_score: int = Field(ge=0, le=100, description="Общая оценка")
+    feedback: str = Field(description="Развёрнутая обратная связь, 3-5 предложений")
+
+
+with open("student_work.png", "rb") as f:
+    student_b64 = base64.b64encode(f.read()).decode("utf-8")
+with open("reference.png", "rb") as f:
+    reference_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+structured_llm = llm.with_structured_output(ComparisonResult)
+
+message = HumanMessage(
+    content=[
+        {
+            "type": "text",
+            "text": "Сравни две работы. ПЕРВОЕ изображение — работа студента. "
+                    "ВТОРОЕ изображение — эталон. "
+                    "Определи, какие элементы совпадают, чего не хватает, что лишнее.",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{student_b64}"},
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{reference_b64}"},
+        },
+    ]
+)
+
+result = structured_llm.invoke([message])
+print(f"Сходство: {result.similarity_score}/100")
+print(f"Общая оценка: {result.overall_score}/100")
+print(f"Совпадающие элементы: {result.matching_elements}")
+print(f"Отсутствующие элементы: {result.missing_elements}")
+print(f"Лишние элементы: {result.extra_elements}")
+print(f"\nОбратная связь: {result.feedback}")
 ```
 
-Ожидаемый результат: `content_type: "screenshot"` или `"other"`, `text_content` содержит «Hello World!» и «Score: 85/100», `key_elements` включает текст и рамку.
+Порядок изображений в `content` имеет значение — модель обрабатывает блоки последовательно. Если промпт говорит «первое — студент, второе — эталон», расположение должно соответствовать.
 
-**POST /multimodal/ocr** — распознавание текста:
+**Многостраничный документ:**
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/multimodal/ocr \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"image_base64\": \"$TEST_IMAGE\",
-    \"media_type\": \"image/png\",
-    \"language_hint\": \"en\"
-  }" | python -m json.tool
-```
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+import base64
 
-Ожидаемый результат: `recognized_text` содержит весь текст с изображения, `legibility_score` высокий (8-10 для печатного текста), `language: "en"`.
+pages_b64 = []
+for i in range(1, 4):
+    with open(f"page_{i}.jpg", "rb") as f:
+        pages_b64.append(base64.b64encode(f.read()).decode("utf-8"))
 
-**POST /multimodal/diagram** — анализ диаграммы:
-
-Для этого теста создадим простую диаграмму:
-
-```bash
-python3 -c "
-from PIL import Image, ImageDraw
-import base64, io
-
-img = Image.new('RGB', (500, 300), 'white')
-draw = ImageDraw.Draw(img)
-
-draw.rectangle([50, 50, 200, 120], outline='black', width=2)
-draw.text((80, 75), 'User', fill='black')
-
-draw.rectangle([300, 50, 450, 120], outline='black', width=2)
-draw.text((330, 75), 'Order', fill='black')
-
-draw.line([200, 85, 300, 85], fill='black', width=2)
-draw.text((220, 65), '1..*', fill='red')
-
-draw.rectangle([300, 180, 450, 250], outline='black', width=2)
-draw.text((320, 205), 'Product', fill='black')
-
-draw.line([375, 120, 375, 180], fill='black', width=2)
-draw.text((385, 140), '*..1', fill='red')
-
-buf = io.BytesIO()
-img.save(buf, format='PNG')
-print(base64.b64encode(buf.getvalue()).decode())
-" > /tmp/test_diagram_b64.txt
-```
-
-```bash
-DIAGRAM_IMAGE=$(cat /tmp/test_diagram_b64.txt)
-
-curl -s -X POST http://localhost:8000/api/v1/multimodal/diagram \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"image_base64\": \"$DIAGRAM_IMAGE\",
-    \"media_type\": \"image/png\",
-    \"diagram_type_hint\": \"ER\",
-    \"grading_criteria\": \"correctness, completeness, notation\"
-  }" | python -m json.tool
-```
-
-Ожидаемый результат: `diagram_type: "ER"`, `elements` содержит User, Order, Product, `relationships` описывает связи, `overall_score` — оценка качества диаграммы.
-
-**POST /multimodal/compare** — сравнение двух изображений:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/multimodal/compare \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"student_image\": {
-      \"image_base64\": \"$TEST_IMAGE\",
-      \"media_type\": \"image/png\"
+content_blocks: list[dict] = [
+    {
+        "type": "text",
+        "text": "Перед тобой 3 страницы рукописной работы. "
+                "Проанализируй все страницы как единый документ.",
     },
-    \"reference_image\": {
-      \"image_base64\": \"$DIAGRAM_IMAGE\",
-      \"media_type\": \"image/png\"
-    },
-    \"comparison_prompt\": \"Compare these two images. The first is the student submission, the second is the reference.\"
-  }" | python -m json.tool
+]
+for i, page_b64 in enumerate(pages_b64, 1):
+    content_blocks.append({"type": "text", "text": f"--- Страница {i} ---"})
+    content_blocks.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{page_b64}"},
+    })
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=4096, temperature=0.0)
+result = llm.invoke([HumanMessage(content=content_blocks)])
+print(result.content)
 ```
 
-Ожидаемый результат: низкий `similarity_score` (изображения разные), `missing_elements` и `extra_elements` перечисляют различия.
+---
+
+### Пример 4. Анализ PDF-документа
+
+PDF-страницы конвертируются в изображения через `pymupdf` и отправляются в vision-модель.
+
+```python
+import fitz
+import base64
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
+
+class PDFPageSummary(BaseModel):
+    page_number: int = Field(description="Номер страницы")
+    content_type: str = Field(description="Тип контента: text, table, diagram, mixed")
+    summary: str = Field(description="Краткое содержание страницы")
+    key_points: list[str] = Field(description="Ключевые тезисы")
+
+class PDFAnalysis(BaseModel):
+    total_pages: int = Field(description="Количество проанализированных страниц")
+    pages: list[PDFPageSummary] = Field(description="Анализ каждой страницы")
+    overall_summary: str = Field(description="Общее резюме документа")
+    document_type: str = Field(
+        description="Тип документа: article, report, presentation, form, other",
+    )
+
+def pdf_pages_to_base64(
+    pdf_path: str,
+    max_pages: int = 5,
+    dpi: int = 150,
+) -> list[str]:
+    doc = fitz.open(pdf_path)
+    pages_b64 = []
+    for page_num in range(min(len(doc), max_pages)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=dpi)
+        img_bytes = pix.tobytes("png")
+        pages_b64.append(base64.b64encode(img_bytes).decode("utf-8"))
+    doc.close()
+    return pages_b64
+
+
+pages = pdf_pages_to_base64("document.pdf", max_pages=5)
+print(f"Сконвертировано страниц: {len(pages)}")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=8192, temperature=0.0)
+structured_llm = llm.with_structured_output(PDFAnalysis)
+
+content_blocks: list[dict] = [
+    {
+        "type": "text",
+        "text": f"Проанализируй PDF-документ ({len(pages)} страниц). "
+                "Определи тип документа, кратко опиши содержание каждой страницы, "
+                "выдели ключевые тезисы и подготовь общее резюме.",
+    },
+]
+for i, page_b64 in enumerate(pages, 1):
+    content_blocks.append({"type": "text", "text": f"--- Страница {i} ---"})
+    content_blocks.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{page_b64}"},
+    })
+
+result = structured_llm.invoke([HumanMessage(content=content_blocks)])
+print(f"Тип документа: {result.document_type}")
+print(f"Общее резюме: {result.overall_summary}")
+for page in result.pages:
+    print(f"\nСтраница {page.page_number} ({page.content_type}):")
+    print(f"  {page.summary}")
+    for point in page.key_points:
+        print(f"  • {point}")
+```
+
+При 5 страницах с `detail: auto` — примерно 4000-8000 input-токенов на изображения. Ограничивайте количество страниц и используйте `dpi=150` (а не 300) для баланса качества и стоимости.
 
 ### Связь с теорией
 
-| Эндпоинт | Разделы теории | Ключевые концепции |
+| Пример | Разделы теории | Ключевые концепции |
 |---|---|---|
-| `POST /analyze` | §1, §2, §3, §6 | HumanMessage с content-списком, Base64 кодирование, detail level |
-| `POST /ocr` | §2, §4, §8 | Vision + structured output, промпт-инжиниринг для OCR, ограничения |
-| `POST /diagram` | §4, §6, §7 | Сложная Pydantic-схема, high detail для мелких деталей, vision chain |
-| `POST /compare` | §3, §5, §7 | Multi-image input, порядок изображений, сравнительный анализ |
+| Пример 1 (изображение в LLM) | §1, §2, §3, §6 | HumanMessage с content-списком, Base64 и URL, detail level, preprocessing |
+| Пример 2 (structured output) | §4, §7, §8 | Vision + with_structured_output(), промпт-инжиниринг для vision, ограничения |
+| Пример 3 (multi-image) | §5 | Multi-image input, порядок изображений, сравнительный анализ |
+| Пример 4 (PDF-анализ) | §2, §4, §5 | Конвертация PDF в изображения, multi-page analysis, structured output |
 
 ---
 
@@ -1535,8 +1383,8 @@ curl -s -X POST http://localhost:8000/api/v1/multimodal/compare \
 - [ ] Почему LangChain использует формат `image_url` с data URI, а не нативный формат Anthropic? Что это даёт?
 - [ ] Когда лучше передать изображение по URL, а когда через Base64? Назови по 2 сценария для каждого.
 - [ ] Как `detail: low` vs `detail: high` влияет на стоимость и качество? Приведи конкретные числа по токенам.
-- [ ] Почему OCR-эндпоинт использует `detail: "high"` принудительно, а analyze-эндпоинт — `detail` из запроса?
-- [ ] Что происходит, если отправить RGBA-изображение в JPEG? Зачем нужна конвертация в `preprocess_image`?
+- [ ] Почему для OCR рукописного текста рекомендуется `detail: "high"`, а для классификации типа контента достаточно `detail: "low"`?
+- [ ] Что происходит, если отправить RGBA-изображение в JPEG? Зачем нужна конвертация перед отправкой в vision API?
 - [ ] Как работает multi-image input? Почему порядок изображений в `content` имеет значение?
 - [ ] Назови 3 задачи, где vision LLM работает хорошо, и 3, где лучше использовать OCR + text LLM.
 - [ ] Почему `with_structured_output()` работает с vision без изменений? Что общего у vision и текстовых запросов на уровне API?
@@ -1566,10 +1414,20 @@ with open("photo_4096x4096.jpg", "rb") as f:
 ```
 
 ```python
-from app.services.vision import preprocess_image
+from PIL import Image
+import io
+import base64
 
 with open("photo_4096x4096.jpg", "rb") as f:
-    optimized_b64, media_type = preprocess_image(f.read(), max_dimension=1536)
+    image = Image.open(io.BytesIO(f.read()))
+
+image.thumbnail((1536, 1536), Image.LANCZOS)
+if image.mode != "RGB":
+    image = image.convert("RGB")
+
+buffer = io.BytesIO()
+image.save(buffer, format="JPEG", quality=85)
+optimized_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 ```
 
 Изображение 4096×4096 JPEG может весить 5-15 MB. После base64 это 7-20 MB в JSON-запросе. Это увеличивает latency на 2-5 секунд только на передачу данных. Resize до 1536px сохраняет качество для vision-анализа и уменьшает размер в 5-10 раз.
@@ -1577,23 +1435,29 @@ with open("photo_4096x4096.jpg", "rb") as f:
 ### 3. detail: "high" для задач, где достаточно "low"
 
 ```python
-result = await analyze_image(
-    llm=llm,
-    images=[(b64, media_type)],
-    prompt="Is this a photo or a diagram?",
-    response_model=ContentType,
-    detail="high",
+message = HumanMessage(
+    content=[
+        {"type": "text", "text": "Is this a photo or a diagram?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"},
+        },
+    ]
 )
+result = structured_llm.invoke([message])
 ```
 
 ```python
-result = await analyze_image(
-    llm=llm,
-    images=[(b64, media_type)],
-    prompt="Is this a photo or a diagram?",
-    response_model=ContentType,
-    detail="low",
+message = HumanMessage(
+    content=[
+        {"type": "text", "text": "Is this a photo or a diagram?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
+        },
+    ]
 )
+result = structured_llm.invoke([message])
 ```
 
 Для классификации типа контента `detail: low` (85 токенов) достаточно. `detail: high` (765+ токенов) — пустая трата бюджета. Используйте `high` только когда нужны мелкие детали: распознавание текста, анализ элементов диаграмм, чтение чисел.
@@ -1640,14 +1504,22 @@ prompt = prompts.get(content_type, "Describe what you see in detail")
 ### 6. Не учитывать стоимость: vision tokens значительно дороже текстовых
 
 ```python
-for page in all_200_pages:
-    result = await analyze_image(llm, [(page, "image/jpeg")], "OCR", Model, detail="high")
+for page_b64 in all_200_pages:
+    message = HumanMessage(content=[
+        {"type": "text", "text": "Распознай текст"},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{page_b64}", "detail": "high"}},
+    ])
+    result = structured_llm.invoke([message])
 ```
 
 ```python
 pages_to_analyze = all_200_pages[:20]
-for page in pages_to_analyze:
-    result = await analyze_image(llm, [(page, "image/jpeg")], "OCR", Model, detail="high")
+for page_b64 in pages_to_analyze:
+    message = HumanMessage(content=[
+        {"type": "text", "text": "Распознай текст"},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{page_b64}", "detail": "high"}},
+    ])
+    result = structured_llm.invoke([message])
 ```
 
 200 изображений × ~1000 токенов (high detail) = 200,000 input tokens только на изображения. При $3/M — $0.60 за один запрос. Плюс output tokens. Ограничивайте количество изображений, используйте `detail: low` где возможно, и помните о лимите Anthropic (20 изображений на запрос).
@@ -1661,6 +1533,7 @@ for page in pages_to_analyze:
 - [LangChain Multimodal Messages](https://python.langchain.com/docs/concepts/messages/#humanmessage) — формат мультимодальных сообщений
 - [Pillow Documentation](https://pillow.readthedocs.io/en/stable/) — обработка изображений в Python
 - [httpx Documentation](https://www.python-httpx.org/) — асинхронный HTTP-клиент
+- [PyMuPDF Documentation](https://pymupdf.readthedocs.io/) — работа с PDF-документами
 - [Base64 Encoding](https://docs.python.org/3/library/base64.html) — стандартная библиотека Python
 
 **Следующая тема:** [Тема 13: Advanced Agentic Patterns](topic_13_agentic_patterns.md)

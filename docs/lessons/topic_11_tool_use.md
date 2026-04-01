@@ -1,7 +1,6 @@
 # Тема 11: Tool Use / Function Calling — глубокое погружение
 
 > **Пререквизиты:** [Тема 6: LangGraph + Agents](topic_06_langgraph_agents.md)
-> **Что добавляем в проект:** `app/api/v1/tools.py`, `app/tools/assessment_tools.py`, `app/tools/validation_tools.py`, `app/schemas/tools.py`
 > **Зависимости:** `langchain-core`, `langchain-anthropic`, `langgraph`, `pydantic`, `httpx`
 
 ---
@@ -553,7 +552,7 @@ Fallback можно реализовать как отдельный tool (мо�
 
 ### 6. Async tools
 
-В FastAPI-приложении все I/O-операции должны быть асинхронными. Синхронный HTTP-вызов внутри tool блокирует event loop, что снижает пропускную способность сервера.
+В асинхронном приложении все I/O-операции должны быть асинхронными. Синхронный HTTP-вызов внутри tool блокирует event loop, что снижает пропускную способность.
 
 **Создание async tool с `@tool`:**
 
@@ -632,7 +631,7 @@ llm_with_tools = llm.bind_tools(tools)
 
 При вызове через `ainvoke` sync-tool оборачивается в `run_in_executor`, а async-tool вызывается напрямую. Это безопасно, но sync-tool всё равно блокирует поток из thread pool.
 
-Рекомендация: в FastAPI-приложении делай все tools, которые выполняют I/O (HTTP, DB, файлы), асинхронными. Sync оставляй только для чистых вычислений (подсчёт слов, regex, математика).
+Рекомендация: делай все tools, которые выполняют I/O (HTTP, DB, файлы), асинхронными. Sync оставляй только для чистых вычислений (подсчёт слов, regex, математика).
 
 ### 7. Dynamic tool selection
 
@@ -1145,541 +1144,455 @@ def divide(a: float, b: float) -> dict:
 
 ---
 
-## Практика: роутер `/api/v1/tools`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/tools.py`
-
-```python
-from pydantic import BaseModel, Field
-
-
-class ToolDemoRequest(BaseModel):
-    text: str = Field(description="Student work text to analyze with tools")
-    task_type: str = Field(
-        default="essay",
-        description="Type of work: essay, code, or general",
-    )
-
-
-class ToolCallInfo(BaseModel):
-    tool_name: str
-    tool_args: dict
-    tool_result: str
-
-
-class ToolDemoResponse(BaseModel):
-    answer: str
-    tool_calls: list[ToolCallInfo]
-    tool_call_count: int
-
-
-class ForcedToolRequest(BaseModel):
-    text: str = Field(description="Text to analyze")
-    tool_name: str = Field(description="Name of the tool to force LLM to use")
-
-
-class ForcedToolResponse(BaseModel):
-    answer: str
-    forced_tool: str
-    tool_calls: list[ToolCallInfo]
-
-
-class ErrorHandlingRequest(BaseModel):
-    text: str = Field(default="Sample text for analysis")
-    trigger_error: bool = Field(
-        default=True,
-        description="Whether to trigger a tool error for demonstration",
-    )
-
-
-class ErrorHandlingResponse(BaseModel):
-    answer: str
-    tool_calls: list[ToolCallInfo]
-    error_was_handled: bool
-```
-
-### Шаг 2. Tools — `app/tools/assessment_tools.py`
-
-Создаём набор инструментов для анализа студенческих работ. Каждый tool выполняет конкретную задачу анализа — подсчёт слов, проверку структуры, поиск цитат, анализ лексики.
+### Пример 1. @tool — базовый декоратор
 
 ```python
-import re
-from typing import Annotated
-
-import httpx
-from langchain_core.tools import tool, ToolException, InjectedToolArg
+from langchain_core.tools import tool
 
 
 @tool
 def count_words(text: str) -> dict:
-    """Count words, sentences, and paragraphs in the given text. Use this tool to get basic text statistics."""
+    """Count words, sentences, and paragraphs in the given text."""
     words = text.split()
-    sentences = [s for s in re.split(r'[.!?]+', text) if s.strip()]
+    sentences = [s for s in text.split('.') if s.strip()]
     paragraphs = [p for p in text.split('\n\n') if p.strip()]
-    avg_word_length = (
-        sum(len(w.strip(".,!?;:")) for w in words) / len(words) if words else 0
-    )
     return {
         "word_count": len(words),
         "sentence_count": len(sentences),
         "paragraph_count": max(len(paragraphs), 1),
-        "avg_words_per_sentence": round(len(words) / max(len(sentences), 1), 1),
-        "avg_word_length": round(avg_word_length, 1),
     }
 
 
 @tool
 def check_essay_structure(text: str) -> dict:
-    """Check if the essay has a proper structure: introduction, body paragraphs, and conclusion. Use this to evaluate essay organization."""
+    """Check if essay has introduction, body paragraphs, and conclusion."""
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    if not paragraphs:
-        paragraphs = [text.strip()]
-
-    intro_signals = [
-        "this essay", "in this paper", "the purpose", "introduction",
-        "this report", "the aim", "this analysis", "the topic",
-    ]
-    conclusion_signals = [
-        "in conclusion", "to summarize", "in summary", "therefore",
-        "to conclude", "overall", "in closing", "finally",
-    ]
+    intro_signals = ["this essay", "in this paper", "the purpose", "introduction"]
+    conclusion_signals = ["in conclusion", "to summarize", "in summary", "therefore"]
 
     first_para = paragraphs[0].lower() if paragraphs else ""
     last_para = paragraphs[-1].lower() if paragraphs else ""
 
-    has_intro = any(signal in first_para for signal in intro_signals)
-    has_conclusion = any(signal in last_para for signal in conclusion_signals)
+    has_intro = any(s in first_para for s in intro_signals)
+    has_conclusion = any(s in last_para for s in conclusion_signals)
     has_body = len(paragraphs) >= 3
 
     return {
         "has_introduction": has_intro,
         "has_body_paragraphs": has_body,
         "has_conclusion": has_conclusion,
-        "paragraph_count": len(paragraphs),
         "structure_score": sum([has_intro, has_body, has_conclusion]),
-        "max_structure_score": 3,
-        "feedback": (
-            "Well-structured essay" if all([has_intro, has_body, has_conclusion])
-            else "Essay structure needs improvement"
-        ),
     }
 
 
-@tool
-def check_citations(text: str, style: str) -> dict:
-    """Find and validate citations in the text. Style must be 'apa' or 'mla'. Use this tool when you need to check if the student properly cited sources."""
-    patterns = {
-        "apa": r'\([A-Z][a-zA-Z]+(?:\s+(?:&|and)\s+[A-Z][a-zA-Z]+)*,\s*\d{4}(?:,\s*p+\.\s*\d+(?:-\d+)?)?\)',
-        "mla": r'\([A-Z][a-zA-Z]+(?:\s+(?:and|&)\s+[A-Z][a-zA-Z]+)*\s+\d+(?:-\d+)?\)',
-    }
+result = count_words.invoke({"text": "AI is transforming education. Students learn faster."})
+print("count_words:", result)
 
-    style_lower = style.lower()
-    if style_lower not in patterns:
-        return {
-            "error": f"Unknown style '{style}'. Supported: apa, mla",
-            "citation_count": 0,
-            "citations": [],
-        }
-
-    found = re.findall(patterns[style_lower], text)
-    has_bibliography = any(
-        marker in text.lower()
-        for marker in ["references", "works cited", "bibliography"]
+result = check_essay_structure.invoke({
+    "text": (
+        "This essay examines AI in education.\n\n"
+        "AI tools help personalize learning for each student.\n\n"
+        "In conclusion, AI will transform how we teach."
     )
+})
+print("check_essay_structure:", result)
 
-    return {
-        "style": style_lower,
-        "citation_count": len(found),
-        "citations": found[:10],
-        "has_bibliography_section": has_bibliography,
-        "meets_minimum": len(found) >= 3,
-    }
-
-
-@tool
-def analyze_vocabulary(text: str) -> dict:
-    """Analyze vocabulary richness and complexity of the text. Use this to evaluate the student's language proficiency."""
-    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
-    if not words:
-        return {"error": "No words found in text"}
-
-    unique_words = set(words)
-    long_words = [w for w in words if len(w) > 8]
-
-    academic_markers = [
-        "however", "therefore", "furthermore", "moreover", "consequently",
-        "nevertheless", "specifically", "significantly", "demonstrates",
-        "illustrates", "indicates", "suggests", "analysis", "hypothesis",
-        "methodology", "framework", "perspective", "fundamental",
-    ]
-    academic_found = [w for w in academic_markers if w in unique_words]
-
-    return {
-        "total_words": len(words),
-        "unique_words": len(unique_words),
-        "uniqueness_ratio": round(len(unique_words) / len(words), 3),
-        "avg_word_length": round(sum(len(w) for w in words) / len(words), 1),
-        "long_words_count": len(long_words),
-        "long_words_ratio": round(len(long_words) / len(words), 3),
-        "academic_words_found": academic_found,
-        "vocabulary_level": (
-            "advanced" if len(academic_found) >= 5
-            else "intermediate" if len(academic_found) >= 2
-            else "basic"
-        ),
-    }
-
-
-@tool
-def get_rubric(
-    rubric_name: str,
-    available_rubrics: Annotated[dict, InjectedToolArg],
-) -> dict:
-    """Fetch an assessment rubric by name. Returns criteria, scores, and weights for the requested rubric."""
-    if rubric_name not in available_rubrics:
-        raise ToolException(
-            f"Rubric '{rubric_name}' not found. "
-            f"Available rubrics: {list(available_rubrics.keys())}"
-        )
-    return available_rubrics[rubric_name]
-
-
-@tool
-async def check_plagiarism(text: str) -> dict:
-    """Check text for potential plagiarism by analyzing text originality patterns. Use this for academic integrity verification."""
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    if not sentences:
-        return {"originality_score": 1.0, "is_original": True}
-
-    sentence_starts = [s.split()[0].lower() if s.split() else "" for s in sentences]
-    unique_starts = len(set(sentence_starts))
-    start_diversity = unique_starts / max(len(sentence_starts), 1)
-
-    avg_sentence_length = sum(len(s.split()) for s in sentences) / len(sentences)
-    length_variance = sum(
-        (len(s.split()) - avg_sentence_length) ** 2 for s in sentences
-    ) / len(sentences)
-
-    originality_score = round(min(start_diversity * 0.5 + min(length_variance / 100, 0.5), 1.0), 2)
-
-    return {
-        "originality_score": originality_score,
-        "is_original": originality_score > 0.5,
-        "sentence_count_analyzed": len(sentences),
-        "diversity_index": round(start_diversity, 2),
-        "style_variance": round(length_variance, 2),
-        "method": "heuristic_analysis",
-    }
-
-
-ESSAY_TOOLS = [count_words, check_essay_structure, check_citations, analyze_vocabulary, check_plagiarism]
-ALL_TOOLS = ESSAY_TOOLS + [get_rubric]
-
-TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
+print()
+print("Tool name:", count_words.name)
+print("Tool description:", count_words.description)
+print("Tool schema:", count_words.args_schema.model_json_schema())
 ```
 
-### Шаг 3. Роутер — `app/api/v1/tools.py`
-
-Четыре эндпоинта демонстрируют разные режимы tool calling.
+### Пример 2. StructuredTool и BaseTool с Pydantic-схемой
 
 ```python
-import json
+from langchain_core.tools import StructuredTool, BaseTool
+from pydantic import BaseModel, Field
 
-from fastapi import APIRouter
+
+class CheckCitationsInput(BaseModel):
+    text: str = Field(description="Essay text to check for citations")
+    style: str = Field(description="Citation style: 'apa' or 'mla'")
+
+
+def _check_citations(text: str, style: str) -> dict:
+    import re
+    patterns = {
+        "apa": r'\([A-Z][a-z]+,\s*\d{4}\)',
+        "mla": r'\([A-Z][a-z]+\s+\d+\)',
+    }
+    pattern = patterns.get(style.lower(), patterns["apa"])
+    found = re.findall(pattern, text)
+    return {"style": style, "citation_count": len(found), "citations": found}
+
+
+check_citations = StructuredTool.from_function(
+    func=_check_citations,
+    name="check_citations",
+    description="Find and validate citations in essay text",
+    args_schema=CheckCitationsInput,
+    handle_tool_error=True,
+)
+
+text_with_citations = "According to research (Smith, 2023), AI improves outcomes (Johnson, 2022)."
+print("StructuredTool:", check_citations.invoke({"text": text_with_citations, "style": "apa"}))
+
+
+class VocabularyInput(BaseModel):
+    text: str = Field(description="Text to analyze for vocabulary richness")
+
+
+class VocabularyTool(BaseTool):
+    name: str = "analyze_vocabulary"
+    description: str = "Analyze vocabulary richness and complexity of the text"
+    args_schema: type[BaseModel] = VocabularyInput
+    academic_markers: list[str] = [
+        "however", "therefore", "furthermore", "moreover",
+        "consequently", "demonstrates", "indicates", "analysis",
+    ]
+
+    def _run(self, text: str) -> dict:
+        import re
+        words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
+        unique = set(words)
+        academic_found = [w for w in self.academic_markers if w in unique]
+        return {
+            "total_words": len(words),
+            "unique_words": len(unique),
+            "uniqueness_ratio": round(len(unique) / max(len(words), 1), 3),
+            "academic_words": academic_found,
+            "level": "advanced" if len(academic_found) >= 3 else "basic",
+        }
+
+
+vocab_tool = VocabularyTool()
+print("BaseTool:", vocab_tool.invoke({
+    "text": "Furthermore, this analysis demonstrates significant results. "
+            "However, the methodology indicates limitations."
+}))
+```
+
+### Пример 3. bind_tools() и цикл tool calling
+
+```python
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, ToolMessage
 
-from app.dependencies import LLMDep
-from app.schemas.tools import (
-    ErrorHandlingRequest,
-    ErrorHandlingResponse,
-    ForcedToolRequest,
-    ForcedToolResponse,
-    ToolCallInfo,
-    ToolDemoRequest,
-    ToolDemoResponse,
-)
-from app.tools.assessment_tools import (
-    ESSAY_TOOLS,
-    TOOLS_BY_NAME,
-    check_essay_structure,
-    count_words,
-)
 
-router = APIRouter(prefix="/tools", tags=["tools"])
-
-SYSTEM_PROMPT = (
-    "You are a student work assessment assistant. "
-    "Use the provided tools to analyze the text before giving your assessment. "
-    "Always base your assessment on tool results, not assumptions."
-)
+@tool
+def count_words(text: str) -> dict:
+    """Count words in the given text. Use for basic text statistics."""
+    words = text.split()
+    return {"word_count": len(words), "char_count": len(text)}
 
 
-async def _execute_tool_loop(
-    llm_with_tools,
-    user_content: str,
-    available_tools: dict[str, object],
-    max_iterations: int = 5,
-    injected_args: dict | None = None,
-) -> tuple[str, list[ToolCallInfo]]:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        HumanMessage(content=user_content),
-    ]
-    all_tool_calls: list[ToolCallInfo] = []
+@tool
+def check_structure(text: str) -> dict:
+    """Check if essay has proper structure with intro, body, conclusion."""
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return {"paragraph_count": len(paragraphs), "has_structure": len(paragraphs) >= 3}
 
-    for _ in range(max_iterations):
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+tools = [count_words, check_structure]
+llm_with_tools = llm.bind_tools(tools)
+tools_map = {t.name: t for t in tools}
+
+
+async def run_tool_loop(user_text: str) -> str:
+    messages = [HumanMessage(content=user_text)]
+
+    while True:
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
 
         if not response.tool_calls:
-            answer = response.content if isinstance(response.content, str) else str(response.content)
-            return answer, all_tool_calls
+            return response.content
 
         for tc in response.tool_calls:
-            tool_fn = available_tools.get(tc["name"])
-            if not tool_fn:
-                tool_result = f"Error: tool '{tc['name']}' not found"
-            else:
-                try:
-                    call_args = dict(tc["args"])
-                    if injected_args and tc["name"] in injected_args:
-                        call_args.update(injected_args[tc["name"]])
-                    tool_result = await tool_fn.ainvoke(call_args)
-                    if not isinstance(tool_result, str):
-                        tool_result = json.dumps(tool_result, ensure_ascii=False)
-                except Exception as e:
-                    tool_result = f"Tool error: {e}"
-
-            all_tool_calls.append(
-                ToolCallInfo(
-                    tool_name=tc["name"],
-                    tool_args=tc["args"],
-                    tool_result=tool_result if isinstance(tool_result, str) else str(tool_result),
-                )
-            )
-
+            print(f"  Tool call: {tc['name']}({tc['args']})")
+            tool_fn = tools_map[tc["name"]]
+            result = await tool_fn.ainvoke(tc["args"])
+            print(f"  Result: {result}")
             messages.append(
-                ToolMessage(content=str(tool_result), tool_call_id=tc["id"])
+                ToolMessage(content=str(result), tool_call_id=tc["id"])
             )
 
-    answer = messages[-1].content if hasattr(messages[-1], "content") else "Max iterations reached"
-    return answer, all_tool_calls
 
+essay = (
+    "This essay examines AI.\n\n"
+    "AI helps students learn better.\n\n"
+    "In conclusion, AI is useful."
+)
 
-@router.post("/basic")
-async def basic_tool_calling(
-    request: ToolDemoRequest,
-    llm: LLMDep,
-) -> ToolDemoResponse:
-    tools = [count_words, check_essay_structure]
-    llm_with_tools = llm.bind_tools(tools)
-    tools_map = {t.name: t for t in tools}
-
-    answer, tool_calls = await _execute_tool_loop(
-        llm_with_tools,
-        f"Analyze this student work and provide basic statistics:\n\n{request.text}",
-        tools_map,
-    )
-
-    return ToolDemoResponse(
-        answer=answer,
-        tool_calls=tool_calls,
-        tool_call_count=len(tool_calls),
-    )
-
-
-@router.post("/parallel")
-async def parallel_tool_calling(
-    request: ToolDemoRequest,
-    llm: LLMDep,
-) -> ToolDemoResponse:
-    tools = ESSAY_TOOLS
-    llm_with_tools = llm.bind_tools(tools)
-    tools_map = {t.name: t for t in tools}
-
-    prompt = (
-        "Perform a comprehensive analysis of this student essay. "
-        "Use ALL available tools to analyze the text thoroughly — "
-        "check word count, structure, vocabulary, citations (apa style), "
-        "and plagiarism. Then provide an overall assessment based on all results.\n\n"
-        f"{request.text}"
-    )
-
-    answer, tool_calls = await _execute_tool_loop(
-        llm_with_tools, prompt, tools_map,
-    )
-
-    return ToolDemoResponse(
-        answer=answer,
-        tool_calls=tool_calls,
-        tool_call_count=len(tool_calls),
-    )
-
-
-@router.post("/forced")
-async def forced_tool_calling(
-    request: ForcedToolRequest,
-    llm: LLMDep,
-) -> ForcedToolResponse:
-    tools = ESSAY_TOOLS
-    tools_map = {t.name: t for t in tools}
-
-    if request.tool_name not in tools_map:
-        available = list(tools_map.keys())
-        return ForcedToolResponse(
-            answer=f"Tool '{request.tool_name}' not found. Available: {available}",
-            forced_tool=request.tool_name,
-            tool_calls=[],
-        )
-
-    llm_with_tools = llm.bind_tools(
-        tools,
-        tool_choice={"type": "tool", "name": request.tool_name},
-    )
-
-    answer, tool_calls = await _execute_tool_loop(
-        llm_with_tools, f"Analyze this text:\n\n{request.text}", tools_map,
-    )
-
-    return ForcedToolResponse(
-        answer=answer,
-        forced_tool=request.tool_name,
-        tool_calls=tool_calls,
-    )
-
-
-@router.post("/error-handling")
-async def error_handling_demo(
-    request: ErrorHandlingRequest,
-    llm: LLMDep,
-) -> ErrorHandlingResponse:
-    from app.tools.assessment_tools import get_rubric
-
-    tools = [count_words, get_rubric]
-    llm_with_tools = llm.bind_tools(tools)
-    tools_map = {t.name: t for t in tools}
-
-    rubrics_db = {
-        "essay_basic": {
-            "name": "Basic Essay Rubric",
-            "criteria": ["thesis", "evidence", "structure"],
-        },
-    }
-
-    injected = {"get_rubric": {"available_rubrics": rubrics_db}}
-
-    rubric_name = "nonexistent_rubric" if request.trigger_error else "essay_basic"
-
-    prompt = (
-        f"First, get the rubric named '{rubric_name}' and count the words "
-        f"in this text. If a tool returns an error, explain what happened.\n\n"
-        f"{request.text}"
-    )
-
-    answer, tool_calls = await _execute_tool_loop(
-        llm_with_tools, prompt, tools_map, injected_args=injected,
-    )
-
-    error_occurred = any("error" in tc.tool_result.lower() for tc in tool_calls)
-
-    return ErrorHandlingResponse(
-        answer=answer,
-        tool_calls=tool_calls,
-        error_was_handled=error_occurred,
-    )
+print("=== Tool calling loop ===")
+answer = asyncio.run(run_tool_loop(f"Analyze this essay:\n\n{essay}"))
+print(f"\nFinal answer:\n{answer}")
 ```
 
-### Шаг 4. Регистрация в `app/api/router.py`
+### Пример 4. Параллельное выполнение tools
 
 ```python
-from fastapi import APIRouter
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, ToolMessage
 
-from app.api.v1 import assessment, rubrics, prompts, tools
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(tools.router)
+@tool
+def count_words(text: str) -> dict:
+    """Count words in text."""
+    return {"word_count": len(text.split())}
+
+
+@tool
+def check_structure(text: str) -> dict:
+    """Check essay structure."""
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return {"paragraphs": len(paragraphs), "has_structure": len(paragraphs) >= 3}
+
+
+@tool
+def analyze_vocabulary(text: str) -> dict:
+    """Analyze vocabulary richness."""
+    import re
+    words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
+    unique = set(words)
+    return {"unique_ratio": round(len(unique) / max(len(words), 1), 3)}
+
+
+@tool
+def check_citations(text: str, style: str) -> dict:
+    """Find citations in APA or MLA style."""
+    import re
+    pattern = r'\([A-Z][a-z]+,\s*\d{4}\)' if style == "apa" else r'\([A-Z][a-z]+\s+\d+\)'
+    return {"citations": re.findall(pattern, text)}
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+tools = [count_words, check_structure, analyze_vocabulary, check_citations]
+llm_with_tools = llm.bind_tools(tools)
+tools_map = {t.name: t for t in tools}
+
+
+async def execute_parallel(response, tools_map):
+    tasks = []
+    for tc in response.tool_calls:
+        tool_fn = tools_map[tc["name"]]
+        tasks.append(tool_fn.ainvoke(tc["args"]))
+    results = await asyncio.gather(*tasks)
+
+    tool_messages = []
+    for tc, result in zip(response.tool_calls, results):
+        tool_messages.append(
+            ToolMessage(content=str(result), tool_call_id=tc["id"])
+        )
+    return tool_messages
+
+
+async def main():
+    essay = (
+        "This essay examines AI in education (Smith, 2023). "
+        "Furthermore, recent studies demonstrate significant improvements (Lee, 2022).\n\n"
+        "The methodology indicates promising results. However, challenges remain.\n\n"
+        "In conclusion, AI transforms education."
+    )
+
+    prompt = (
+        "Analyze this essay comprehensively — check word count, structure, "
+        "vocabulary, and citations (apa style). Use ALL available tools.\n\n"
+        + essay
+    )
+
+    messages = [HumanMessage(content=prompt)]
+    response = await llm_with_tools.ainvoke(messages)
+    messages.append(response)
+
+    print(f"Model requested {len(response.tool_calls)} tool calls:")
+    for tc in response.tool_calls:
+        print(f"  - {tc['name']}")
+
+    tool_messages = await execute_parallel(response, tools_map)
+    messages.extend(tool_messages)
+
+    for msg in tool_messages:
+        print(f"  Result: {msg.content[:100]}...")
+
+    final = await llm_with_tools.ainvoke(messages)
+    print(f"\nFinal answer:\n{final.content[:500]}...")
+
+
+asyncio.run(main())
 ```
 
-### Шаг 5. Тестирование с curl
+### Пример 5. Обработка ошибок и InjectedToolArg
 
-Запустите сервер:
+```python
+from typing import Annotated
+from langchain_core.tools import tool, ToolException, InjectedToolArg
 
-```bash
-uvicorn app.main:app --reload
+
+RUBRICS_DB = {
+    "essay_basic": {"criteria": ["thesis", "evidence", "structure"], "max_score": 100},
+}
+
+
+@tool(handle_tool_error=True)
+def get_rubric(rubric_name: str) -> dict:
+    """Fetch assessment rubric by name. Available rubrics: essay_basic."""
+    if rubric_name not in RUBRICS_DB:
+        raise ToolException(
+            f"Rubric '{rubric_name}' not found. "
+            f"Available: {list(RUBRICS_DB.keys())}"
+        )
+    return RUBRICS_DB[rubric_name]
+
+
+print("=== Successful call ===")
+print(get_rubric.invoke({"rubric_name": "essay_basic"}))
+
+print("\n=== Error handled ===")
+print(get_rubric.invoke({"rubric_name": "nonexistent"}))
+
+
+def custom_error_handler(error: ToolException) -> str:
+    return f"Tool failed: {error}. Try 'essay_basic' instead."
+
+
+@tool(handle_tool_error=custom_error_handler)
+def get_rubric_v2(rubric_name: str) -> dict:
+    """Fetch rubric with custom error handling."""
+    if rubric_name not in RUBRICS_DB:
+        raise ToolException(f"'{rubric_name}' not found")
+    return RUBRICS_DB[rubric_name]
+
+
+print("\n=== Custom error handler ===")
+print(get_rubric_v2.invoke({"rubric_name": "wrong_name"}))
+
+
+@tool
+def save_assessment(
+    student_id: str,
+    score: int,
+    db_session: Annotated[dict, InjectedToolArg],
+) -> dict:
+    """Save assessment result for a student."""
+    db_session.setdefault("assessments", []).append(
+        {"student_id": student_id, "score": score}
+    )
+    return {"saved": True, "student_id": student_id}
+
+
+print("\n=== InjectedToolArg ===")
+print("Schema (db_session hidden):", save_assessment.args_schema.model_json_schema())
+
+fake_db = {"assessments": []}
+result = save_assessment.invoke({
+    "student_id": "s-001",
+    "score": 85,
+    "db_session": fake_db,
+})
+print("Result:", result)
+print("DB state:", fake_db)
 ```
 
-**POST /tools/basic** — базовый tool calling:
+### Пример 6. Динамический выбор tools и tool_choice
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/tools/basic \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Artificial intelligence is transforming education in profound ways. Machine learning algorithms can now personalize learning paths for individual students.\n\nIn the classroom, AI-powered tools help teachers identify students who are struggling. Adaptive learning platforms adjust difficulty in real-time.\n\nHowever, there are concerns about data privacy and the digital divide. Not all students have equal access to technology.\n\nIn conclusion, while AI offers tremendous potential for education, we must address these challenges to ensure equitable access for all learners."
-  }' | python -m json.tool
+```python
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+
+
+@tool
+def count_words(text: str) -> dict:
+    """Count words in text."""
+    return {"word_count": len(text.split())}
+
+
+@tool
+def check_essay_structure(text: str) -> dict:
+    """Check essay structure (intro, body, conclusion)."""
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    return {"paragraphs": len(paragraphs)}
+
+
+@tool
+def run_code_tests(code: str) -> dict:
+    """Run basic syntax checks on Python code."""
+    issues = []
+    for i, line in enumerate(code.split('\n'), 1):
+        if len(line) > 120:
+            issues.append(f"Line {i}: too long")
+    return {"issues": issues, "passed": len(issues) == 0}
+
+
+@tool
+def check_math_solution(expression: str) -> dict:
+    """Verify a mathematical expression."""
+    try:
+        result = eval(expression, {"__builtins__": {}})
+        return {"result": result, "valid": True}
+    except Exception:
+        return {"valid": False}
+
+
+TOOL_SETS = {
+    "essay": [count_words, check_essay_structure],
+    "code": [count_words, run_code_tests],
+    "math": [count_words, check_math_solution],
+}
+
+
+def get_tools_for_task(task_type: str) -> list:
+    return TOOL_SETS.get(task_type, [count_words])
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+
+
+async def main():
+    for task_type in ["essay", "code", "math"]:
+        tools = get_tools_for_task(task_type)
+        print(f"Task type '{task_type}': tools = {[t.name for t in tools]}")
+
+    tools = get_tools_for_task("essay")
+
+    llm_forced = llm.bind_tools(
+        tools,
+        tool_choice={"type": "tool", "name": "count_words"},
+    )
+    response = await llm_forced.ainvoke([
+        HumanMessage(content="Tell me about AI in education.")
+    ])
+    print(f"\nForced tool_choice: {[tc['name'] for tc in response.tool_calls]}")
+
+    llm_any = llm.bind_tools(tools, tool_choice="any")
+    response = await llm_any.ainvoke([
+        HumanMessage(content="Analyze this short essay about AI.")
+    ])
+    print(f"tool_choice='any': {[tc['name'] for tc in response.tool_calls]}")
+
+
+asyncio.run(main())
 ```
-
-Ожидаемый результат: `tool_call_count` >= 1, модель вызывает `count_words` и/или `check_essay_structure`, затем даёт анализ на основе результатов.
-
-**POST /tools/parallel** — параллельный tool calling:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/tools/parallel \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "This essay examines the impact of artificial intelligence on modern education (Smith, 2023). According to recent studies, AI-powered tools can improve student outcomes by up to 30% (Johnson & Lee, 2022).\n\nThe methodology employed in this analysis draws from multiple peer-reviewed sources. Furthermore, the pedagogical implications are significant and demonstrate a paradigm shift in educational methodology.\n\nNevertheless, the implementation challenges are considerable. Specifically, the digital divide creates inequitable access to these technologies (Williams, 2023).\n\nIn conclusion, the evidence suggests that AI will fundamentally transform education, but careful policy considerations are necessary to ensure equitable outcomes."
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `tool_call_count` >= 3, модель вызывает несколько tools (возможно параллельно), включая `count_words`, `check_essay_structure`, `analyze_vocabulary`, `check_citations`.
-
-**POST /tools/forced** — принудительный выбор tool:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/tools/forced \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "AI is transforming education. Machine learning helps personalize learning. This is a short text.",
-    "tool_name": "analyze_vocabulary"
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `forced_tool` = `"analyze_vocabulary"`, первый tool call — именно `analyze_vocabulary`.
-
-**POST /tools/error-handling** — обработка ошибок:
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/tools/error-handling \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Short test essay about AI in education.",
-    "trigger_error": true
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `error_was_handled` = `true`, в `tool_calls` виден вызов `get_rubric` с ошибкой, модель объясняет в `answer`, что рубрика не найдена.
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/tools/error-handling \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Short test essay about AI in education.",
-    "trigger_error": false
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `error_was_handled` = `false`, рубрика `essay_basic` успешно найдена.
 
 ### Связь с теорией
 
-| Эндпоинт | Концепция из теории | Что демонстрирует |
+| Пример | Концепция из теории | Что демонстрирует |
 |---|---|---|
-| `POST /tools/basic` | §1 `@tool`, §3 `bind_tools`, §4 Tool calling flow | Базовый цикл: LLM вызывает один tool, получает результат, формирует ответ |
-| `POST /tools/parallel` | §4 Параллельный tool calling, §7 Dynamic tool selection | Модель вызывает несколько tools за один ход для комплексного анализа |
-| `POST /tools/forced` | §3 `tool_choice` | Принудительный выбор конкретного tool через `tool_choice` |
-| `POST /tools/error-handling` | §5 ToolException, §8 InjectedToolArg | Обработка ошибок в tools + скрытые аргументы через InjectedToolArg |
+| Пример 1 | §1 `@tool` | Создание tools через декоратор, автоматическая генерация schema из type hints |
+| Пример 2 | §1 `StructuredTool` / `BaseTool`, §2 args_schema | Кастомная Pydantic-схема, внутреннее состояние в BaseTool |
+| Пример 3 | §3 `bind_tools`, §4 Tool calling flow | Полный цикл: LLM запрашивает tool → клиент выполняет → результат обратно в LLM |
+| Пример 4 | §4 Параллельный tool calling | asyncio.gather для одновременного выполнения нескольких tool calls |
+| Пример 5 | §5 ToolException, handle_tool_error, §8 InjectedToolArg | Graceful error handling + скрытые аргументы через InjectedToolArg |
+| Пример 6 | §7 Dynamic tool selection, §3 tool_choice | Выбор набора tools по контексту + принудительный вызов конкретного tool |
 
 ---
 
@@ -1691,7 +1604,7 @@ curl -s -X POST http://localhost:8000/api/v1/tools/error-handling \
 - [ ] Нарисуй полный цикл tool calling: какие сообщения и в каком порядке проходят между клиентом и LLM?
 - [ ] Что такое `tool_call_id` в `ToolMessage` и почему он обязателен?
 - [ ] Как `ToolException` и `handle_tool_error` работают вместе? Что видит модель при ошибке?
-- [ ] Почему важно делать I/O-bound tools асинхронными в FastAPI? Что произойдёт с sync HTTP-вызовом?
+- [ ] Почему важно делать I/O-bound tools асинхронными? Что произойдёт с sync HTTP-вызовом в async-приложении?
 - [ ] Как `InjectedToolArg` скрывает аргумент от LLM? Где этот аргумент появляется при вызове tool?
 - [ ] Почему больше 15 tools одновременно — плохая идея? Какие стратегии помогают?
 - [ ] Как `ToolNode` из LangGraph автоматизирует цикл tool calling?
@@ -1782,7 +1695,7 @@ def check_api(text: str) -> dict:
     return response.json()
 ```
 
-`requests.post` — синхронный вызов. В FastAPI с `async def` это блокирует event loop: пока ждём ответа от внешнего API, сервер не обрабатывает другие запросы.
+`requests.post` — синхронный вызов. В async-приложении это блокирует event loop: пока ждём ответа от внешнего API, остальные задачи не выполняются.
 
 ```python
 import httpx

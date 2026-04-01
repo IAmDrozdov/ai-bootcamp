@@ -1,7 +1,6 @@
 # Тема 18: Ollama и локальные LLM — запуск моделей без облака
 
 > **Пререквизиты:** [Тема 2: LangChain Core + LCEL](topic_02_langchain_lcel.md)
-> **Что добавляем в проект:** `app/api/v1/local.py`, `app/services/local_llm.py`, `app/schemas/local.py`
 > **Зависимости:** `langchain-ollama`, `langchain-community`, `ollama`
 
 ---
@@ -55,7 +54,7 @@ brew install ollama
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Твоё приложение (FastAPI)                      │
+│  Твоё приложение (Python)                       │
 │  → ChatOllama(model="llama3.1")                 │
 │  → HTTP POST http://localhost:11434/api/chat    │
 └───────────────────┬─────────────────────────────┘
@@ -686,370 +685,9 @@ primary_llm.with_fallbacks(
 
 ---
 
-## Практика: роутер `/api/v1/local`
+## Практика
 
-Добавим в наш assessment-проект поддержку локальных моделей через Ollama. Четыре эндпоинта: список моделей, оценка локальной моделью, сравнение локальной и облачной, локальные embeddings.
-
-### Шаг 1. Схемы — `app/schemas/local.py`
-
-```python
-from pydantic import BaseModel, Field
-
-
-class OllamaModelInfo(BaseModel):
-    name: str
-    size: str
-    family: str | None = None
-    parameter_size: str | None = None
-    quantization_level: str | None = None
-
-
-class ModelsResponse(BaseModel):
-    available: bool
-    models: list[OllamaModelInfo] = []
-    error: str | None = None
-
-
-class LocalAssessRequest(BaseModel):
-    student_work: str = Field(min_length=10, max_length=50000)
-    rubric: str = Field(default="Evaluate the quality of the student work on a scale of 0-100. Provide detailed feedback.")
-    model_name: str = Field(default="llama3.1:8b")
-    temperature: float = Field(default=0.3, ge=0.0, le=1.0)
-    num_ctx: int = Field(default=4096, ge=512, le=131072)
-
-
-class LocalAssessResponse(BaseModel):
-    score: int = Field(ge=0, le=100, description="Overall score")
-    feedback: str = Field(description="Detailed assessment feedback")
-    model_used: str
-    generation_time_ms: int
-
-
-class CompareRequest(BaseModel):
-    student_work: str = Field(min_length=10, max_length=50000)
-    rubric: str = Field(default="Evaluate the quality of the student work on a scale of 0-100. Provide detailed feedback.")
-    local_model: str = Field(default="llama3.1:8b")
-    cloud_model: str = Field(default="claude-sonnet-4-20250514")
-
-
-class SingleModelResult(BaseModel):
-    score: int = Field(ge=0, le=100)
-    feedback: str
-    model: str
-    generation_time_ms: int
-
-
-class CompareResponse(BaseModel):
-    local_result: SingleModelResult
-    cloud_result: SingleModelResult
-    score_difference: int
-    faster_model: str
-
-
-class EmbedRequest(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=100)
-    model_name: str = Field(default="nomic-embed-text")
-
-
-class EmbeddingResult(BaseModel):
-    text: str
-    vector_dim: int
-    vector_preview: list[float] = Field(description="First 5 dimensions of the vector")
-
-
-class EmbedResponse(BaseModel):
-    results: list[EmbeddingResult]
-    model_used: str
-    total_texts: int
-    dimension: int
-```
-
-Схемы следуют паттерну проекта: `Request` для входящих данных с валидацией через `Field`, `Response` для ответов с типизированными полями.
-
-### Шаг 2. Сервис — `app/services/local_llm.py`
-
-Сервис инкапсулирует работу с Ollama. Четыре функции: проверка доступности, получение модели, получение embedding-модели, список доступных моделей.
-
-```python
-import httpx
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-
-
-OLLAMA_BASE_URL = "http://localhost:11434"
-
-
-async def check_ollama_available() -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            return response.status_code == 200
-    except (httpx.ConnectError, httpx.TimeoutException):
-        return False
-
-
-def get_ollama_model(
-    model_name: str = "llama3.1:8b",
-    temperature: float = 0.3,
-    num_ctx: int = 4096,
-    **kwargs,
-) -> ChatOllama:
-    return ChatOllama(
-        model=model_name,
-        temperature=temperature,
-        num_ctx=num_ctx,
-        base_url=OLLAMA_BASE_URL,
-        **kwargs,
-    )
-
-
-def get_ollama_embeddings(model_name: str = "nomic-embed-text") -> OllamaEmbeddings:
-    return OllamaEmbeddings(
-        model=model_name,
-        base_url=OLLAMA_BASE_URL,
-    )
-
-
-async def list_available_models() -> list[dict]:
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
-            response.raise_for_status()
-            data = response.json()
-            return data.get("models", [])
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError):
-        return []
-```
-
-Ключевые решения:
-
-- `check_ollama_available()` — асинхронная проверка через HTTP (не через CLI). Timeout 3 секунды — если Ollama не отвечает за 3 секунды, считаем недоступной.
-- `get_ollama_model()` — фабрика для `ChatOllama`. Принимает `**kwargs` для гибкости (можно передать `format="json"`, `keep_alive` и т.д.).
-- `get_ollama_embeddings()` — фабрика для `OllamaEmbeddings`.
-- `list_available_models()` — вызывает Ollama REST API (`/api/tags`) напрямую, без LangChain. Возвращает список словарей с метаданными моделей.
-
-### Шаг 3. Router — `app/api/v1/local.py`
-
-```python
-import time
-
-from fastapi import APIRouter, HTTPException
-from langchain_anthropic import ChatAnthropic
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
-
-from app.schemas.local import (
-    CompareRequest,
-    CompareResponse,
-    EmbedRequest,
-    EmbedResponse,
-    EmbeddingResult,
-    LocalAssessRequest,
-    LocalAssessResponse,
-    ModelsResponse,
-    OllamaModelInfo,
-    SingleModelResult,
-)
-from app.services.local_llm import (
-    check_ollama_available,
-    get_ollama_embeddings,
-    get_ollama_model,
-    list_available_models,
-)
-
-router = APIRouter(prefix="/local", tags=["local-llm"])
-
-ASSESS_PROMPT = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are an expert teacher evaluating student work.\n"
-        "Rubric: {rubric}\n\n"
-        "You MUST respond with a JSON object containing exactly two fields:\n"
-        '- "score": integer from 0 to 100\n'
-        '- "feedback": string with detailed assessment feedback',
-    ),
-    ("human", "Student work:\n\n{student_work}"),
-])
-
-
-class _AssessmentOutput(BaseModel):
-    score: int = Field(ge=0, le=100)
-    feedback: str
-
-
-@router.get("/models")
-async def get_models() -> ModelsResponse:
-    is_available = await check_ollama_available()
-    if not is_available:
-        return ModelsResponse(
-            available=False,
-            models=[],
-            error="Ollama server is not running. Start it with: ollama serve",
-        )
-
-    raw_models = await list_available_models()
-    models = [
-        OllamaModelInfo(
-            name=m.get("name", "unknown"),
-            size=_format_size(m.get("size", 0)),
-            family=m.get("details", {}).get("family"),
-            parameter_size=m.get("details", {}).get("parameter_size"),
-            quantization_level=m.get("details", {}).get("quantization_level"),
-        )
-        for m in raw_models
-    ]
-    return ModelsResponse(available=True, models=models)
-
-
-@router.post("/assess")
-async def assess_with_local(request: LocalAssessRequest) -> LocalAssessResponse:
-    if not await check_ollama_available():
-        raise HTTPException(
-            status_code=503,
-            detail="Ollama server is not running. Start it with: ollama serve",
-        )
-
-    llm = get_ollama_model(
-        model_name=request.model_name,
-        temperature=request.temperature,
-        num_ctx=request.num_ctx,
-    )
-    structured_llm = llm.with_structured_output(_AssessmentOutput)
-    chain = ASSESS_PROMPT | structured_llm
-
-    start = time.perf_counter()
-    try:
-        result = await chain.ainvoke({
-            "student_work": request.student_work,
-            "rubric": request.rubric,
-        })
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ollama inference failed: {e}")
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
-
-    return LocalAssessResponse(
-        score=result.score,
-        feedback=result.feedback,
-        model_used=request.model_name,
-        generation_time_ms=elapsed_ms,
-    )
-
-
-@router.post("/compare")
-async def compare_local_vs_cloud(request: CompareRequest) -> CompareResponse:
-    if not await check_ollama_available():
-        raise HTTPException(
-            status_code=503,
-            detail="Ollama server is not running. Start it with: ollama serve",
-        )
-
-    local_llm = get_ollama_model(model_name=request.local_model, temperature=0.3)
-    cloud_llm = ChatAnthropic(model=request.cloud_model, temperature=0.3)
-
-    local_chain = ASSESS_PROMPT | local_llm.with_structured_output(_AssessmentOutput)
-    cloud_chain = ASSESS_PROMPT | cloud_llm.with_structured_output(_AssessmentOutput)
-
-    invoke_input = {
-        "student_work": request.student_work,
-        "rubric": request.rubric,
-    }
-
-    start_local = time.perf_counter()
-    try:
-        local_result = await local_chain.ainvoke(invoke_input)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Local model failed: {e}")
-    local_ms = int((time.perf_counter() - start_local) * 1000)
-
-    start_cloud = time.perf_counter()
-    try:
-        cloud_result = await cloud_chain.ainvoke(invoke_input)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Cloud model failed: {e}")
-    cloud_ms = int((time.perf_counter() - start_cloud) * 1000)
-
-    return CompareResponse(
-        local_result=SingleModelResult(
-            score=local_result.score,
-            feedback=local_result.feedback,
-            model=request.local_model,
-            generation_time_ms=local_ms,
-        ),
-        cloud_result=SingleModelResult(
-            score=cloud_result.score,
-            feedback=cloud_result.feedback,
-            model=request.cloud_model,
-            generation_time_ms=cloud_ms,
-        ),
-        score_difference=abs(local_result.score - cloud_result.score),
-        faster_model=(
-            request.local_model if local_ms < cloud_ms else request.cloud_model
-        ),
-    )
-
-
-@router.post("/embed")
-async def embed_texts(request: EmbedRequest) -> EmbedResponse:
-    if not await check_ollama_available():
-        raise HTTPException(
-            status_code=503,
-            detail="Ollama server is not running. Start it with: ollama serve",
-        )
-
-    embeddings_model = get_ollama_embeddings(request.model_name)
-
-    try:
-        vectors = await embeddings_model.aembed_documents(request.texts)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Embedding failed: {e}")
-
-    results = [
-        EmbeddingResult(
-            text=text[:100],
-            vector_dim=len(vec),
-            vector_preview=vec[:5],
-        )
-        for text, vec in zip(request.texts, vectors)
-    ]
-
-    return EmbedResponse(
-        results=results,
-        model_used=request.model_name,
-        total_texts=len(request.texts),
-        dimension=len(vectors[0]) if vectors else 0,
-    )
-
-
-def _format_size(size_bytes: int) -> str:
-    if size_bytes == 0:
-        return "unknown"
-    gb = size_bytes / (1024 ** 3)
-    if gb >= 1:
-        return f"{gb:.1f} GB"
-    mb = size_bytes / (1024 ** 2)
-    return f"{mb:.0f} MB"
-```
-
-Разберём каждый эндпоинт:
-
-**`GET /local/models`** — возвращает список моделей, скачанных в Ollama. Сначала проверяет доступность Ollama-сервера. Если сервер не запущен, возвращает `available: false` с подсказкой. Не бросает 503 — это информационный эндпоинт.
-
-**`POST /local/assess`** — оценка студенческой работы локальной моделью. Использует `with_structured_output()` для получения типизированного ответа. Измеряет время генерации через `time.perf_counter()`. Если Ollama недоступна — 503. Если inference упал — 502.
-
-**`POST /local/compare`** — сравнение оценки одной и той же работы локальной и облачной моделью. Запускает обе модели последовательно (не параллельно — чтобы корректно измерить время каждой). Возвращает результаты обеих, разницу в баллах и какая модель быстрее.
-
-**`POST /local/embed`** — генерация embeddings локальной моделью. Принимает список текстов, возвращает для каждого размерность вектора и превью первых 5 значений. Полные векторы не возвращаем — они слишком большие для JSON-ответа.
-
-### Шаг 4. Регистрация и тестирование
-
-**Регистрация роутера** в `app/api/router.py`:
-
-```python
-from app.api.v1.local import router as local_router
-
-api_router.include_router(local_router)
-```
-
-**Подготовка Ollama:**
+Подготовка: убедись, что Ollama установлена и запущена, модели скачаны.
 
 ```bash
 ollama serve
@@ -1060,161 +698,312 @@ ollama pull nomic-embed-text
 ollama list
 ```
 
-**Установка зависимостей:**
-
 ```bash
-pip install langchain-ollama ollama
+pip install langchain-ollama langchain-anthropic ollama
 ```
 
-**Тестирование через curl:**
+### Пример 1. Ollama — проверка и базовое использование
 
-1. Проверка доступных моделей:
+Прямое взаимодействие с Ollama через Python-клиент — без LangChain, чтобы понять, что происходит «под капотом».
 
-```bash
-curl -s http://localhost:8000/api/v1/local/models | python -m json.tool
+```python
+import ollama
+
+models = ollama.list()
+for m in models["models"]:
+    name = m["name"]
+    size_gb = m["size"] / (1024 ** 3)
+    family = m.get("details", {}).get("family", "unknown")
+    quant = m.get("details", {}).get("quantization_level", "unknown")
+    print(f"{name:30s} {size_gb:.1f} GB  family={family}  quant={quant}")
 ```
 
-Ожидаемый ответ:
-
-```json
-{
-    "available": true,
-    "models": [
-        {
-            "name": "llama3.1:8b",
-            "size": "4.7 GB",
-            "family": "llama",
-            "parameter_size": "8.0B",
-            "quantization_level": "Q4_0"
-        },
-        {
-            "name": "nomic-embed-text:latest",
-            "size": "274.0 MB",
-            "family": "nomic-bert",
-            "parameter_size": "137M",
-            "quantization_level": "F16"
-        }
-    ],
-    "error": null
-}
+```python
+response = ollama.chat(
+    model="llama3.1:8b",
+    messages=[{"role": "user", "content": "Что такое квантизация нейросетей? Ответь в 2-3 предложениях."}],
+)
+print(response["message"]["content"])
 ```
 
-2. Оценка локальной моделью:
+```python
+import time
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/local/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The French Revolution began in 1789 with the storming of the Bastille. It was a period of radical political and societal change in France. The revolution led to the end of the monarchy and the rise of Napoleon Bonaparte.",
-    "model_name": "llama3.1:8b",
-    "temperature": 0.3
-  }' | python -m json.tool
+start = time.perf_counter()
+response = ollama.chat(
+    model="llama3.1:8b",
+    messages=[{"role": "user", "content": "2 + 2 = ?"}],
+)
+elapsed_ms = int((time.perf_counter() - start) * 1000)
+print(f"Ответ: {response['message']['content']}")
+print(f"Время: {elapsed_ms} ms")
 ```
 
-Ожидаемый ответ:
+### Пример 2. ChatOllama в LCEL-цепочке
 
-```json
-{
-    "score": 45,
-    "feedback": "The student demonstrates basic knowledge of the French Revolution...",
-    "model_used": "llama3.1:8b",
-    "generation_time_ms": 3200
-}
+ChatOllama реализует Runnable-интерфейс LangChain — подключается к LCEL-цепочкам точно так же, как облачные модели.
+
+```python
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a teacher evaluating student work. Respond in Russian."),
+    ("human", "Оцени работу:\n\n{student_work}"),
+])
+
+llm = ChatOllama(model="llama3.1:8b", temperature=0.3, num_ctx=4096)
+parser = StrOutputParser()
+
+chain = prompt | llm | parser
+
+result = chain.invoke({
+    "student_work": (
+        "The French Revolution began in 1789 with the storming of the Bastille. "
+        "It was a period of radical political and societal change in France. "
+        "The revolution led to the end of the monarchy and the rise of Napoleon Bonaparte."
+    ),
+})
+print(result)
 ```
 
-3. Сравнение локальной и облачной модели:
+Structured output — получаем Pydantic-объект вместо текста:
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/local/compare \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The French Revolution began in 1789 with the storming of the Bastille. It was a period of radical political and societal change in France.",
-    "local_model": "llama3.1:8b",
-    "cloud_model": "claude-sonnet-4-20250514"
-  }' | python -m json.tool
+```python
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+import time
+
+class AssessmentResult(BaseModel):
+    score: int = Field(ge=0, le=100, description="Score from 0 to 100")
+    feedback: str = Field(description="Brief feedback in 2-3 sentences")
+
+prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an expert teacher evaluating student work.\n"
+        "Rubric: Evaluate the quality on a scale of 0-100. Provide detailed feedback.",
+    ),
+    ("human", "Student work:\n\n{student_work}"),
+])
+
+llm = ChatOllama(model="llama3.1:8b", temperature=0)
+structured_llm = llm.with_structured_output(AssessmentResult)
+chain = prompt | structured_llm
+
+start = time.perf_counter()
+result = chain.invoke({
+    "student_work": (
+        "The French Revolution began in 1789 with the storming of the Bastille. "
+        "It was a period of radical political and societal change in France."
+    ),
+})
+elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+print(f"Score:    {result.score}")
+print(f"Feedback: {result.feedback}")
+print(f"Time:     {elapsed_ms} ms")
 ```
 
-4. Генерация embeddings:
+Streaming — токены возвращаются по мере генерации:
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/local/embed \
-  -H "Content-Type: application/json" \
-  -d '{
-    "texts": [
-      "Excellent essay with deep analysis",
-      "Poor work, lacks understanding"
-    ],
-    "model_name": "nomic-embed-text"
-  }' | python -m json.tool
+```python
+from langchain_ollama import ChatOllama
+
+llm = ChatOllama(model="llama3.1:8b", temperature=0.3)
+
+for chunk in llm.stream("Перечисли 3 причины Французской революции."):
+    print(chunk.content, end="", flush=True)
+print()
 ```
 
-Ожидаемый ответ:
+### Пример 3. Сравнение облачной и локальной модели
 
-```json
-{
-    "results": [
-        {
-            "text": "Excellent essay with deep analysis",
-            "vector_dim": 768,
-            "vector_preview": [0.0234, -0.0567, 0.1234, -0.0891, 0.0456]
-        },
-        {
-            "text": "Poor work, lacks understanding",
-            "vector_dim": 768,
-            "vector_preview": [-0.0123, 0.0789, -0.0345, 0.0678, -0.0234]
-        }
-    ],
-    "model_used": "nomic-embed-text",
-    "total_texts": 2,
-    "dimension": 768
-}
+Одна и та же задача, два разных провайдера — измеряем качество и скорость.
+
+```python
+import time
+from langchain_ollama import ChatOllama
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+class QuickScore(BaseModel):
+    score: int = Field(ge=0, le=100)
+    feedback: str
+
+prompt = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "You are an expert teacher. "
+        "Evaluate the student work on a scale of 0-100. Provide brief feedback.",
+    ),
+    ("human", "Student work:\n\n{student_work}"),
+])
+
+student_work = (
+    "The French Revolution began in 1789 with the storming of the Bastille. "
+    "It was a period of radical political and societal change in France. "
+    "The revolution led to the end of the monarchy and the rise of Napoleon Bonaparte."
+)
+
+local_llm = ChatOllama(model="llama3.1:8b", temperature=0)
+cloud_llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+
+local_chain = prompt | local_llm.with_structured_output(QuickScore)
+cloud_chain = prompt | cloud_llm.with_structured_output(QuickScore)
+
+invoke_input = {"student_work": student_work}
+
+start = time.perf_counter()
+local_result = local_chain.invoke(invoke_input)
+local_ms = int((time.perf_counter() - start) * 1000)
+
+start = time.perf_counter()
+cloud_result = cloud_chain.invoke(invoke_input)
+cloud_ms = int((time.perf_counter() - start) * 1000)
+
+print(f"{'':15s} {'Score':>6s}  {'Time':>8s}  Feedback")
+print(f"{'Llama 3.1 8B':15s} {local_result.score:6d}  {local_ms:7d}ms  {local_result.feedback[:80]}")
+print(f"{'Claude Sonnet':15s} {cloud_result.score:6d}  {cloud_ms:7d}ms  {cloud_result.feedback[:80]}")
+print(f"\nРазница в баллах: {abs(local_result.score - cloud_result.score)}")
+print(f"Быстрее: {'local' if local_ms < cloud_ms else 'cloud'}")
 ```
 
-**Тестирование fallback-поведения:**
+### Пример 4. Локальные embeddings (OllamaEmbeddings)
 
-Остановите Ollama и проверьте, что эндпоинты корректно возвращают ошибки:
+Бесплатные векторные представления текста — для RAG, поиска похожих работ, кластеризации.
 
-```bash
-ollama stop
+```python
+from langchain_ollama import OllamaEmbeddings
 
-curl -s http://localhost:8000/api/v1/local/models | python -m json.tool
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+vector = embeddings.embed_query("Студент продемонстрировал глубокое понимание темы")
+print(f"Dimensions: {len(vector)}")
+print(f"Preview:    {vector[:5]}")
 ```
 
-Ожидаемый ответ:
+Batch-обработка и сравнение близости текстов:
 
-```json
-{
-    "available": false,
-    "models": [],
-    "error": "Ollama server is not running. Start it with: ollama serve"
-}
+```python
+from langchain_ollama import OllamaEmbeddings
+import math
+
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+texts = [
+    "Отличная работа с глубоким анализом",
+    "Превосходное эссе с детальным разбором",
+    "Слабая работа без понимания материала",
+]
+
+vectors = embeddings.embed_documents(texts)
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+print(f"Модель: nomic-embed-text, размерность: {len(vectors[0])}")
+for i in range(len(texts)):
+    for j in range(i + 1, len(texts)):
+        sim = cosine_similarity(vectors[i], vectors[j])
+        print(f"  sim('{texts[i][:40]}...', '{texts[j][:40]}...') = {sim:.4f}")
+```
+
+### Пример 5. Fallback — облако + локальная модель
+
+Облачная модель как primary, локальная как запасной вариант. Если Claude API недоступен, LangChain автоматически переключится на Ollama.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
+from langchain_core.output_parsers import StrOutputParser
+
+primary = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
+fallback = ChatOllama(model="llama3.1:8b", temperature=0.3)
+
+resilient_llm = primary.with_fallbacks([fallback])
+chain = resilient_llm | StrOutputParser()
+
+result = chain.invoke("Перечисли 3 причины Французской революции.")
+print(result)
+```
+
+Fallback с structured output — `.with_structured_output()` нужен на обеих моделях:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field
+
+class AssessmentResult(BaseModel):
+    score: int = Field(ge=0, le=100)
+    feedback: str
+
+primary = ChatAnthropic(model="claude-sonnet-4-20250514").with_structured_output(AssessmentResult)
+fallback = ChatOllama(model="llama3.1:8b").with_structured_output(AssessmentResult)
+
+chain = primary.with_fallbacks([fallback])
+
+result = chain.invoke("Evaluate this essay: The French Revolution began in 1789...")
+print(f"Score: {result.score}")
+print(f"Feedback: {result.feedback}")
+```
+
+Выбор модели через переменную окружения — переключение без изменения кода:
+
+```python
+import os
+from langchain_ollama import ChatOllama
+from langchain_anthropic import ChatAnthropic
+
+def get_llm():
+    provider = os.getenv("LLM_PROVIDER", "ollama")
+    if provider == "ollama":
+        return ChatOllama(
+            model=os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+            temperature=0.3,
+        )
+    if provider == "anthropic":
+        return ChatAnthropic(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            temperature=0.3,
+        )
+    raise ValueError(f"Unknown provider: {provider}")
+
+llm = get_llm()
+response = llm.invoke("Что такое LCEL?")
+print(response.content)
 ```
 
 ---
 
 ## Чеклист самопроверки
 
-После выполнения всех шагов убедись, что можешь ответить «да» на каждый пункт:
+После выполнения всех примеров убедись, что можешь ответить «да» на каждый пункт:
 
-- [ ] **Ollama установлена и работает.** `ollama --version` выводит версию, `curl http://localhost:11434` возвращает `Ollama is running`.
+- [ ] **Ollama установлена и работает.** `ollama --version` выводит версию, `ollama list` показывает скачанные модели.
 
 - [ ] **Модель скачана.** `ollama list` показывает хотя бы `llama3.1:8b` и `nomic-embed-text`.
 
-- [ ] **GET `/api/v1/local/models`** возвращает список моделей с метаданными (name, size, family).
+- [ ] **ollama Python-клиент.** Умеешь вызвать `ollama.chat()`, `ollama.list()` и получить ответ.
 
-- [ ] **POST `/api/v1/local/assess`** принимает студенческую работу и возвращает `score` (0-100) и `feedback` от локальной модели.
-
-- [ ] **POST `/api/v1/local/compare`** возвращает оценки от обеих моделей, `score_difference` и `faster_model`.
-
-- [ ] **POST `/api/v1/local/embed`** возвращает размерность вектора и preview для каждого текста.
-
-- [ ] **Обработка ошибок.** При остановленном Ollama: `/models` возвращает `available: false`, остальные эндпоинты — 503 с понятным сообщением.
-
-- [ ] **ChatOllama в LCEL.** Умеешь построить цепочку `prompt | ChatOllama(...) | parser` и вызвать через `ainvoke()`.
+- [ ] **ChatOllama в LCEL.** Умеешь построить цепочку `prompt | ChatOllama(...) | parser` и вызвать через `invoke()`.
 
 - [ ] **Structured output с Ollama.** `ChatOllama(...).with_structured_output(MySchema)` возвращает Pydantic-объект.
 
+- [ ] **Сравнение моделей.** Можешь запустить одну и ту же задачу на локальной и облачной модели, сравнить score и время.
+
+- [ ] **Локальные embeddings.** `OllamaEmbeddings(model="nomic-embed-text")` возвращает векторы нужной размерности.
+
 - [ ] **Fallback-цепочка.** Можешь написать `primary.with_fallbacks([fallback])`, где primary — облачная модель, fallback — локальная.
+
+- [ ] **Переключение провайдера.** Умеешь переключать модель через переменную окружения без изменения кода.
 
 ---
 
@@ -1283,7 +1072,7 @@ OutputParserException: Failed to parse output
 
 ```python
 llm = ChatOllama(model="llama3.1:8b", format="json", temperature=0)
-structured_llm = llm.with_structured_output(_AssessmentOutput)
+structured_llm = llm.with_structured_output(AssessmentResult)
 ```
 
 Явное указание `format="json"` повышает надёжность. Также помогает `temperature=0` — убирает случайность в формате ответа.

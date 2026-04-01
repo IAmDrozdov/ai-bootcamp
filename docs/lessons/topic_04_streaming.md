@@ -1,8 +1,7 @@
 # Тема 4: Streaming — ответ LLM в реальном времени
 
 > **Пререквизиты:** [Тема 1](topic_01_prompt_engineering.md), [Тема 2](topic_02_langchain_lcel.md), [Тема 3](topic_03_structured_output.md)
-> **Что добавим в проект:** `app/api/v1/streaming.py` — роутер с 4 эндпоинтами
-> **Зависимости:** `langchain-core`, `langchain-anthropic`, `sse-starlette`, `pydantic`
+> **Зависимости:** `langchain-core`, `langchain-anthropic`, `pydantic`
 
 ---
 
@@ -217,22 +216,20 @@ source.addEventListener("end", (e) => {
 
 Стандартный `EventSource` API поддерживает только GET. Для POST используйте библиотеки: `eventsource-parser`, `fetch-event-source`, или ручной парсинг `fetch()` с `ReadableStream`.
 
-### 6. EventSourceResponse в FastAPI
+### 6. SSE (Server-Sent Events) — отправка потока клиенту
 
-`sse-starlette` предоставляет `EventSourceResponse` — ASGI-совместимый response для SSE:
+SSE — это протокол, в котором сервер отправляет поток событий по HTTP. Каждое событие — текстовый блок с полями `event`, `data`, `id`. Библиотека `sse-starlette` предоставляет `EventSourceResponse` для ASGI-приложений:
 
 ```python
 from sse_starlette.sse import EventSourceResponse
 
-@router.post("/stream")
-async def stream(request: Request):
-    async def generate():
-        yield {"event": "start", "data": "{}"}
-        async for token in get_tokens():
-            yield {"event": "token", "data": json.dumps({"content": token})}
-        yield {"event": "end", "data": "{}"}
+async def generate():
+    yield {"event": "start", "data": "{}"}
+    async for token in get_tokens():
+        yield {"event": "token", "data": json.dumps({"content": token})}
+    yield {"event": "end", "data": "{}"}
 
-    return EventSourceResponse(generate())
+response = EventSourceResponse(generate())
 ```
 
 **Формат yield:**
@@ -243,35 +240,29 @@ async def stream(request: Request):
 
 **Обработка отключения клиента:**
 
-Если клиент закрывает соединение, `EventSourceResponse` автоматически отменяет генератор. Но если внутри генератора длительная операция (например, вызов LLM), отмена произойдёт только при следующем `yield`. Для корректной обработки:
+Если клиент закрывает соединение, `EventSourceResponse` автоматически отменяет генератор. Но если внутри генератора длительная операция (например, вызов LLM), отмена произойдёт только при следующем `yield`. Генератор должен периодически проверять состояние соединения:
 
 ```python
-from starlette.requests import Request
-
-@router.post("/stream")
-async def stream(request: Request):
-    async def generate():
-        async for chunk in chain.astream(data):
-            if await request.is_disconnected():
-                break
-            if chunk.content:
-                yield {"data": chunk.content}
-
-    return EventSourceResponse(generate())
+async def generate(is_disconnected):
+    async for chunk in chain.astream(data):
+        if is_disconnected():
+            break
+        if chunk.content:
+            yield {"data": chunk.content}
 ```
 
 ### 7. Structured Output и Streaming — несовместимость и обходные пути
 
 `with_structured_output()` использует tool calling API: модель генерирует JSON как аргумент tool call, который парсится целиком. Невозможно распарсить половину JSON в Pydantic-объект — `{"overall_score": 85, "summary": "The ess` — это невалидный JSON.
 
-**Production-стратегия — два эндпоинта:**
+**Production-стратегия — два режима:**
 
-| Эндпоинт | Метод | Для кого | Ответ |
+| Режим | Метод | Для кого | Ответ |
 |---|---|---|---|
-| `POST /assess` | `ainvoke()` | API-to-API | `AssessmentResponse` (JSON) |
-| `POST /assess/stream` | `astream()` | UI / фронтенд | Поток токенов (SSE) |
+| Structured | `ainvoke()` | API-to-API | Pydantic-объект (JSON) |
+| Streaming | `astream()` | UI / фронтенд | Поток токенов |
 
-Стриминговый endpoint использует **raw LLM** (без structured output) и передаёт текст токен за токеном. В проекте это реализовано: `assess()` возвращает структурированный ответ, `assess_stream()` стримит текст.
+Structured-режим использует `with_structured_output()` и возвращает полный объект. Streaming-режим использует **raw LLM** (без structured output) и передаёт текст токен за токеном.
 
 **Экспериментальный вариант — partial JSON parsing:**
 
@@ -498,19 +489,14 @@ EventSourceResponse(
 ```python
 import json
 from sse_starlette.sse import EventSourceResponse
-from fastapi import APIRouter
 
-router = APIRouter()
+async def generate():
+    yield {"event": "start", "data": json.dumps({"status": "ok"})}
+    for i in range(10):
+        yield {"event": "token", "data": json.dumps({"index": i, "content": f"word_{i}"})}
+    yield {"event": "end", "data": json.dumps({"total": 10})}
 
-@router.post("/stream")
-async def stream_endpoint():
-    async def generate():
-        yield {"event": "start", "data": json.dumps({"status": "ok"})}
-        for i in range(10):
-            yield {"event": "token", "data": json.dumps({"index": i, "content": f"word_{i}"})}
-        yield {"event": "end", "data": json.dumps({"total": 10})}
-
-    return EventSourceResponse(generate(), ping=15)
+response = EventSourceResponse(generate(), ping=15)
 ```
 
 ---
@@ -629,72 +615,92 @@ print(f"Usage: {accumulated.usage_metadata}")
 
 ---
 
-## Практика: роутер `/api/v1/streaming`
+## Практика
 
-### Шаг 1. Схемы ответов
-
-Для SSE-эндпоинтов основные ответы отправляются как события. Но нам нужны Pydantic-модели для типизации данных внутри событий и для обычных JSON-эндпоинтов.
+### Пример 1: Базовый стриминг с astream()
 
 ```python
-from pydantic import BaseModel, Field
-
-
-class StreamingRequest(BaseModel):
-    student_work: str
-    rubric_id: str | None = "essay_default"
-
-
-class ModelPricing(BaseModel):
-    input_per_million: float = Field(description="USD per 1M input tokens")
-    output_per_million: float = Field(description="USD per 1M output tokens")
-
-
-class PricingResponse(BaseModel):
-    current_model: str
-    pricing: ModelPricing
-    all_models: dict[str, ModelPricing]
-```
-
-### Шаг 2. Создание роутера `app/api/v1/streaming.py`
-
-```python
-import json
-import time
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
-from langchain_core.callbacks import AsyncCallbackHandler
+import asyncio
+from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.dependencies import LLMDep, RubricStoreDep, SettingsDep
-from app.schemas.assessment import AssessmentRequest
-from app.schemas.rubric import Rubric
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_GOOD_EXAMPLE,
-    FEW_SHOT_BAD_EXAMPLE,
-)
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor. Evaluate the text and provide detailed feedback."),
+    ("human", "Assess this student work:\n\n{student_work}"),
+])
+chain = prompt | llm
 
-router = APIRouter(prefix="/streaming", tags=["lesson-4-streaming"])
+
+async def main():
+    full_message = None
+    async for chunk in chain.astream(
+        {"student_work": "Climate change is a major threat. Rising temperatures cause ice to melt."},
+    ):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+        full_message = chunk if full_message is None else full_message + chunk
+
+    print(f"\n\nFull content length: {len(full_message.content)}")
+    print(f"Usage: {full_message.usage_metadata}")
+
+
+asyncio.run(main())
+```
+
+Каждый `AIMessageChunk` содержит фрагмент текста. Оператор `+` объединяет chunk-и — в конце `full_message` эквивалентен результату `ainvoke()`. Поле `usage_metadata` доступно после объединения всех chunk-ов.
+
+### Пример 2: astream_events() — детальные события chain
+
+```python
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514").with_config({"run_name": "assessor_llm"})
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor."),
+    ("human", "Assess:\n\n{student_work}"),
+])
+chain = prompt | llm
+
+
+async def main():
+    token_count = 0
+    async for event in chain.astream_events(
+        {"student_work": "Climate change is a major threat."},
+        version="v2",
+        include_names=["assessor_llm"],
+    ):
+        kind = event["event"]
+        if kind == "on_chat_model_start":
+            print(">>> LLM started generation")
+        elif kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                token_count += 1
+                print(chunk.content, end="", flush=True)
+        elif kind == "on_chat_model_end":
+            print(f"\n>>> LLM finished. Chunks received: {token_count}")
+
+
+asyncio.run(main())
+```
+
+`astream_events()` с `version="v2"` выдаёт типизированные события для каждого этапа chain. Фильтр `include_names` ограничивает поток событиями от конкретного runnable — полезно для chain с несколькими LLM-вызовами.
+
+### Пример 3: Подсчёт токенов и стоимости через callback
+
+```python
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.prompts import ChatPromptTemplate
 
 MODEL_PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-haiku-3-5-20241022": {"input": 0.80, "output": 4.0},
 }
-
-DEFAULT_PRICING = {"input": 3.0, "output": 15.0}
-
-
-class ModelPricing(BaseModel):
-    input_per_million: float = Field(description="USD per 1M input tokens")
-    output_per_million: float = Field(description="USD per 1M output tokens")
-
-
-class PricingResponse(BaseModel):
-    current_model: str
-    pricing: ModelPricing
-    all_models: dict[str, ModelPricing]
 
 
 class UsageTracker(AsyncCallbackHandler):
@@ -712,315 +718,99 @@ class UsageTracker(AsyncCallbackHandler):
         for generation_list in response.generations:
             for gen in generation_list:
                 msg = getattr(gen, "message", None)
-                if msg:
-                    meta = getattr(msg, "usage_metadata", None)
-                    if meta:
-                        self.input_tokens = meta.get("input_tokens", 0)
-                        self.output_tokens = meta.get("output_tokens", 0)
-                        return
+                if msg and getattr(msg, "usage_metadata", None):
+                    self.input_tokens = msg.usage_metadata.get("input_tokens", 0)
+                    self.output_tokens = msg.usage_metadata.get("output_tokens", 0)
+                    return
 
 
-def _resolve_rubric(request: AssessmentRequest, rubrics: dict[str, Rubric]) -> Rubric:
-    if request.rubric:
-        return request.rubric
-    rubric_id = request.rubric_id or "essay_default"
-    if rubric_id not in rubrics:
-        raise HTTPException(status_code=404, detail=f"Rubric '{rubric_id}' not found")
-    return rubrics[rubric_id]
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writing assessor."),
+    ("human", "Assess:\n\n{student_work}"),
+])
+chain = prompt | llm
 
 
-def _format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-def _build_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-
-@router.post("/events")
-async def stream_events(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> EventSourceResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    prompt = _build_prompt()
-    chain = prompt | llm
-
-    async def event_generator():
-        token_count = 0
-        start_time = time.monotonic()
-
-        yield {"event": "start", "data": json.dumps({"message": "Assessment started"})}
-
-        async for event in chain.astream_events(
-            {"student_work": request.student_work, "rubric": rubric_text},
-            version="v2",
-        ):
-            if event["event"] == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if chunk.content:
-                    token_count += 1
-                    yield {
-                        "event": "token",
-                        "data": json.dumps({"content": chunk.content}),
-                    }
-
-        elapsed = round(time.monotonic() - start_time, 2)
-        yield {
-            "event": "end",
-            "data": json.dumps({"tokens": token_count, "elapsed": elapsed}),
-        }
-
-    return EventSourceResponse(event_generator())
-
-
-@router.post("/progress")
-async def stream_with_progress(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> EventSourceResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    criterion_names = [c.name.lower() for c in rubric.criteria]
-    total_criteria = len(criterion_names)
-    prompt = _build_prompt()
-    chain = prompt | llm
-
-    async def event_generator():
-        buffer = ""
-        detected: set[str] = set()
-
-        yield {
-            "event": "progress",
-            "data": json.dumps({
-                "stage": "analyzing",
-                "current": 0,
-                "total": total_criteria,
-                "message": "Analyzing student work...",
-            }),
-        }
-
-        async for chunk in chain.astream(
-            {"student_work": request.student_work, "rubric": rubric_text},
-        ):
-            if not chunk.content:
-                continue
-
-            yield {"event": "token", "data": json.dumps({"content": chunk.content})}
-
-            buffer += chunk.content.lower()
-            for name in criterion_names:
-                if name not in detected and name in buffer:
-                    detected.add(name)
-                    yield {
-                        "event": "progress",
-                        "data": json.dumps({
-                            "stage": "scoring",
-                            "current": len(detected),
-                            "total": total_criteria,
-                            "criterion": name,
-                            "message": f"Evaluating criterion {len(detected)}/{total_criteria}: {name}",
-                        }),
-                    }
-
-        yield {
-            "event": "progress",
-            "data": json.dumps({
-                "stage": "complete",
-                "current": total_criteria,
-                "total": total_criteria,
-                "message": "Assessment complete",
-            }),
-        }
-
-    return EventSourceResponse(event_generator())
-
-
-@router.post("/with-usage")
-async def stream_with_usage(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-    settings: SettingsDep,
-) -> EventSourceResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    prompt = _build_prompt()
-    chain = prompt | llm
+async def main():
     tracker = UsageTracker()
+    async for chunk in chain.astream(
+        {"student_work": "Climate change is a major threat. Rising temperatures cause ice to melt."},
+        config={"callbacks": [tracker]},
+    ):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
 
-    async def event_generator():
-        start_time = time.monotonic()
+    model_name = "claude-sonnet-4-20250514"
+    pricing = MODEL_PRICING[model_name]
+    input_cost = tracker.input_tokens * pricing["input"] / 1_000_000
+    output_cost = tracker.output_tokens * pricing["output"] / 1_000_000
 
-        async for chunk in chain.astream(
-            {"student_work": request.student_work, "rubric": rubric_text},
-            config={"callbacks": [tracker]},
-        ):
-            if chunk.content:
-                yield {"event": "token", "data": json.dumps({"content": chunk.content})}
-
-        elapsed = round(time.monotonic() - start_time, 2)
-        pricing = MODEL_PRICING.get(settings.model_name, DEFAULT_PRICING)
-        input_cost = tracker.input_tokens * pricing["input"] / 1_000_000
-        output_cost = tracker.output_tokens * pricing["output"] / 1_000_000
-
-        yield {
-            "event": "usage",
-            "data": json.dumps({
-                "input_tokens": tracker.input_tokens,
-                "output_tokens": tracker.output_tokens,
-                "total_tokens": tracker.input_tokens + tracker.output_tokens,
-                "cost_usd": round(input_cost + output_cost, 6),
-                "elapsed_seconds": elapsed,
-                "model": settings.model_name,
-            }),
-        }
-
-    return EventSourceResponse(event_generator())
+    print(f"\n\nInput tokens:  {tracker.input_tokens}")
+    print(f"Output tokens: {tracker.output_tokens}")
+    print(f"Cost (USD):    {input_cost + output_cost:.6f}")
 
 
-@router.get("/pricing")
-async def get_pricing(settings: SettingsDep) -> PricingResponse:
-    current_pricing = MODEL_PRICING.get(settings.model_name, DEFAULT_PRICING)
-    return PricingResponse(
-        current_model=settings.model_name,
-        pricing=ModelPricing(
-            input_per_million=current_pricing["input"],
-            output_per_million=current_pricing["output"],
-        ),
-        all_models={
-            name: ModelPricing(
-                input_per_million=p["input"],
-                output_per_million=p["output"],
-            )
-            for name, p in MODEL_PRICING.items()
-        },
-    )
+asyncio.run(main())
 ```
 
-**Как каждый эндпоинт связан с теорией:**
+`UsageTracker` реализует `AsyncCallbackHandler` и перехватывает `on_llm_end` — в этот момент провайдер возвращает метаданные о потреблении токенов. Callback передаётся через `config`, не влияя на логику chain.
 
-| Эндпоинт | Концепция из теории | Что демонстрирует |
-|---|---|---|
-| `POST /events` | §4 astream_events, §5 SSE | Типизированные SSE-события с фильтрацией по типу |
-| `POST /progress` | §4 фильтрация, §3 astream | Эвристическое определение прогресса по содержимому стрима |
-| `POST /with-usage` | §8 Callback handlers | Подсчёт токенов и стоимости через AsyncCallbackHandler |
-| `GET /pricing` | §9 стоимость | Справочный endpoint для расчёта стоимости |
-
-### Шаг 3. Регистрация в `app/api/router.py`
+### Пример 4: Стриминг с разными типами chain
 
 ```python
-from fastapi import APIRouter
+import asyncio
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from pydantic import BaseModel
 
-from app.api.v1 import assessment, rubrics, streaming
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant."),
+    ("human", "{question}"),
+])
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(streaming.router)
+
+class MathAnswer(BaseModel):
+    answer: int
+    explanation: str
+
+
+async def main():
+    print("=== prompt | llm → AIMessageChunk ===")
+    chain_msg = prompt | llm
+    async for chunk in chain_msg.astream({"question": "What is 2+2?"}):
+        if chunk.content:
+            print(chunk.content, end="", flush=True)
+    print("\n")
+
+    print("=== prompt | llm | StrOutputParser → str ===")
+    chain_str = prompt | llm | StrOutputParser()
+    async for chunk in chain_str.astream({"question": "What is 2+2?"}):
+        print(chunk, end="", flush=True)
+    print("\n")
+
+    print("=== with_structured_output → single chunk ===")
+    structured_llm = llm.with_structured_output(MathAnswer)
+    chain_structured = prompt | structured_llm
+    async for chunk in chain_structured.astream({"question": "What is 2+2?"}):
+        print(f"Chunk: {chunk}")
+
+
+asyncio.run(main())
 ```
 
-### Шаг 4. Тестирование с curl
+Тип chunk зависит от последнего элемента chain. `StrOutputParser` пропускает строки, `with_structured_output` собирает полный JSON — стриминг отдаёт один chunk.
 
-Запустите сервер:
+**Связь примеров с теорией:**
 
-```bash
-uvicorn app.main:app --reload
-```
-
-**POST /events** — типизированные SSE-события:
-
-```bash
-curl -N -X POST http://localhost:8000/api/v1/streaming/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Ожидаемый вывод — поток SSE-событий:
-
-```
-event: start
-data: {"message": "Assessment started"}
-
-event: token
-data: {"content": "The"}
-
-event: token
-data: {"content": " essay"}
-
-...
-
-event: end
-data: {"tokens": 342, "elapsed": 4.21}
-```
-
-Флаг `-N` отключает буферизацию curl — без него события будут приходить пачками.
-
-**POST /progress** — прогресс по критериям:
-
-```bash
-curl -N -X POST http://localhost:8000/api/v1/streaming/progress \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Между событиями `token` будут появляться события `progress` при обнаружении имён критериев из рубрики в стриме.
-
-**POST /with-usage** — стриминг с подсчётом токенов:
-
-```bash
-curl -N -X POST http://localhost:8000/api/v1/streaming/with-usage \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Последнее событие — `usage` с информацией о токенах и стоимости:
-
-```
-event: usage
-data: {"input_tokens": 1250, "output_tokens": 340, "total_tokens": 1590, "cost_usd": 0.008850, "elapsed_seconds": 3.41, "model": "claude-sonnet-4-20250514"}
-```
-
-**GET /pricing** — информация о ценах:
-
-```bash
-curl -s http://localhost:8000/api/v1/streaming/pricing | python -m json.tool
-```
-
-```json
-{
-  "current_model": "claude-sonnet-4-20250514",
-  "pricing": {
-    "input_per_million": 3.0,
-    "output_per_million": 15.0
-  },
-  "all_models": {
-    "claude-sonnet-4-20250514": {"input_per_million": 3.0, "output_per_million": 15.0},
-    "claude-haiku-3-5-20241022": {"input_per_million": 0.8, "output_per_million": 4.0}
-  }
-}
-```
+| Пример | Концепция из теории | Что демонстрирует |
+|---|---|---|
+| Пример 1 | §3 astream(), AIMessageChunk | Базовый стриминг, объединение chunk-ов |
+| Пример 2 | §4 astream_events(), фильтрация | Типизированные события, `include_names` |
+| Пример 3 | §8 Callback handlers | Подсчёт токенов и стоимости через AsyncCallbackHandler |
+| Пример 4 | §7 Structured Output + Streaming | Разница поведения стриминга для разных типов chain |
 
 ---
 
@@ -1028,14 +818,12 @@ curl -s http://localhost:8000/api/v1/streaming/pricing | python -m json.tool
 
 - [ ] Почему structured output и streaming несовместимы? Какая production-стратегия решает это?
 - [ ] В чём разница между `astream()` и `astream_events()`? Когда какой использовать?
-- [ ] Объясни SSE: протокол, формат сообщения, отличие от WebSocket.
 - [ ] Что такое TTFT и почему это ключевая UX-метрика для LLM-приложений?
 - [ ] Зачем callback handlers, если можно логировать напрямую в chain?
 - [ ] Как `AIMessageChunk` объединяются в полное сообщение?
 - [ ] Почему нужен `version="v2"` в `astream_events()`?
 - [ ] Как отследить потребление токенов при стриминге через callback?
-- [ ] Что произойдёт, если клиент закроет SSE-соединение во время генерации?
-- [ ] Как обнаружить прогресс оценки (смену критерия) в текстовом стриме?
+- [ ] Как тип последнего элемента chain влияет на тип chunk при стриминге?
 
 ---
 
@@ -1056,36 +844,40 @@ async for chunk in (prompt | llm).astream(data):
 
 `with_structured_output` собирает полный ответ — `astream` отдаст один chunk. Для стриминга используйте raw LLM без structured output.
 
-### 2. Пустые chunk-и в SSE
+### 2. Пустые chunk-и при стриминге
 
 ```python
 async for chunk in chain.astream(data):
-    yield {"data": chunk.content}
+    print(chunk.content, end="")
 ```
 
 ```python
 async for chunk in chain.astream(data):
     if chunk.content:
-        yield {"data": chunk.content}
+        print(chunk.content, end="")
 ```
 
-Некоторые chunk-и приходят пустыми (служебные). Без фильтрации клиент получает пустые SSE-события.
+Некоторые chunk-и приходят с пустым `.content` (служебные). Без проверки код выведет `None` или пустую строку.
 
-### 3. Блокирующий код в async генераторе
+### 3. Блокирующий код в async-функции
 
 ```python
-async def generate():
+import time
+
+async def process():
     time.sleep(1)
     async for chunk in chain.astream(data):
-        yield {"data": chunk.content}
+        print(chunk.content, end="")
 ```
 
 ```python
-async def generate():
+import asyncio
+
+async def process():
     await asyncio.sleep(1)
     async for chunk in chain.astream(data):
         if chunk.content:
-            yield {"data": chunk.content}
+            print(chunk.content, end="")
 ```
 
 `time.sleep()` блокирует event loop и все другие async-операции. Используйте `asyncio.sleep()`.
@@ -1108,19 +900,7 @@ class MyCallback(AsyncCallbackHandler):
         self.tokens = response.llm_output
 ```
 
-В async-контексте (FastAPI) синхронные callbacks блокируют event loop. Всегда используйте `AsyncCallbackHandler`.
-
-### 5. Отсутствие json.dumps в SSE data
-
-```python
-yield {"event": "token", "data": {"content": chunk.content}}
-```
-
-```python
-yield {"event": "token", "data": json.dumps({"content": chunk.content})}
-```
-
-SSE data — строка. Если передать dict, `EventSourceResponse` вызовет `str()`, и клиент получит Python repr вместо JSON.
+В async-контексте синхронные callbacks блокируют event loop. Используйте `AsyncCallbackHandler` при работе с `astream()` и `astream_events()`.
 
 ---
 

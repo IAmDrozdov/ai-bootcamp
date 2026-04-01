@@ -1,8 +1,7 @@
 # Тема 8: Observability
 
 > **Пререквизиты:** [Тема 1-4](topic_01_prompt_engineering.md), рекомендуется [Тема 6](topic_06_langgraph_agents.md)
-> **Что добавим в проект:** `app/schemas/observability.py`, `app/services/langfuse_service.py`, `app/api/v1/observability.py`, обновление `app/config.py`
-> **Зависимости:** `langfuse` (группа `eval`)
+> **Зависимости:** `langfuse`
 
 ---
 
@@ -438,461 +437,280 @@ result = await chain.ainvoke(
 
 ---
 
-## Практика: роутер `/api/v1/observability`
+## Практика
 
-В этой практике мы добавим полноценную observability в проект: трейсинг оценок через Langfuse, аналитику стоимости, управление промптами через API. Каждый endpoint обёрнут в graceful degradation — приложение работает нормально без Langfuse.
+Для работы с примерами установите зависимости и задайте переменные окружения:
 
-### Шаг 1: Схемы данных
+```python
+%pip install langfuse langchain-anthropic langchain-core
+```
 
-Определим Pydantic-модели для observability endpoints. `TracedAssessmentRequest` расширяет обычный assessment request метаданными трейса. `CostReport` агрегирует данные из Langfuse для аналитики.
+```python
+import os
 
-**Файл: `app/schemas/observability.py`**
+os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-..."
+os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-..."
+os.environ["LANGFUSE_HOST"] = "https://cloud.langfuse.com"
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
+```
+
+---
+
+### Пример 1: Подключение Langfuse callback handler
+
+Создаём callback handler и подключаем к простому chain. Langfuse автоматически трейсит все этапы: промпт, LLM-вызов, ответ, токены, стоимость.
+
+```python
+from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+
+handler = LangfuseCallbackHandler(
+    trace_name="hello_langfuse",
+    user_id="demo-user",
+    tags=["lesson-8", "demo"],
+)
+
+print(f"Auth check: {handler.auth_check()}")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.3)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant. Answer concisely."),
+    ("human", "{question}"),
+])
+
+chain = prompt | llm
+
+result = chain.invoke(
+    {"question": "What is observability in LLM applications?"},
+    config={"callbacks": [handler]},
+)
+
+print(f"Response: {result.content[:200]}")
+print(f"Trace ID: {handler.get_trace_id()}")
+print(f"Trace URL: {handler.get_trace_url()}")
+
+handler.flush()
+```
+
+**Связь с теорией:** callback handler перехватывает события `on_chain_start`, `on_chat_model_start`, `on_llm_end`, `on_chain_end` (раздел 3) и автоматически создаёт Trace → Generation в Langfuse. `flush()` отправляет буферизованные данные.
+
+---
+
+### Пример 2: Трейсинг chain со structured output и score
+
+Трейсим chain с Pydantic-output и добавляем score к trace — основа для мониторинга качества.
 
 ```python
 from pydantic import BaseModel, Field
-
-from app.schemas.assessment import AssessmentResponse
-
-
-class TracedAssessmentRequest(BaseModel):
-    student_work: str
-    rubric_id: str | None = Field(default="essay_default")
-    trace_name: str | None = Field(
-        default=None,
-        description="Custom trace name in Langfuse dashboard",
-    )
-    user_id: str | None = Field(default=None, description="User ID for filtering")
-    metadata: dict | None = Field(default=None, description="Arbitrary trace metadata")
-
-
-class TracedAssessmentResponse(BaseModel):
-    assessment: AssessmentResponse
-    trace_id: str = Field(description="Langfuse trace ID")
-    trace_url: str | None = Field(default=None, description="Link to trace in dashboard")
-
-
-class CostReportEntry(BaseModel):
-    trace_id: str
-    trace_name: str | None = None
-    total_cost: float = 0.0
-    latency_ms: float = 0.0
-
-
-class CostReport(BaseModel):
-    entries: list[CostReportEntry]
-    total_cost: float
-    average_cost: float
-    total_traces: int
-
-
-class PromptVersionRequest(BaseModel):
-    name: str = Field(description="Prompt name (e.g. 'assessment-system-prompt')")
-    prompt: str = Field(description="Prompt template text with {{variable}} placeholders")
-    config: dict | None = Field(
-        default=None,
-        description="Model config: temperature, model name, etc.",
-    )
-    labels: list[str] | None = Field(
-        default=None,
-        description="Labels for prompt version: staging, production, etc.",
-    )
-
-
-class PromptVersionResponse(BaseModel):
-    name: str
-    version: int
-
-
-class PromptResponse(BaseModel):
-    name: str
-    version: int
-    prompt: str
-    config: dict | None = None
-```
-
-**Связь с теорией:** `TracedAssessmentResponse` возвращает `trace_id` и `trace_url` — прямая ссылка на trace в Langfuse dashboard (раздел 2). `CostReport` агрегирует `total_cost` и `latency_ms` с каждого trace (раздел 4). `PromptVersionRequest` с `labels` поддерживает жизненный цикл промпта: `staging` → `production` (раздел 5).
-
----
-
-### Шаг 2: Конфигурация
-
-Добавим настройки Langfuse в `Settings`. Все поля имеют дефолтные значения — приложение работает без Langfuse.
-
-**Обновление файла `app/config.py`:**
-
-```python
-from functools import lru_cache
-
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
-
-    anthropic_api_key: str = ""
-    openai_api_key: str = ""
-    model_name: str = "claude-sonnet-4-20250514"
-    temperature: float = 0.3
-    max_tokens: int = 4096
-
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
-    langfuse_host: str = "https://cloud.langfuse.com"
-    langfuse_enabled: bool = False
-
-
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-```
-
-Добавьте переменные в `.env`:
-
-```
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_HOST=https://cloud.langfuse.com
-LANGFUSE_ENABLED=true
-```
-
-**Связь с теорией:** `langfuse_enabled` — флаг для graceful degradation (раздел 3). Если `False` или ключи не заданы — трейсинг отключён, endpoints возвращают 503. Приложение не падает.
-
----
-
-### Шаг 3: Сервис Langfuse
-
-Создадим обёртку над Langfuse SDK. Функции возвращают `None` при ошибке — ни один endpoint не зависит от Langfuse как hard dependency.
-
-**Файл: `app/services/langfuse_service.py`**
-
-```python
-import logging
-
 from langfuse import Langfuse
 from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
-
-from app.config import Settings
-
-logger = logging.getLogger(__name__)
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
 
 
-def create_langfuse_handler(
-    config: Settings,
-    trace_name: str | None = None,
-    user_id: str | None = None,
-    session_id: str | None = None,
-    metadata: dict | None = None,
-    tags: list[str] | None = None,
-) -> LangfuseCallbackHandler | None:
-    if not config.langfuse_enabled:
-        return None
-    if not config.langfuse_public_key or not config.langfuse_secret_key:
-        return None
-    try:
-        return LangfuseCallbackHandler(
-            public_key=config.langfuse_public_key,
-            secret_key=config.langfuse_secret_key,
-            host=config.langfuse_host,
-            trace_name=trace_name,
-            user_id=user_id,
-            session_id=session_id,
-            metadata=metadata,
-            tags=tags,
-        )
-    except Exception:
-        logger.warning("Failed to create Langfuse callback handler", exc_info=True)
-        return None
+class TextAnalysis(BaseModel):
+    summary: str = Field(description="One-sentence summary")
+    sentiment: str = Field(description="positive, negative, or neutral")
+    key_topics: list[str] = Field(description="Main topics mentioned")
+    confidence: float = Field(description="Confidence score 0.0-1.0")
 
 
-def get_langfuse_client(config: Settings) -> Langfuse | None:
-    if not config.langfuse_enabled:
-        return None
-    if not config.langfuse_public_key or not config.langfuse_secret_key:
-        return None
-    try:
-        return Langfuse(
-            public_key=config.langfuse_public_key,
-            secret_key=config.langfuse_secret_key,
-            host=config.langfuse_host,
-        )
-    except Exception:
-        logger.warning("Failed to create Langfuse client", exc_info=True)
-        return None
-```
-
-**Связь с теорией:** `create_langfuse_handler` инкапсулирует создание callback handler (раздел 3) с graceful degradation. `get_langfuse_client` создаёт Langfuse-клиент для программного доступа к API — scores, prompt management, fetch_traces (раздел 2, 5, 6).
-
----
-
-### Шаг 4: Роутер
-
-Создадим роутер с четырьмя endpoints: трейсированная оценка, отчёт по стоимости, управление версиями промптов и получение промпта.
-
-**Файл: `app/api/v1/observability.py`**
-
-```python
-from fastapi import APIRouter, HTTPException, Query
-
-from app.dependencies import ChainDep, RubricStoreDep, SettingsDep
-from app.schemas.observability import (
-    CostReport,
-    CostReportEntry,
-    PromptResponse,
-    PromptVersionRequest,
-    PromptVersionResponse,
-    TracedAssessmentRequest,
-    TracedAssessmentResponse,
+handler = LangfuseCallbackHandler(
+    trace_name="text_analysis",
+    user_id="analyst-1",
+    session_id="analysis-session-001",
+    metadata={"task": "sentiment_and_topics", "version": "1.0"},
+    tags=["analysis", "structured"],
 )
-from app.services.langfuse_service import create_langfuse_handler, get_langfuse_client
 
-router = APIRouter(prefix="/observability", tags=["lesson-8-observability"])
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0)
+structured_llm = llm.with_structured_output(TextAnalysis)
 
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Analyze the following text. Return structured analysis."),
+    ("human", "{text}"),
+])
 
-def _format_rubric_text(rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
+chain = prompt | structured_llm
 
+text = (
+    "Climate change is a global crisis. According to NASA, global temperatures "
+    "have risen 1.1°C since pre-industrial times. The Paris Agreement aims to "
+    "limit warming to 1.5°C, but current policies put us on track for 2.7°C by 2100."
+)
 
-@router.post("/traced-assess")
-async def traced_assess(
-    request: TracedAssessmentRequest,
-    chain: ChainDep,
-    rubrics: RubricStoreDep,
-    settings: SettingsDep,
-) -> TracedAssessmentResponse:
-    rubric = rubrics.get(request.rubric_id or "essay_default")
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
+result = chain.invoke(
+    {"text": text},
+    config={"callbacks": [handler]},
+)
 
-    handler = create_langfuse_handler(
-        settings,
-        trace_name=request.trace_name or "assessment",
-        user_id=request.user_id,
-        metadata=request.metadata,
-        tags=["assessment"],
-    )
+print(f"Summary: {result.summary}")
+print(f"Sentiment: {result.sentiment}")
+print(f"Topics: {result.key_topics}")
+print(f"Confidence: {result.confidence}")
 
-    invoke_config = {"callbacks": [handler]} if handler else {}
-    rubric_text = _format_rubric_text(rubric)
+trace_id = handler.get_trace_id()
 
-    result = await chain.ainvoke(
-        {"student_work": request.student_work, "rubric": rubric_text},
-        config=invoke_config,
-    )
+langfuse = Langfuse()
+langfuse.score(
+    trace_id=trace_id,
+    name="analysis_quality",
+    value=result.confidence,
+    comment="Auto-score from model confidence",
+)
+langfuse.flush()
 
-    trace_id = ""
-    trace_url = None
+print(f"\nTrace ID: {trace_id}")
+print(f"Trace URL: {handler.get_trace_url()}")
 
-    if handler:
-        trace_id = handler.get_trace_id()
-        trace_url = handler.get_trace_url()
-
-        client = get_langfuse_client(settings)
-        if client:
-            client.score(
-                trace_id=trace_id,
-                name="overall_score",
-                value=result.overall_score / max(result.max_overall_score, 1),
-            )
-            client.flush()
-
-        handler.flush()
-
-    return TracedAssessmentResponse(
-        assessment=result,
-        trace_id=trace_id,
-        trace_url=trace_url,
-    )
-
-
-@router.get("/cost-report")
-async def cost_report(
-    settings: SettingsDep,
-    limit: int = Query(default=50, ge=1, le=200),
-) -> CostReport:
-    client = get_langfuse_client(settings)
-    if not client:
-        raise HTTPException(status_code=503, detail="Langfuse is not configured or unavailable")
-
-    try:
-        traces_response = client.fetch_traces(limit=limit)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch traces: {exc}")
-    finally:
-        client.shutdown()
-
-    entries: list[CostReportEntry] = []
-    total_cost = 0.0
-
-    for trace in traces_response.data:
-        cost = trace.total_cost or 0.0
-        total_cost += cost
-        latency = (trace.latency or 0.0) * 1000
-
-        entries.append(
-            CostReportEntry(
-                trace_id=trace.id,
-                trace_name=trace.name,
-                total_cost=cost,
-                latency_ms=round(latency, 1),
-            )
-        )
-
-    average_cost = total_cost / len(entries) if entries else 0.0
-
-    return CostReport(
-        entries=entries,
-        total_cost=round(total_cost, 6),
-        average_cost=round(average_cost, 6),
-        total_traces=len(entries),
-    )
-
-
-@router.post("/prompt-version")
-async def create_prompt_version(
-    request: PromptVersionRequest,
-    settings: SettingsDep,
-) -> PromptVersionResponse:
-    client = get_langfuse_client(settings)
-    if not client:
-        raise HTTPException(status_code=503, detail="Langfuse is not configured or unavailable")
-
-    try:
-        prompt = client.create_prompt(
-            name=request.name,
-            prompt=request.prompt,
-            config=request.config or {},
-            labels=request.labels or [],
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to create prompt: {exc}")
-    finally:
-        client.shutdown()
-
-    return PromptVersionResponse(name=prompt.name, version=prompt.version)
-
-
-@router.get("/prompt/{name}")
-async def get_prompt(
-    name: str,
-    settings: SettingsDep,
-    version: int | None = Query(default=None),
-    label: str | None = Query(default=None),
-) -> PromptResponse:
-    client = get_langfuse_client(settings)
-    if not client:
-        raise HTTPException(status_code=503, detail="Langfuse is not configured or unavailable")
-
-    try:
-        kwargs: dict = {}
-        if version is not None:
-            kwargs["version"] = version
-        if label is not None:
-            kwargs["label"] = label
-
-        prompt = client.get_prompt(name, **kwargs)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Prompt '{name}' not found")
-    finally:
-        client.shutdown()
-
-    return PromptResponse(
-        name=prompt.name,
-        version=prompt.version,
-        prompt=prompt.prompt,
-        config=prompt.config,
-    )
+handler.flush()
 ```
 
-**Связь с теорией:**
-
-- `traced_assess` демонстрирует полный цикл трейсинга из раздела 3: создание handler → передача в `config={"callbacks": [...]}` → автоматический трейсинг → получение `trace_id` → добавление score (раздел 6). Без Langfuse endpoint работает как обычный `/assess`.
-- `cost_report` реализует аналитику из раздела 4: `fetch_traces` получает данные из Langfuse, `total_cost` и `latency` агрегируются для dashboard.
-- `create_prompt_version` и `get_prompt` реализуют жизненный цикл промптов из раздела 5: создание версий через API, получение по имени с фильтрацией по version или label.
+**Связь с теорией:** `session_id` группирует traces в сессии (раздел 2). Score привязывается к trace через `langfuse.score()` (раздел 6) — автоматический score из confidence модели. В dashboard можно отслеживать распределение scores по времени.
 
 ---
 
-### Шаг 5: Регистрация роутера
+### Пример 3: Cost tracking — анализ расходов
 
-Добавим observability-роутер в главный router.
-
-**Обновление файла `app/api/router.py`:**
+Получаем traces из Langfuse и агрегируем данные по стоимости и латентности.
 
 ```python
-from fastapi import APIRouter
+from langfuse import Langfuse
 
-from app.api.v1 import assessment, observability, rubrics
+langfuse = Langfuse()
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(observability.router)
+response = langfuse.fetch_traces(limit=20)
+
+total_cost = 0.0
+for trace in response.data:
+    cost = trace.total_cost or 0.0
+    latency = (trace.latency or 0.0) * 1000
+    total_cost += cost
+    print(f"  {trace.name}: cost=${cost:.4f}, latency={latency:.0f}ms")
+
+avg_cost = total_cost / len(response.data) if response.data else 0.0
+print(f"\nTotal traces: {len(response.data)}")
+print(f"Total cost: ${total_cost:.4f}")
+print(f"Average cost per trace: ${avg_cost:.4f}")
+
+expensive = [t for t in response.data if (t.total_cost or 0) > avg_cost * 2]
+if expensive:
+    print(f"\nAnomalies (cost > 2x average):")
+    for t in expensive:
+        print(f"  {t.id}: ${t.total_cost:.4f} ({t.name})")
+
+langfuse.shutdown()
 ```
+
+**Связь с теорией:** `fetch_traces` возвращает данные с `total_cost` и `latency` (раздел 4). Аномалии — traces со стоимостью > 2× среднего — могут указывать на retry-циклы или раздутые контексты. Эти данные — основа для стратегий оптимизации: prompt compression, model selection, caching (раздел 4).
 
 ---
 
-### Шаг 6: Тестирование
+### Пример 4: Prompt management — версионирование промптов
 
-Запустите сервер:
+Создаём версии промпта в Langfuse, получаем по имени и label. Промпт можно менять в UI без деплоя кода.
 
-```bash
-uvicorn app.main:app --reload
+```python
+from langfuse import Langfuse
+
+langfuse = Langfuse()
+
+prompt_v1 = langfuse.create_prompt(
+    name="analysis-system-prompt",
+    prompt="You are an expert analyst. Task: {{task}}\nContext: {{context}}",
+    config={"temperature": 0.3, "model": "claude-sonnet-4-20250514"},
+    labels=["staging"],
+)
+print(f"Created: {prompt_v1.name} v{prompt_v1.version}")
+
+prompt_v2 = langfuse.create_prompt(
+    name="analysis-system-prompt",
+    prompt="You are a senior analyst with 10 years of experience. Task: {{task}}\nContext: {{context}}\nBe concise.",
+    config={"temperature": 0.2, "model": "claude-sonnet-4-20250514"},
+    labels=["production"],
+)
+print(f"Created: {prompt_v2.name} v{prompt_v2.version}")
+
+staging_prompt = langfuse.get_prompt("analysis-system-prompt", label="staging")
+print(f"\nStaging (v{staging_prompt.version}): {staging_prompt.prompt[:80]}...")
+
+prod_prompt = langfuse.get_prompt("analysis-system-prompt", label="production")
+print(f"Production (v{prod_prompt.version}): {prod_prompt.prompt[:80]}...")
+
+compiled = prod_prompt.compile(
+    task="Summarize quarterly results",
+    context="Revenue grew 15% YoY, operating margin improved to 22%.",
+)
+print(f"\nCompiled prompt:\n{compiled}")
+
+langfuse.shutdown()
 ```
 
-**Оценка с трейсингом:**
+**Связь с теорией:** жизненный цикл промпта из раздела 5 — создание версий, labels (`staging`, `production`), получение по имени. `compile()` подставляет переменные в шаблон. Откат — назначить предыдущей версии label `production`, без изменений в коде.
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/observability/traced-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a global crisis. According to NASA, global temperatures have risen 1.1°C since pre-industrial times. The Paris Agreement aims to limit warming to 1.5°C, but current policies put us on track for 2.7°C by 2100.",
-    "rubric_id": "essay_default",
-    "trace_name": "test-assessment",
-    "user_id": "teacher-1",
-    "metadata": {"experiment": "observability-lesson"}
-  }' | python -m json.tool
+---
+
+### Пример 5: Custom spans и metadata
+
+Создаём trace вручную с вложенными spans для multi-step pipeline. Каждый шаг — отдельный span с input/output.
+
+```python
+import time
+from langfuse import Langfuse
+
+langfuse = Langfuse()
+
+trace = langfuse.trace(
+    name="multi_step_pipeline",
+    user_id="demo-user",
+    input={"raw_text": "Climate change is a global crisis affecting every continent."},
+    metadata={"pipeline_version": "1.0", "source": "lesson-8"},
+    tags=["pipeline", "demo"],
+)
+
+span_preprocess = trace.span(
+    name="preprocessing",
+    input={"raw_text": "Climate change is a global crisis affecting every continent."},
+)
+time.sleep(0.1)
+processed = "climate change is a global crisis affecting every continent."
+span_preprocess.end(output={"cleaned_text": processed, "char_count": len(processed)})
+
+generation = trace.generation(
+    name="summarize",
+    model="claude-sonnet-4-20250514",
+    input=[{"role": "user", "content": f"Summarize in one sentence: {processed}"}],
+    model_parameters={"temperature": 0.3},
+)
+summary = "Climate change is a worldwide emergency impacting all regions."
+generation.end(
+    output=summary,
+    usage={"input": 42, "output": 15},
+)
+
+span_postprocess = trace.span(name="postprocessing")
+final_result = {"summary": summary, "word_count": len(summary.split())}
+span_postprocess.end(output=final_result)
+
+langfuse.score(
+    trace_id=trace.id,
+    name="pipeline_quality",
+    value=0.85,
+    comment="Automated quality check passed",
+)
+
+trace.update(output=final_result)
+
+print(f"Trace ID: {trace.id}")
+print(f"Result: {final_result}")
+
+langfuse.flush()
+langfuse.shutdown()
 ```
 
-Ответ содержит `trace_id` и `trace_url` — откройте URL в браузере, чтобы увидеть trace в Langfuse dashboard: полный промпт, ответ LLM, токены, стоимость, score.
-
-**Отчёт по стоимости:**
-
-```bash
-curl -s "http://localhost:8000/api/v1/observability/cost-report?limit=10" | python -m json.tool
-```
-
-**Создать версию промпта:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/observability/prompt-version \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "assessment-system-prompt",
-    "prompt": "You are an expert assessor. Rubric: {{rubric}}\nExamples: {{examples}}",
-    "config": {"temperature": 0.3, "model": "claude-sonnet-4-20250514"},
-    "labels": ["staging"]
-  }' | python -m json.tool
-```
-
-**Получить промпт по имени:**
-
-```bash
-curl -s "http://localhost:8000/api/v1/observability/prompt/assessment-system-prompt" | python -m json.tool
-```
-
-**Получить конкретную версию:**
-
-```bash
-curl -s "http://localhost:8000/api/v1/observability/prompt/assessment-system-prompt?version=1" | python -m json.tool
-```
-
-**Получить промпт по label:**
-
-```bash
-curl -s "http://localhost:8000/api/v1/observability/prompt/assessment-system-prompt?label=staging" | python -m json.tool
-```
+**Связь с теорией:** ручное создание trace и spans (раздел 2) для контроля иерархии: Trace → Span (preprocessing) → Generation (LLM) → Span (postprocessing) → Score. `generation()` записывает usage (токены) для cost tracking (раздел 4). `score()` привязывает оценку качества к trace (раздел 6). Metadata и tags позволяют фильтровать в dashboard.
 
 ---
 
@@ -962,7 +780,7 @@ handler.flush()
 langfuse.flush()
 ```
 
-В FastAPI с `uvicorn --reload` процесс перезапускается часто — без flush каждый рестарт теряет последний батч.
+При завершении скрипта или notebook kernel буферизованные данные теряются.
 
 ### 4. Трейсинг только в production
 

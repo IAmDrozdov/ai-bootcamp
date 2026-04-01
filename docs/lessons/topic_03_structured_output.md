@@ -1,7 +1,6 @@
 # Тема 3: Structured Output — типизированные ответы LLM
 
 > **Пререквизиты:** [Тема 1](topic_01_prompt_engineering.md), [Тема 2](topic_02_langchain_lcel.md)
-> **Что добавим в проект:** `app/api/v1/structured.py` — роутер с 4 эндпоинтами
 > **Зависимости:** `langchain-core`, `langchain-anthropic`, `langchain`, `pydantic`
 
 ---
@@ -49,7 +48,16 @@ score = int(match.group(1)) if match else None
 **Этап 1: Конвертация Pydantic → JSON Schema**
 
 ```python
-from app.schemas.assessment import AssessmentResponse
+from pydantic import BaseModel, Field
+
+
+class AssessmentResponse(BaseModel):
+    overall_score: int = Field(description="Total score across all criteria")
+    summary: str = Field(description="Brief overall assessment summary")
+    strengths: list[str] = Field(description="Key strengths of the work")
+    improvements: list[str] = Field(description="Suggested improvements")
+
+
 print(AssessmentResponse.model_json_schema())
 ```
 
@@ -628,428 +636,291 @@ print(result.model_dump())
 
 ---
 
-## Практика: роутер `/api/v1/structured`
+## Практика
 
-### Шаг 1. Схемы запросов и ответов
+### Пример 1: with_structured_output() — типизированный ответ
 
-Определим новые Pydantic-модели для эндпоинтов. Базовые `AssessmentRequest` и `AssessmentResponse` уже есть в проекте — мы создаём дополнительные схемы.
-
-Все модели определяются в файле роутера для простоты (в production их выносят в `app/schemas/`).
+Демонстрирует основной подход: Pydantic-модель с `Field(description=..., ge=..., le=...)`, constrained decoding через tool calling API. Результат — типизированный объект.
 
 ```python
-from pydantic import BaseModel, Field
-from app.schemas.assessment import AssessmentResponse
-
-
-class EnrichedCriterionScore(BaseModel):
-    criterion_name: str = Field(description="Name of the evaluated criterion")
-    score: int = Field(description="Score awarded for this criterion")
-    max_score: int = Field(description="Maximum possible score for this criterion")
-    feedback: str = Field(description="Detailed feedback explaining the score")
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Confidence in this score: 0.0=very uncertain, 1.0=fully certain"
-    )
-    reasoning: str = Field(
-        description="Step-by-step reasoning: what was analyzed, what evidence found, how score determined"
-    )
-
-
-class EnrichedAssessmentResponse(BaseModel):
-    overall_score: int = Field(description="Total score across all criteria, sum of individual scores")
-    max_overall_score: int = Field(description="Maximum possible total score")
-    criterion_scores: list[EnrichedCriterionScore] = Field(description="Per-criterion breakdown with confidence")
-    summary: str = Field(description="Brief overall assessment summary, 2-3 sentences")
-    strengths: list[str] = Field(description="Key strengths, minimum 2 items")
-    improvements: list[str] = Field(description="Improvement suggestions, minimum 2 items")
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Overall confidence 0.0-1.0. Lower for ambiguous or borderline work, higher for clearly strong or weak submissions"
-    )
-    reasoning: str = Field(
-        description="Complete reasoning process: for each criterion, what was identified, analyzed, and how score was determined"
-    )
-
-
-class CompareResult(BaseModel):
-    method: str = Field(description="Method name: with_structured_output or pydantic_parser")
-    success: bool = Field(description="Whether the method produced a valid result")
-    result: AssessmentResponse | None = None
-    error: str | None = None
-
-
-class CompareResponse(BaseModel):
-    structured_output: CompareResult
-    pydantic_parser: CompareResult
-    scores_match: bool = Field(description="Whether both methods produced similar overall scores (within 5 points)")
-
-
-class RetryResponse(BaseModel):
-    result: AssessmentResponse | None = None
-    attempts: int = Field(description="Number of attempts made")
-    errors: list[str] = Field(default_factory=list, description="Errors from failed attempts")
-    success: bool
-
-
-class RawAssessmentResponse(BaseModel):
-    raw_content: str = Field(description="Raw text content from AIMessage")
-    raw_tool_calls: list[dict] = Field(default_factory=list, description="Tool call arguments")
-    parsed: AssessmentResponse | None = None
-    parsing_error: str | None = None
-```
-
-**Связь с теорией:** `EnrichedAssessmentResponse` демонстрирует влияние `Field(description=...)` — подробные описания `confidence` и `reasoning` направляют модель генерировать калиброванные оценки уверенности и детальные рассуждения. Ограничения `ge=0.0, le=1.0` гарантируют корректный диапазон через constrained decoding.
-
-### Шаг 2. Создание роутера `app/api/v1/structured.py`
-
-```python
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
-
-from app.dependencies import LLMDep, RubricStoreDep
-from app.schemas.assessment import AssessmentRequest, AssessmentResponse
-from app.schemas.rubric import Rubric
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_GOOD_EXAMPLE,
-    FEW_SHOT_BAD_EXAMPLE,
-)
-
-router = APIRouter(prefix="/structured", tags=["lesson-3-structured"])
+from pydantic import BaseModel, Field
 
 
-class EnrichedCriterionScore(BaseModel):
+class CriterionScore(BaseModel):
     criterion_name: str = Field(description="Name of the evaluated criterion")
-    score: int = Field(description="Score awarded for this criterion")
-    max_score: int = Field(description="Maximum possible score for this criterion")
+    score: int = Field(ge=0, le=25, description="Score for this criterion, 0 to 25")
     feedback: str = Field(description="Detailed feedback explaining the score")
     confidence: float = Field(
         ge=0.0, le=1.0,
         description="Confidence in this score: 0.0=very uncertain, 1.0=fully certain",
     )
-    reasoning: str = Field(
-        description="Step-by-step reasoning: what was analyzed, what evidence found, how score determined",
-    )
 
 
-class EnrichedAssessmentResponse(BaseModel):
-    overall_score: int = Field(description="Total score across all criteria")
-    max_overall_score: int = Field(description="Maximum possible total score")
-    criterion_scores: list[EnrichedCriterionScore] = Field(description="Per-criterion breakdown")
+class AssessmentResponse(BaseModel):
+    overall_score: int = Field(ge=0, le=100, description="Total score across all criteria")
+    criterion_scores: list[CriterionScore] = Field(description="Per-criterion breakdown")
     summary: str = Field(description="Brief overall assessment summary, 2-3 sentences")
-    strengths: list[str] = Field(description="Key strengths, minimum 2")
-    improvements: list[str] = Field(description="Improvement suggestions, minimum 2")
-    confidence: float = Field(
-        ge=0.0, le=1.0,
-        description="Overall confidence 0.0-1.0. Lower for ambiguous work, higher for clearly strong or weak",
-    )
-    reasoning: str = Field(
-        description="Complete reasoning: for each criterion, what was identified and how score was determined",
-    )
+    strengths: list[str] = Field(description="Key strengths, minimum 2 items")
+    improvements: list[str] = Field(description="Improvement suggestions, minimum 2 items")
 
 
-class CompareResult(BaseModel):
-    method: str
-    success: bool
-    result: AssessmentResponse | None = None
-    error: str | None = None
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+structured_llm = llm.with_structured_output(AssessmentResponse)
 
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an essay assessor. Evaluate student work against these criteria:\n"
+     "- Thesis (max 25): clarity and strength of the main argument\n"
+     "- Evidence (max 25): quality and relevance of supporting evidence\n"
+     "- Structure (max 25): organization and logical flow\n"
+     "- Language (max 25): grammar, vocabulary, academic tone"),
+    ("human", "Assess this essay:\n\n{student_work}"),
+])
 
-class CompareResponse(BaseModel):
-    structured_output: CompareResult
-    pydantic_parser: CompareResult
-    scores_match: bool = Field(description="Both methods scored within 5 points")
+chain = prompt | structured_llm
 
+result = chain.invoke({
+    "student_work": (
+        "Climate change is a major threat. Rising temperatures cause ice to melt, "
+        "leading to higher sea levels. Governments should implement carbon taxes "
+        "and invest in renewable energy. Without action, future generations will suffer."
+    ),
+})
 
-class RetryResponse(BaseModel):
-    result: AssessmentResponse | None = None
-    attempts: int
-    errors: list[str] = Field(default_factory=list)
-    success: bool
-
-
-class RawAssessmentResponse(BaseModel):
-    raw_content: str
-    raw_tool_calls: list[dict] = Field(default_factory=list)
-    parsed: AssessmentResponse | None = None
-    parsing_error: str | None = None
-
-
-def _resolve_rubric(request: AssessmentRequest, rubrics: dict[str, Rubric]) -> Rubric:
-    if request.rubric:
-        return request.rubric
-    rubric_id = request.rubric_id or "essay_default"
-    if rubric_id not in rubrics:
-        raise HTTPException(status_code=404, detail=f"Rubric '{rubric_id}' not found")
-    return rubrics[rubric_id]
-
-
-def _format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-def _build_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-    )
-
-
-@router.post("/compare")
-async def compare_methods(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> CompareResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    prompt = _build_prompt()
-    input_data = {"student_work": request.student_work, "rubric": rubric_text}
-
-    structured_result = CompareResult(method="with_structured_output", success=False)
-    try:
-        chain_a = prompt | llm.with_structured_output(AssessmentResponse)
-        result_a = await chain_a.ainvoke(input_data)
-        structured_result = CompareResult(
-            method="with_structured_output", success=True, result=result_a,
-        )
-    except Exception as e:
-        structured_result = CompareResult(
-            method="with_structured_output", success=False, error=str(e),
-        )
-
-    parser_result = CompareResult(method="pydantic_parser", success=False)
-    try:
-        parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
-        prompt_b = ChatPromptTemplate.from_messages([
-            ("system", ASSESSMENT_SYSTEM_PROMPT + "\n\n{format_instructions}"),
-            ("human", "Please assess the following student work:\n\n{student_work}"),
-        ]).partial(
-            few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-            few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-            format_instructions=parser.get_format_instructions(),
-        )
-        chain_b = prompt_b | llm | parser
-        result_b = await chain_b.ainvoke(input_data)
-        parser_result = CompareResult(
-            method="pydantic_parser", success=True, result=result_b,
-        )
-    except Exception as e:
-        parser_result = CompareResult(
-            method="pydantic_parser", success=False, error=str(e),
-        )
-
-    scores_match = False
-    if structured_result.result and parser_result.result:
-        diff = abs(structured_result.result.overall_score - parser_result.result.overall_score)
-        scores_match = diff <= 5
-
-    return CompareResponse(
-        structured_output=structured_result,
-        pydantic_parser=parser_result,
-        scores_match=scores_match,
-    )
-
-
-@router.post("/enriched")
-async def enriched_assessment(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> EnrichedAssessmentResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    prompt = _build_prompt()
-    chain = prompt | llm.with_structured_output(EnrichedAssessmentResponse)
-    return await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-    })
-
-
-@router.post("/with-retry")
-async def assessment_with_retry(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> RetryResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
-
-    first_prompt = ChatPromptTemplate.from_messages([
-        ("system", ASSESSMENT_SYSTEM_PROMPT + "\n\n{format_instructions}"),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-        format_instructions=parser.get_format_instructions(),
-    )
-
-    retry_prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            ASSESSMENT_SYSTEM_PROMPT
-            + "\n\n{format_instructions}"
-            + "\n\nYour previous response failed to parse. Error: {error_context}\n"
-            + "Return ONLY valid JSON matching the schema. No additional text.",
-        ),
-        ("human", "Please assess the following student work:\n\n{student_work}"),
-    ]).partial(
-        few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-        few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-        format_instructions=parser.get_format_instructions(),
-    )
-
-    errors: list[str] = []
-
-    for attempt in range(1, 4):
-        try:
-            if attempt == 1:
-                chain = first_prompt | llm | parser
-                result = await chain.ainvoke({
-                    "student_work": request.student_work,
-                    "rubric": rubric_text,
-                })
-            else:
-                chain = retry_prompt | llm | parser
-                result = await chain.ainvoke({
-                    "student_work": request.student_work,
-                    "rubric": rubric_text,
-                    "error_context": errors[-1],
-                })
-            return RetryResponse(
-                result=result, attempts=attempt, errors=errors, success=True,
-            )
-        except Exception as e:
-            errors.append(str(e))
-
-    return RetryResponse(attempts=3, errors=errors, success=False)
-
-
-@router.post("/raw")
-async def raw_assessment(
-    request: AssessmentRequest,
-    llm: LLMDep,
-    rubrics: RubricStoreDep,
-) -> RawAssessmentResponse:
-    rubric = _resolve_rubric(request, rubrics)
-    rubric_text = _format_rubric(rubric)
-    prompt = _build_prompt()
-
-    chain = prompt | llm.with_structured_output(AssessmentResponse, include_raw=True)
-    result = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
-    })
-
-    raw_message = result["raw"]
-    parsed = result["parsed"]
-    parsing_error = str(result["parsing_error"]) if result["parsing_error"] else None
-
-    raw_content = raw_message.content if isinstance(raw_message.content, str) else str(raw_message.content)
-    tool_calls_data = [
-        {"name": tc["name"], "args": tc["args"], "id": tc["id"]}
-        for tc in (raw_message.tool_calls or [])
-    ]
-
-    return RawAssessmentResponse(
-        raw_content=raw_content,
-        raw_tool_calls=tool_calls_data,
-        parsed=parsed,
-        parsing_error=parsing_error,
-    )
+print(f"Overall score: {result.overall_score}")
+print(f"Summary: {result.summary}")
+for cs in result.criterion_scores:
+    print(f"  {cs.criterion_name}: {cs.score}/25 (confidence: {cs.confidence:.2f})")
+print(f"Strengths: {result.strengths}")
+print(f"Improvements: {result.improvements}")
+print(f"Return type: {type(result).__name__}")
 ```
 
-**Как каждый эндпоинт связан с теорией:**
+`Field(description=...)` с деталями (`confidence`, `feedback`) направляет модель генерировать калиброванные оценки. Ограничения `ge=0, le=25` гарантируют корректный диапазон через constrained decoding.
 
-| Эндпоинт | Концепция из теории | Что демонстрирует |
-|---|---|---|
-| `POST /compare` | §2 vs §3 | Эмпирическое сравнение двух подходов к structured output |
-| `POST /enriched` | §6 Field(description) | Влияние описаний полей на качество ответа LLM |
-| `POST /with-retry` | §3, §5 | Обработка ошибок парсинга с retry-логикой |
-| `POST /raw` | §2 include_raw | Инспекция сырого ответа модели для отладки |
-
-### Шаг 3. Регистрация в `app/api/router.py`
+`include_raw=True` позволяет инспектировать сырой ответ модели — полезно при отладке:
 
 ```python
-from fastapi import APIRouter
+structured_llm_raw = llm.with_structured_output(AssessmentResponse, include_raw=True)
+chain_raw = prompt | structured_llm_raw
 
-from app.api.v1 import assessment, rubrics, structured
+raw_result = chain_raw.invoke({
+    "student_work": "Climate change is a major threat.",
+})
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(structured.router)
+print(f"Raw content: {raw_result['raw'].content!r}")
+print(f"Tool calls: {[tc['name'] for tc in raw_result['raw'].tool_calls]}")
+print(f"Parsed: {type(raw_result['parsed']).__name__}")
+print(f"Parsing error: {raw_result['parsing_error']}")
 ```
 
-### Шаг 4. Тестирование с curl
+При tool calling `raw.content` будет пустым, а `raw.tool_calls` содержит данные, из которых парсится `parsed`.
 
-Запустите сервер:
+### Пример 2: PydanticOutputParser — промпт-подход
 
-```bash
-uvicorn app.main:app --reload
+Альтернативный подход: format instructions вставляются в промпт как текст, модель генерирует JSON, парсер валидирует через Pydantic.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+class AssessmentResponse(BaseModel):
+    overall_score: int = Field(ge=0, le=100, description="Total score across all criteria")
+    summary: str = Field(description="Brief overall assessment summary")
+    strengths: list[str] = Field(description="Key strengths of the work")
+    improvements: list[str] = Field(description="Improvement suggestions")
+
+
+parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
+
+print("=== Format Instructions (первые 200 символов) ===")
+print(parser.get_format_instructions()[:200] + "...")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an essay assessor.\n\n{format_instructions}"),
+    ("human", "Assess this essay:\n\n{student_work}"),
+]).partial(format_instructions=parser.get_format_instructions())
+
+chain = prompt | llm | parser
+
+result = chain.invoke({
+    "student_work": (
+        "Climate change is a major threat. Rising temperatures cause ice to melt, "
+        "leading to higher sea levels. Governments should implement carbon taxes "
+        "and invest in renewable energy. Without action, future generations will suffer."
+    ),
+})
+
+print(f"\nScore: {result.overall_score}")
+print(f"Summary: {result.summary}")
+print(f"Return type: {type(result).__name__}")
 ```
 
-**POST /compare** — сравнение двух подходов:
+Ключевое отличие от `with_structured_output`: модель получает текстовую инструкцию по формату, а не constraint на уровне token generation. Надёжность ниже (~90% vs ~99.5%), но работает с любой моделью.
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/structured/compare \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
+### Пример 3: Сравнение двух подходов
+
+Запускаем оба метода на одном тексте и сравниваем результаты:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+class AssessmentResponse(BaseModel):
+    overall_score: int = Field(ge=0, le=100, description="Total score across all criteria")
+    summary: str = Field(description="Brief overall assessment summary")
+    strengths: list[str] = Field(description="Key strengths of the work")
+    improvements: list[str] = Field(description="Improvement suggestions")
+
+
+STUDENT_WORK = (
+    "Climate change is a major threat. Rising temperatures cause ice to melt, "
+    "leading to higher sea levels. Governments should implement carbon taxes "
+    "and invest in renewable energy. Without action, future generations will suffer."
+)
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+
+prompt_a = ChatPromptTemplate.from_messages([
+    ("system", "You are an essay assessor. Evaluate on 0-100 scale."),
+    ("human", "Assess:\n\n{student_work}"),
+])
+chain_a = prompt_a | llm.with_structured_output(AssessmentResponse)
+
+try:
+    result_a = chain_a.invoke({"student_work": STUDENT_WORK})
+    print(f"with_structured_output: score={result_a.overall_score}, success=True")
+except Exception as e:
+    result_a = None
+    print(f"with_structured_output: error={e}")
+
+parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
+prompt_b = ChatPromptTemplate.from_messages([
+    ("system", "You are an essay assessor.\n\n{format_instructions}"),
+    ("human", "Assess:\n\n{student_work}"),
+]).partial(format_instructions=parser.get_format_instructions())
+chain_b = prompt_b | llm | parser
+
+try:
+    result_b = chain_b.invoke({"student_work": STUDENT_WORK})
+    print(f"PydanticOutputParser:   score={result_b.overall_score}, success=True")
+except Exception as e:
+    result_b = None
+    print(f"PydanticOutputParser:   error={e}")
+
+if result_a and result_b:
+    diff = abs(result_a.overall_score - result_b.overall_score)
+    print(f"\nScore difference: {diff} points")
+    print(f"Scores match (within 5): {diff <= 5}")
 ```
 
-Ожидаемый результат: оба метода возвращают `success: true`, `scores_match: true`, оценки отличаются на ≤5 баллов.
+Оба метода возвращают Pydantic-объект одного типа. Ожидаемый результат: оценки отличаются на ≤5 баллов. Разница объясняется стохастичностью генерации и различием промптов (format instructions добавляют ~300 токенов контекста).
 
-**POST /enriched** — расширенная оценка:
+### Пример 4: Обработка ошибок и retry-логика
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/structured/enriched \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
+`PydanticOutputParser` может получить невалидный JSON (~5-10% случаев). Retry-цикл передаёт ошибку в контекст промпта, давая модели шанс исправиться:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+
+class AssessmentResponse(BaseModel):
+    overall_score: int = Field(ge=0, le=100, description="Total score across all criteria")
+    summary: str = Field(description="Brief overall assessment summary")
+    strengths: list[str] = Field(description="Key strengths of the work")
+    improvements: list[str] = Field(description="Improvement suggestions")
+
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
+
+first_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an essay assessor.\n\n{format_instructions}"),
+    ("human", "Assess:\n\n{student_work}"),
+]).partial(format_instructions=parser.get_format_instructions())
+
+retry_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an essay assessor.\n\n{format_instructions}\n\n"
+     "Your previous response failed to parse. Error: {error_context}\n"
+     "Return ONLY valid JSON matching the schema. No additional text."),
+    ("human", "Assess:\n\n{student_work}"),
+]).partial(format_instructions=parser.get_format_instructions())
+
+student_work = (
+    "Climate change is a major threat. Rising temperatures cause ice to melt, "
+    "leading to higher sea levels. Governments should implement carbon taxes."
+)
+errors: list[str] = []
+max_attempts = 3
+result = None
+
+for attempt in range(1, max_attempts + 1):
+    try:
+        if attempt == 1:
+            chain = first_prompt | llm | parser
+            result = chain.invoke({"student_work": student_work})
+        else:
+            chain = retry_prompt | llm | parser
+            result = chain.invoke({
+                "student_work": student_work,
+                "error_context": errors[-1],
+            })
+        print(f"Success on attempt {attempt}")
+        print(f"Score: {result.overall_score}")
+        print(f"Summary: {result.summary}")
+        break
+    except Exception as e:
+        errors.append(str(e))
+        print(f"Attempt {attempt} failed: {e}")
+
+if result is None:
+    print(f"\nAll {max_attempts} attempts failed")
+    for i, err in enumerate(errors, 1):
+        print(f"  Attempt {i}: {err}")
 ```
 
-Обратите внимание на поля `confidence` и `reasoning` — для короткого эссе без источников confidence должен быть высоким (работа явно слабая), reasoning должен объяснять шаг за шагом.
+Альтернатива ручному retry — `OutputFixingParser`, который автоматизирует этот процесс:
 
-**POST /with-retry** — оценка с ретраями:
+```python
+from langchain.output_parsers import OutputFixingParser
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/structured/with-retry \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
+base_parser = PydanticOutputParser(pydantic_object=AssessmentResponse)
+fixing_parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm)
+
+malformed = '{"overall_score": 85, summary: "Good work", "strengths": ["clear"], "improvements": ["add sources"]}'
+
+try:
+    result = fixing_parser.invoke(malformed)
+    print(f"Fixed successfully: score={result.overall_score}")
+    print(f"Type: {type(result).__name__}")
+except Exception as e:
+    print(f"Fixing failed: {e}")
 ```
 
-Ожидаемый результат: `attempts: 1` (первая попытка обычно успешна для Claude), `success: true`. Поле `errors` пустое.
+`OutputFixingParser` вызывает LLM повторно с сообщением об ошибке — это удваивает latency и стоимость при ошибках, но повышает success rate с ~90% до ~97%.
 
-**POST /raw** — сырой ответ:
+**Связь примеров с теорией:**
 
-```bash
-curl -s -X POST http://localhost:8000/api/v1/structured/raw \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-Обратите внимание: `raw_content` будет пустым (при tool calling текст отсутствует), а `raw_tool_calls` содержит полные данные инструмента с аргументами — именно из них парсится `parsed`.
+| Пример | Концепция из теории | Что демонстрирует |
+|---|---|---|
+| Пример 1 | §2, §6 | `with_structured_output`, Field constraints, `include_raw` |
+| Пример 2 | §3 | `PydanticOutputParser`, format instructions в промпте |
+| Пример 3 | §2 vs §3 | Эмпирическое сравнение двух подходов |
+| Пример 4 | §3, §5 | Retry-логика и `OutputFixingParser` |
 
 ---
 

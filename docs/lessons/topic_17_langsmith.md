@@ -1,7 +1,6 @@
 # Тема 17: LangSmith — платформа LangChain для LLM ops
 
 > **Пререквизиты:** [Тема 8: Observability](topic_08_observability.md), рекомендуется [Тема 16: Langfuse](topic_16_langfuse.md)
-> **Что добавляем в проект:** `app/api/v1/langsmith.py`, `app/services/langsmith_service.py`, `app/schemas/langsmith.py`
 > **Зависимости:** `langsmith`, `langchain-core`, `langchain-anthropic`
 
 ---
@@ -1045,724 +1044,435 @@ result = EvaluationResult(
 
 ---
 
-## Практика: роутер `/api/v1/langsmith`
+## Практика
 
-### Шаг 1. Схемы — `app/schemas/langsmith.py`
+### Пример 1. Настройка трейсинга и @traceable
 
-Pydantic-модели для request/response всех эндпоинтов:
-
-```python
-from pydantic import BaseModel, Field
-
-
-class HubPullRequest(BaseModel):
-    prompt_name: str = Field(description="Hub prompt identifier, e.g. 'my-org/assessment-prompt'")
-    commit_hash: str | None = Field(default=None, description="Specific version hash")
-    student_work: str = Field(description="Text to assess using the pulled prompt")
-    rubric_id: str = Field(default="essay_default")
-
-
-class HubPullResponse(BaseModel):
-    prompt_name: str
-    prompt_version: str
-    assessment_result: dict
-    trace_url: str | None = None
-
-
-class DatasetExample(BaseModel):
-    student_work: str
-    expected_score: int = Field(ge=0, le=100)
-    expected_summary: str
-
-
-class CreateDatasetRequest(BaseModel):
-    dataset_name: str = Field(description="Unique name for the dataset")
-    description: str = Field(default="")
-    examples: list[DatasetExample] = Field(min_length=1)
-
-
-class CreateDatasetResponse(BaseModel):
-    dataset_name: str
-    dataset_id: str
-    examples_count: int
-    message: str
-
-
-class EvaluatorConfig(BaseModel):
-    name: str = Field(description="Evaluator name: 'score_accuracy', 'feedback_quality', 'embedding_distance'")
-    threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-
-
-class EvaluateRequest(BaseModel):
-    dataset_name: str
-    experiment_prefix: str = Field(default="eval")
-    evaluators: list[EvaluatorConfig] = Field(min_length=1)
-    max_concurrency: int = Field(default=3, ge=1, le=20)
-
-
-class EvaluationResultItem(BaseModel):
-    example_id: str
-    inputs: dict
-    predicted: dict
-    scores: dict[str, float]
-    comments: dict[str, str]
-
-
-class EvaluateResponse(BaseModel):
-    experiment_name: str
-    dataset_name: str
-    total_examples: int
-    aggregate_scores: dict[str, float]
-    results: list[EvaluationResultItem]
-
-
-class CompareRequest(BaseModel):
-    dataset_name: str
-    prompt_name_a: str = Field(description="First prompt Hub identifier")
-    prompt_name_b: str = Field(description="Second prompt Hub identifier")
-    evaluators: list[EvaluatorConfig] = Field(min_length=1)
-    max_concurrency: int = Field(default=3, ge=1, le=20)
-
-
-class CompareResultItem(BaseModel):
-    example_id: str
-    inputs: dict
-    scores_a: dict[str, float]
-    scores_b: dict[str, float]
-    winner: str
-
-
-class CompareResponse(BaseModel):
-    dataset_name: str
-    prompt_a: str
-    prompt_b: str
-    total_examples: int
-    wins_a: int
-    wins_b: int
-    ties: int
-    aggregate_scores_a: dict[str, float]
-    aggregate_scores_b: dict[str, float]
-    results: list[CompareResultItem]
-```
-
-Обратите внимание:
-- `HubPullRequest` позволяет указать конкретную версию промпта через `commit_hash` — это важно для reproducibility
-- `EvaluatorConfig` абстрагирует выбор evaluator — клиент указывает имя, сервис маппит на реальную функцию
-- `CompareResponse` включает `wins_a`, `wins_b`, `ties` — агрегат для быстрого принятия решений
-
-### Шаг 2. Сервис — `app/services/langsmith_service.py`
-
-Сервис инкапсулирует всю логику взаимодействия с LangSmith API. Роутер вызывает функции сервиса, не зная деталей реализации.
+Включение трейсинга, цепочка с автоматической записью в LangSmith, трейсинг обычной функции через `@traceable`:
 
 ```python
 import os
-from langsmith import Client, traceable
-from langsmith.evaluation import evaluate, EvaluationResult
-from langsmith.schemas import Run, Example
-from langchain import hub
+from langsmith import traceable
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.schemas.assessment import AssessmentResponse
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_..."
+os.environ["LANGCHAIN_PROJECT"] = "bootcamp-langsmith"
 
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0)
 
-FALLBACK_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "You are an expert essay assessor. Evaluate the student work against standard academic criteria. Return a JSON with 'overall_score' (0-100) and 'summary' (2-3 sentences)."),
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert essay assessor. Return a JSON with 'overall_score' (0-100) and 'summary'."),
     ("human", "Assess this student work:\n\n{student_work}"),
 ])
 
-
-def get_langsmith_client() -> Client:
-    return Client()
+chain = prompt | llm
 
 
-def get_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=os.getenv("MODEL_NAME", "claude-sonnet-4-20250514"),
-        temperature=0.0,
-        max_tokens=4096,
-    )
+@traceable(name="preprocess", run_type="chain")
+def preprocess(text: str) -> dict:
+    return {
+        "student_work": text,
+        "word_count": len(text.split()),
+    }
 
 
-@traceable(name="pull_and_assess", run_type="chain", tags=["hub", "assessment"])
-async def pull_and_assess(
-    prompt_name: str,
-    student_work: str,
-    rubric_id: str,
-    commit_hash: str | None = None,
-) -> dict:
-    full_name = f"{prompt_name}:{commit_hash}" if commit_hash else prompt_name
+@traceable(name="full_pipeline", run_type="chain")
+def full_pipeline(text: str) -> str:
+    preprocessed = preprocess(text)
+    result = chain.invoke({"student_work": preprocessed["student_work"]})
+    return result.content
 
+
+essay = (
+    "Climate change is a major threat. Rising temperatures cause ice to melt, "
+    "leading to higher sea levels. Governments should implement carbon taxes."
+)
+
+output = full_pipeline(essay)
+print("=== Результат ===")
+print(output)
+print()
+print("Trace записан в LangSmith → проект 'bootcamp-langsmith'")
+print("В UI будет дерево: full_pipeline → preprocess + ChatAnthropic")
+```
+
+Все вызовы `chain.invoke()` автоматически записываются благодаря `LANGCHAIN_TRACING_V2=true`. Декоратор `@traceable` добавляет в trace обычные Python-функции, создавая parent-child relationship.
+
+Теги и метаданные для фильтрации в UI:
+
+```python
+result = chain.invoke(
+    {"student_work": essay},
+    config={
+        "tags": ["assessment", "v2", "essay"],
+        "metadata": {
+            "user_id": "student_42",
+            "rubric_version": "2.1",
+        },
+        "run_name": "essay_assessment_v2",
+    },
+)
+print(result.content)
+```
+
+### Пример 2. Hub — публикация и загрузка промптов
+
+Создание промпта, публикация в Hub, загрузка и использование:
+
+```python
+import os
+from langchain import hub
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_anthropic import ChatAnthropic
+
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_..."
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an expert essay assessor. Evaluate student work against "
+     "standard academic criteria. Be specific in your feedback. "
+     "Return JSON with 'overall_score' (0-100) and 'summary' (2-3 sentences)."),
+    ("human", "Rubric: {rubric_id}\n\nStudent work:\n{student_work}"),
+])
+
+hub.push("my-org/essay-assessment-v2", prompt)
+print("Промпт опубликован в Hub")
+
+loaded_prompt = hub.pull("my-org/essay-assessment-v2")
+print(f"Загружен промпт: {type(loaded_prompt).__name__}")
+print(f"Переменные: {loaded_prompt.input_variables}")
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0)
+chain = loaded_prompt | llm
+
+result = chain.invoke({
+    "student_work": "AI is transforming healthcare through diagnostic imaging...",
+    "rubric_id": "essay_default",
+})
+print(f"\nОтвет модели:\n{result.content}")
+```
+
+Загрузка конкретной версии для reproducibility:
+
+```python
+pinned_prompt = hub.pull("my-org/essay-assessment-v2:a1b2c3d4")
+print(f"Загружена pinned версия: {type(pinned_prompt).__name__}")
+```
+
+Каждый `hub.push()` создаёт новый commit. Старые версии доступны по hash — можно откатиться к любой предыдущей версии.
+
+### Пример 3. Создание dataset и запуск evaluation
+
+Создание golden dataset через API, запуск evaluation с built-in и custom evaluator:
+
+```python
+import os
+from langsmith import Client, evaluate
+from langsmith.evaluation import EvaluationResult
+from langsmith.schemas import Run, Example
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_..."
+os.environ["LANGCHAIN_PROJECT"] = "bootcamp-langsmith"
+
+client = Client()
+
+dataset_name = "assessment-golden-v1"
+
+dataset = client.create_dataset(
+    dataset_name=dataset_name,
+    description="Golden dataset for essay assessment evaluation",
+)
+print(f"Dataset создан: {dataset.name} (id={dataset.id})")
+
+client.create_examples(
+    inputs=[
+        {"student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes."},
+        {"student_work": "The intersection of artificial intelligence and labor economics presents a nuanced challenge. While Frey and Osborne (2013) estimated 47% automation risk, subsequent analyses by Arntz et al. (2016) suggest only 9% of jobs are fully automatable."},
+        {"student_work": "AI is good. It helps people. The end."},
+    ],
+    outputs=[
+        {"overall_score": 55, "summary": "Basic essay with clear thesis but lacking evidence and depth."},
+        {"overall_score": 88, "summary": "Strong academic essay with citations, nuanced analysis, and clear structure."},
+        {"overall_score": 15, "summary": "Extremely weak essay with no thesis, evidence, or analysis."},
+    ],
+    dataset_name=dataset_name,
+)
+print(f"Добавлено 3 примера в dataset")
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert essay assessor. Return JSON: {{\"overall_score\": <0-100>, \"summary\": \"<2-3 sentences>\"}}"),
+    ("human", "Assess:\n\n{student_work}"),
+])
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0)
+chain = prompt | llm
+
+
+def target(inputs: dict) -> dict:
+    result = chain.invoke(inputs)
+    import json
     try:
-        prompt = hub.pull(full_name)
-    except Exception:
-        prompt = FALLBACK_PROMPT
-
-    llm = get_llm()
-    structured_llm = llm.with_structured_output(AssessmentResponse)
-    chain = prompt | structured_llm
-
-    result = await chain.ainvoke({
-        "student_work": student_work,
-        "rubric_id": rubric_id,
-    })
-
-    return {
-        "overall_score": result.overall_score,
-        "summary": result.summary,
-        "strengths": result.strengths,
-        "improvements": result.improvements,
-        "criterion_scores": [
-            {
-                "criterion_name": cs.criterion_name,
-                "score": cs.score,
-                "max_score": cs.max_score,
-                "feedback": cs.feedback,
-            }
-            for cs in result.criterion_scores
-        ],
-    }
+        parsed = json.loads(result.content)
+    except json.JSONDecodeError:
+        parsed = {"overall_score": 0, "summary": result.content}
+    return parsed
 
 
-def create_assessment_dataset(
-    dataset_name: str,
-    description: str,
-    examples: list[dict],
-) -> dict:
-    client = get_langsmith_client()
-
-    dataset = client.create_dataset(
-        dataset_name=dataset_name,
-        description=description,
+def score_accuracy(run: Run, example: Example) -> EvaluationResult:
+    predicted = run.outputs.get("overall_score", 0)
+    expected = example.outputs.get("overall_score", 0)
+    diff = abs(predicted - expected)
+    score = max(0.0, 1.0 - diff / 100)
+    return EvaluationResult(
+        key="score_accuracy",
+        score=score,
+        comment=f"Predicted: {predicted}, Expected: {expected}, Diff: {diff}",
     )
 
-    inputs = []
-    outputs = []
-    for ex in examples:
-        inputs.append({
-            "student_work": ex["student_work"],
-            "rubric_id": "essay_default",
-        })
-        outputs.append({
-            "overall_score": ex["expected_score"],
-            "summary": ex["expected_summary"],
-        })
 
-    client.create_examples(
-        inputs=inputs,
-        outputs=outputs,
-        dataset_name=dataset_name,
+def feedback_quality(run: Run, example: Example) -> EvaluationResult:
+    summary = run.outputs.get("summary", "")
+    word_count = len(summary.split())
+    score = 1.0 if word_count >= 10 else 0.0
+    return EvaluationResult(
+        key="feedback_quality",
+        score=score,
+        comment=f"Word count: {word_count}",
     )
 
-    return {
-        "dataset_id": str(dataset.id),
-        "dataset_name": dataset_name,
-        "examples_count": len(examples),
+
+results = evaluate(
+    target,
+    data=dataset_name,
+    evaluators=[score_accuracy, feedback_quality],
+    experiment_prefix="bootcamp-eval-v1",
+    max_concurrency=3,
+)
+
+print("\n=== Результаты evaluation ===")
+for r in results:
+    example_inputs = r["example"].inputs if r.get("example") else {}
+    text_preview = example_inputs.get("student_work", "")[:60]
+    scores = {
+        er.key: er.score
+        for er in r.get("evaluation_results", {}).get("results", [])
     }
+    print(f"  [{text_preview}...] → {scores}")
+
+print("\nExperiment записан в LangSmith UI → Experiments → 'bootcamp-eval-v1'")
+```
+
+### Пример 4. Custom evaluators — продвинутые метрики
+
+Несколько видов custom evaluators: числовой, бинарный, summary (агрегированный):
+
+```python
+import os
+from langsmith import evaluate
+from langsmith.evaluation import EvaluationResult
+from langsmith.schemas import Run, Example
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_..."
 
 
-def _build_score_accuracy_evaluator(threshold: float):
-    def evaluator(run: Run, example: Example) -> EvaluationResult:
+def score_accuracy(run: Run, example: Example) -> EvaluationResult:
+    predicted = run.outputs.get("overall_score", 0)
+    expected = example.outputs.get("overall_score", 0)
+    diff = abs(predicted - expected)
+
+    if diff <= 5:
+        score = 1.0
+    elif diff <= 10:
+        score = 0.7
+    elif diff <= 20:
+        score = 0.3
+    else:
+        score = 0.0
+
+    return EvaluationResult(
+        key="score_accuracy",
+        score=score,
+        comment=f"Predicted: {predicted}, Expected: {expected}, Diff: {diff}",
+    )
+
+
+def has_actionable_feedback(run: Run, example: Example) -> EvaluationResult:
+    summary = run.outputs.get("summary", "")
+    action_words = ["improve", "consider", "add", "strengthen", "develop", "revise", "expand"]
+    has_action = any(w in summary.lower() for w in action_words)
+    return EvaluationResult(
+        key="actionable_feedback",
+        score=1.0 if has_action else 0.0,
+        comment=f"Contains actionable language: {has_action}",
+    )
+
+
+def mean_score_diff(runs: list[Run], examples: list[Example]) -> EvaluationResult:
+    diffs = []
+    for run, example in zip(runs, examples):
         predicted = run.outputs.get("overall_score", 0)
         expected = example.outputs.get("overall_score", 0)
-        diff = abs(predicted - expected)
-        max_diff = 100
-        score = max(0.0, 1.0 - diff / max_diff)
+        diffs.append(abs(predicted - expected))
 
-        return EvaluationResult(
-            key="score_accuracy",
-            score=score,
-            comment=f"Predicted: {predicted}, Expected: {expected}, Diff: {diff}",
-        )
-    return evaluator
+    mae = sum(diffs) / len(diffs) if diffs else 0
+    return EvaluationResult(
+        key="mean_absolute_error",
+        score=mae,
+        comment=f"MAE across {len(diffs)} examples",
+    )
 
 
-def _build_feedback_quality_evaluator(threshold: float):
-    def evaluator(run: Run, example: Example) -> EvaluationResult:
-        summary = run.outputs.get("summary", "")
-        word_count = len(summary.split())
-        has_substance = word_count >= 10
-        score = 1.0 if has_substance else 0.0
-
-        return EvaluationResult(
-            key="feedback_quality",
-            score=score,
-            comment=f"Summary word count: {word_count}, sufficient: {has_substance}",
-        )
-    return evaluator
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert essay assessor. Return JSON: {{\"overall_score\": <0-100>, \"summary\": \"<2-3 sentences>\"}}"),
+    ("human", "Assess:\n\n{student_work}"),
+])
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0)
+chain = prompt | llm
 
 
-EVALUATOR_REGISTRY = {
-    "score_accuracy": _build_score_accuracy_evaluator,
-    "feedback_quality": _build_feedback_quality_evaluator,
-}
+def target(inputs: dict) -> dict:
+    result = chain.invoke(inputs)
+    import json
+    try:
+        return json.loads(result.content)
+    except json.JSONDecodeError:
+        return {"overall_score": 0, "summary": result.content}
 
 
-def _resolve_evaluators(configs: list[dict]) -> list:
-    evaluators = []
-    for config in configs:
-        name = config["name"]
-        threshold = config.get("threshold", 0.7)
-        builder = EVALUATOR_REGISTRY.get(name)
-        if not builder:
-            continue
-        evaluators.append(builder(threshold))
-    return evaluators
+results = evaluate(
+    target,
+    data="assessment-golden-v1",
+    evaluators=[score_accuracy, has_actionable_feedback],
+    summary_evaluators=[mean_score_diff],
+    experiment_prefix="bootcamp-custom-evals",
+    max_concurrency=3,
+)
+
+print("=== Custom evaluators ===")
+for r in results:
+    scores = {
+        er.key: round(er.score, 2)
+        for er in r.get("evaluation_results", {}).get("results", [])
+    }
+    print(f"  Scores: {scores}")
+
+print("\nSummary evaluator (MAE) виден в LangSmith UI → aggregate metrics")
+```
+
+Summary evaluators работают на уровне всего dataset — принимают все runs и examples, возвращают агрегированную метрику. Это полезно для MAE, стандартного отклонения, percentile-метрик.
+
+### Пример 5. Comparison experiments — A/B-тестирование промптов
+
+Два промпта прогоняются на одном dataset, результаты сравниваются:
+
+```python
+import os
+import json
+from langsmith import evaluate
+from langsmith.evaluation import EvaluationResult
+from langsmith.schemas import Run, Example
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_..."
+
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0.0)
+
+prompt_v1 = ChatPromptTemplate.from_messages([
+    ("system", "You are an essay assessor. Return JSON: {{\"overall_score\": <0-100>, \"summary\": \"<text>\"}}"),
+    ("human", "{student_work}"),
+])
+
+prompt_v2 = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are an expert academic essay assessor with 20 years of experience. "
+     "Evaluate against these criteria: thesis clarity, evidence quality, structure, "
+     "critical thinking, writing mechanics. "
+     "Return JSON: {{\"overall_score\": <0-100>, \"summary\": \"<2-3 detailed sentences>\"}}"),
+    ("human", "Student work to assess:\n\n{student_work}"),
+])
 
 
-def _build_target_function(prompt_name: str | None = None):
+def make_target(prompt):
+    chain = prompt | llm
     def target(inputs: dict) -> dict:
-        llm = get_llm()
-
-        if prompt_name:
-            try:
-                prompt = hub.pull(prompt_name)
-            except Exception:
-                prompt = FALLBACK_PROMPT
-        else:
-            prompt = FALLBACK_PROMPT
-
-        structured_llm = llm.with_structured_output(AssessmentResponse)
-        chain = prompt | structured_llm
         result = chain.invoke(inputs)
-
-        return {
-            "overall_score": result.overall_score,
-            "summary": result.summary,
-        }
-
+        try:
+            return json.loads(result.content)
+        except json.JSONDecodeError:
+            return {"overall_score": 0, "summary": result.content}
     return target
 
 
-def run_evaluation(
-    dataset_name: str,
-    experiment_prefix: str,
-    evaluator_configs: list[dict],
-    max_concurrency: int = 3,
-    prompt_name: str | None = None,
-) -> dict:
-    evaluators = _resolve_evaluators(evaluator_configs)
-    if not evaluators:
-        evaluators = [_build_score_accuracy_evaluator(0.7)]
-
-    target = _build_target_function(prompt_name)
-
-    results = evaluate(
-        target,
-        data=dataset_name,
-        evaluators=evaluators,
-        experiment_prefix=experiment_prefix,
-        max_concurrency=max_concurrency,
-    )
-
-    result_items = []
-    aggregate = {}
-
-    for result in results:
-        example_id = str(result["example"].id) if result.get("example") else "unknown"
-
-        scores = {}
-        comments = {}
-        for eval_result in result.get("evaluation_results", {}).get("results", []):
-            scores[eval_result.key] = eval_result.score
-            comments[eval_result.key] = eval_result.comment or ""
-
-        result_items.append({
-            "example_id": example_id,
-            "inputs": result.get("run", {}).inputs if result.get("run") else {},
-            "predicted": result.get("run", {}).outputs if result.get("run") else {},
-            "scores": scores,
-            "comments": comments,
-        })
-
-        for key, score in scores.items():
-            if key not in aggregate:
-                aggregate[key] = []
-            aggregate[key].append(score)
-
-    aggregate_scores = {
-        key: sum(values) / len(values)
-        for key, values in aggregate.items()
-        if values
-    }
-
-    return {
-        "experiment_name": experiment_prefix,
-        "dataset_name": dataset_name,
-        "total_examples": len(result_items),
-        "aggregate_scores": aggregate_scores,
-        "results": result_items,
-    }
+def score_accuracy(run: Run, example: Example) -> EvaluationResult:
+    predicted = run.outputs.get("overall_score", 0)
+    expected = example.outputs.get("overall_score", 0)
+    diff = abs(predicted - expected)
+    score = max(0.0, 1.0 - diff / 100)
+    return EvaluationResult(key="score_accuracy", score=score)
 
 
-def run_comparison(
-    dataset_name: str,
-    prompt_name_a: str,
-    prompt_name_b: str,
-    evaluator_configs: list[dict],
-    max_concurrency: int = 3,
-) -> dict:
-    evaluators = _resolve_evaluators(evaluator_configs)
-    if not evaluators:
-        evaluators = [_build_score_accuracy_evaluator(0.7)]
+dataset_name = "assessment-golden-v1"
 
-    target_a = _build_target_function(prompt_name_a)
-    target_b = _build_target_function(prompt_name_b)
-
-    results_a = evaluate(
-        target_a,
-        data=dataset_name,
-        evaluators=evaluators,
-        experiment_prefix=f"compare-a-{prompt_name_a.split('/')[-1]}",
-        max_concurrency=max_concurrency,
-    )
-
-    results_b = evaluate(
-        target_b,
-        data=dataset_name,
-        evaluators=evaluators,
-        experiment_prefix=f"compare-b-{prompt_name_b.split('/')[-1]}",
-        max_concurrency=max_concurrency,
-    )
-
-    comparison_items = []
-    wins_a = 0
-    wins_b = 0
-    ties = 0
-    all_scores_a = {}
-    all_scores_b = {}
-
-    for res_a, res_b in zip(results_a, results_b):
-        example_id = str(res_a["example"].id) if res_a.get("example") else "unknown"
-
-        scores_a = {}
-        scores_b = {}
-
-        for er in res_a.get("evaluation_results", {}).get("results", []):
-            scores_a[er.key] = er.score
-        for er in res_b.get("evaluation_results", {}).get("results", []):
-            scores_b[er.key] = er.score
-
-        avg_a = sum(scores_a.values()) / len(scores_a) if scores_a else 0
-        avg_b = sum(scores_b.values()) / len(scores_b) if scores_b else 0
-
-        if avg_a > avg_b + 0.01:
-            winner = "a"
-            wins_a += 1
-        elif avg_b > avg_a + 0.01:
-            winner = "b"
-            wins_b += 1
-        else:
-            winner = "tie"
-            ties += 1
-
-        comparison_items.append({
-            "example_id": example_id,
-            "inputs": res_a.get("run", {}).inputs if res_a.get("run") else {},
-            "scores_a": scores_a,
-            "scores_b": scores_b,
-            "winner": winner,
-        })
-
-        for key, score in scores_a.items():
-            all_scores_a.setdefault(key, []).append(score)
-        for key, score in scores_b.items():
-            all_scores_b.setdefault(key, []).append(score)
-
-    agg_a = {k: sum(v) / len(v) for k, v in all_scores_a.items() if v}
-    agg_b = {k: sum(v) / len(v) for k, v in all_scores_b.items() if v}
-
-    return {
-        "dataset_name": dataset_name,
-        "prompt_a": prompt_name_a,
-        "prompt_b": prompt_name_b,
-        "total_examples": len(comparison_items),
-        "wins_a": wins_a,
-        "wins_b": wins_b,
-        "ties": ties,
-        "aggregate_scores_a": agg_a,
-        "aggregate_scores_b": agg_b,
-        "results": comparison_items,
-    }
-```
-
-Ключевые архитектурные решения сервиса:
-
-1. **EVALUATOR_REGISTRY** — маппинг имени evaluator на builder-функцию. Клиент отправляет `"score_accuracy"`, сервис создаёт нужный evaluator. Легко расширяется: добавляешь функцию и запись в dict.
-
-2. **`_build_target_function()`** — фабрика target functions для evaluation. Принимает опциональный `prompt_name` и возвращает callable, совместимый с `evaluate()`. Замыкание захватывает prompt_name.
-
-3. **Fallback prompt** — если Hub prompt не найден, используется встроенный шаблон. Production-код не должен падать из-за недоступности Hub.
-
-4. **`@traceable`** на `pull_and_assess` — каждый вызов записывается в LangSmith, даже если трейсинг для остальных функций не включен.
-
-### Шаг 3. Роутер — `app/api/v1/langsmith.py`
-
-4 эндпоинта, каждый демонстрирует отдельную концепцию LangSmith:
-
-```python
-from fastapi import APIRouter, HTTPException
-
-from app.schemas.langsmith import (
-    HubPullRequest,
-    HubPullResponse,
-    CreateDatasetRequest,
-    CreateDatasetResponse,
-    EvaluateRequest,
-    EvaluateResponse,
-    EvaluationResultItem,
-    CompareRequest,
-    CompareResponse,
-    CompareResultItem,
-)
-from app.services.langsmith_service import (
-    pull_and_assess,
-    create_assessment_dataset,
-    run_evaluation,
-    run_comparison,
+results_v1 = evaluate(
+    make_target(prompt_v1),
+    data=dataset_name,
+    evaluators=[score_accuracy],
+    experiment_prefix="compare-prompt-v1",
+    max_concurrency=3,
 )
 
+results_v2 = evaluate(
+    make_target(prompt_v2),
+    data=dataset_name,
+    evaluators=[score_accuracy],
+    experiment_prefix="compare-prompt-v2",
+    max_concurrency=3,
+)
 
-router = APIRouter(prefix="/langsmith", tags=["langsmith"])
+print("=== Comparison: prompt v1 vs v2 ===")
+scores_v1 = []
+scores_v2 = []
+wins_v1 = wins_v2 = ties = 0
 
+for r1, r2 in zip(results_v1, results_v2):
+    s1 = [er.score for er in r1.get("evaluation_results", {}).get("results", [])]
+    s2 = [er.score for er in r2.get("evaluation_results", {}).get("results", [])]
+    avg1 = sum(s1) / len(s1) if s1 else 0
+    avg2 = sum(s2) / len(s2) if s2 else 0
+    scores_v1.append(avg1)
+    scores_v2.append(avg2)
 
-@router.post("/hub/pull")
-async def hub_pull_and_assess(request: HubPullRequest) -> HubPullResponse:
-    try:
-        result = await pull_and_assess(
-            prompt_name=request.prompt_name,
-            student_work=request.student_work,
-            rubric_id=request.rubric_id,
-            commit_hash=request.commit_hash,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Hub pull or assessment failed: {e}")
+    if avg1 > avg2 + 0.01:
+        wins_v1 += 1
+        winner = "v1"
+    elif avg2 > avg1 + 0.01:
+        wins_v2 += 1
+        winner = "v2"
+    else:
+        ties += 1
+        winner = "tie"
 
-    version = request.commit_hash or "latest"
+    text = r1["example"].inputs.get("student_work", "")[:50] if r1.get("example") else ""
+    print(f"  [{text}...] v1={avg1:.2f} v2={avg2:.2f} → {winner}")
 
-    return HubPullResponse(
-        prompt_name=request.prompt_name,
-        prompt_version=version,
-        assessment_result=result,
-    )
+mean_v1 = sum(scores_v1) / len(scores_v1) if scores_v1 else 0
+mean_v2 = sum(scores_v2) / len(scores_v2) if scores_v2 else 0
 
-
-@router.post("/dataset")
-async def create_dataset(request: CreateDatasetRequest) -> CreateDatasetResponse:
-    examples = [
-        {
-            "student_work": ex.student_work,
-            "expected_score": ex.expected_score,
-            "expected_summary": ex.expected_summary,
-        }
-        for ex in request.examples
-    ]
-
-    try:
-        result = create_assessment_dataset(
-            dataset_name=request.dataset_name,
-            description=request.description,
-            examples=examples,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Dataset creation failed: {e}")
-
-    return CreateDatasetResponse(
-        dataset_name=result["dataset_name"],
-        dataset_id=result["dataset_id"],
-        examples_count=result["examples_count"],
-        message=f"Dataset '{result['dataset_name']}' created with {result['examples_count']} examples",
-    )
-
-
-@router.post("/evaluate")
-async def evaluate_dataset(request: EvaluateRequest) -> EvaluateResponse:
-    evaluator_configs = [
-        {"name": ev.name, "threshold": ev.threshold}
-        for ev in request.evaluators
-    ]
-
-    try:
-        result = run_evaluation(
-            dataset_name=request.dataset_name,
-            experiment_prefix=request.experiment_prefix,
-            evaluator_configs=evaluator_configs,
-            max_concurrency=request.max_concurrency,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Evaluation failed: {e}")
-
-    return EvaluateResponse(
-        experiment_name=result["experiment_name"],
-        dataset_name=result["dataset_name"],
-        total_examples=result["total_examples"],
-        aggregate_scores=result["aggregate_scores"],
-        results=[
-            EvaluationResultItem(**item)
-            for item in result["results"]
-        ],
-    )
-
-
-@router.post("/compare")
-async def compare_prompts(request: CompareRequest) -> CompareResponse:
-    evaluator_configs = [
-        {"name": ev.name, "threshold": ev.threshold}
-        for ev in request.evaluators
-    ]
-
-    try:
-        result = run_comparison(
-            dataset_name=request.dataset_name,
-            prompt_name_a=request.prompt_name_a,
-            prompt_name_b=request.prompt_name_b,
-            evaluator_configs=evaluator_configs,
-            max_concurrency=request.max_concurrency,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Comparison failed: {e}")
-
-    return CompareResponse(
-        dataset_name=result["dataset_name"],
-        prompt_a=result["prompt_a"],
-        prompt_b=result["prompt_b"],
-        total_examples=result["total_examples"],
-        wins_a=result["wins_a"],
-        wins_b=result["wins_b"],
-        ties=result["ties"],
-        aggregate_scores_a=result["aggregate_scores_a"],
-        aggregate_scores_b=result["aggregate_scores_b"],
-        results=[
-            CompareResultItem(**item)
-            for item in result["results"]
-        ],
-    )
+print(f"\nСредний score_accuracy: v1={mean_v1:.3f}, v2={mean_v2:.3f}")
+print(f"Wins: v1={wins_v1}, v2={wins_v2}, ties={ties}")
+print("\nВ LangSmith UI оба эксперимента видны рядом на одном dataset (side-by-side)")
 ```
 
-**Как каждый эндпоинт связан с теорией:**
-
-| Эндпоинт | Концепция из теории | Что демонстрирует |
-|---|---|---|
-| `POST /hub/pull` | §3 Hub, §2 Tracing | Загрузка промпта из Hub, assessment с трейсингом |
-| `POST /dataset` | §4 Datasets | Создание dataset для evaluation через API |
-| `POST /evaluate` | §5 Evaluation | Запуск evaluation с custom evaluators |
-| `POST /compare` | §5 Comparison experiments | A/B-сравнение двух промптов |
-
-### Шаг 4. Регистрация и тестирование
-
-Добавьте роутер в `app/api/router.py`:
-
-```python
-from fastapi import APIRouter
-
-from app.api.v1 import assessment, rubrics, prompts, langsmith
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(prompts.router)
-api_router.include_router(langsmith.router)
-```
-
-Обновите `.env`:
-
-```
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=lsv2_pt_your_key_here
-LANGCHAIN_PROJECT=ai-assessment-bootcamp
-```
-
-Запуск:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-#### POST /langsmith/hub/pull — загрузка промпта и assessment
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/langsmith/hub/pull \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt_name": "my-org/essay-assessment",
-    "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes and invest in renewable energy. Without action, future generations will suffer.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `prompt_version: "latest"`, `assessment_result` содержит `overall_score`, `summary`, `strengths`, `improvements`. Если промпт не найден в Hub — используется fallback, assessment всё равно выполнится.
-
-В LangSmith UI появится trace `pull_and_assess` с child runs для prompt template и LLM call.
-
-#### POST /langsmith/dataset — создание dataset
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/langsmith/dataset \
-  -H "Content-Type: application/json" \
-  -d '{
-    "dataset_name": "assessment-golden-test",
-    "description": "Test golden dataset for bootcamp",
-    "examples": [
-      {
-        "student_work": "Climate change is a major threat. Rising temperatures cause ice to melt, leading to higher sea levels. Governments should implement carbon taxes.",
-        "expected_score": 55,
-        "expected_summary": "Basic essay with clear thesis but lacking evidence and depth."
-      },
-      {
-        "student_work": "The intersection of artificial intelligence and labor economics presents a nuanced challenge. While Frey and Osborne (2013) estimated 47% automation risk, subsequent analyses by Arntz et al. (2016) suggest only 9% of jobs are fully automatable.",
-        "expected_score": 88,
-        "expected_summary": "Strong academic essay with citations, nuanced analysis, and clear structure."
-      },
-      {
-        "student_work": "AI is good. It helps people. The end.",
-        "expected_score": 15,
-        "expected_summary": "Extremely weak essay with no thesis, evidence, or analysis."
-      }
-    ]
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `examples_count: 3`, `dataset_id` — UUID созданного dataset. В LangSmith UI → Datasets появится `assessment-golden-test` с 3 examples.
-
-#### POST /langsmith/evaluate — запуск evaluation
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/langsmith/evaluate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "dataset_name": "assessment-golden-test",
-    "experiment_prefix": "bootcamp-eval-v1",
-    "evaluators": [
-      {"name": "score_accuracy", "threshold": 0.7},
-      {"name": "feedback_quality", "threshold": 0.7}
-    ],
-    "max_concurrency": 2
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `total_examples: 3`, `aggregate_scores` содержит `score_accuracy` и `feedback_quality` (средние значения по dataset). Каждый `results[i]` содержит `scores` и `comments` для конкретного example.
-
-Evaluation занимает время: 3 examples × LLM call ≈ 10-20 секунд. В LangSmith UI → Experiments появится `bootcamp-eval-v1` с детальными результатами.
-
-#### POST /langsmith/compare — A/B-сравнение промптов
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/langsmith/compare \
-  -H "Content-Type: application/json" \
-  -d '{
-    "dataset_name": "assessment-golden-test",
-    "prompt_name_a": "my-org/assessment-v1",
-    "prompt_name_b": "my-org/assessment-v2",
-    "evaluators": [
-      {"name": "score_accuracy", "threshold": 0.7}
-    ],
-    "max_concurrency": 2
-  }' | python -m json.tool
-```
-
-Ожидаемый результат: `wins_a`, `wins_b`, `ties` показывают, какой промпт лучше на каждом example. `aggregate_scores_a` vs `aggregate_scores_b` — общее сравнение. Каждый `results[i]` содержит `winner: "a"`, `"b"`, или `"tie"`.
-
-Comparison занимает 2x времени evaluation (оба промпта прогоняются на всём dataset). В LangSmith UI → Experiments оба прогона видны рядом на одном dataset.
+В LangSmith UI оба эксперимента отображаются рядом на одном dataset с side-by-side сравнением метрик. Можно видеть: на каких примерах v2 лучше, на каких хуже, общие aggregate scores.
 
 ---
 

@@ -1,8 +1,7 @@
 # Тема 7: Conversational AI
 
 > **Пререквизиты:** [Тема 6: LangGraph](topic_06_langgraph_agents.md)
-> **Что добавим в проект:** `app/schemas/chat.py`, `app/graph/conversation_graph.py`, `app/api/v1/chat.py`
-> **Зависимости:** `langgraph` (группа `agents`), `langchain-core`, `langchain-anthropic`
+> **Зависимости:** `langgraph`, `langchain-core`, `langchain-anthropic`
 
 ---
 
@@ -122,7 +121,7 @@ prompt = ChatPromptTemplate.from_messages([
 
 ### 5. LangGraph для диалога
 
-LangGraph решает фундаментальную проблему conversational AI: **где и как хранить состояние разговора между HTTP-запросами**.
+LangGraph решает фундаментальную проблему conversational AI: **где и как хранить состояние разговора между вызовами**.
 
 Ключевые свойства LangGraph для диалога:
 
@@ -163,7 +162,7 @@ config_user_2 = {"configurable": {"thread_id": "user-2-session"}}
 | Сложность сервера | Простая (обычный HTTP endpoint) | Средняя (WebSocket handler, lifecycle) |
 | Firewall/Proxy | Работает везде (обычный HTTP) | Иногда блокируется корпоративными прокси |
 
-**SSE** идеален, когда клиент отправляет один запрос и получает потоковый ответ — как в нашем endpoint `POST /assess/stream`. Клиент делает POST, сервер стримит токены через SSE, соединение закрывается.
+**SSE** идеален, когда клиент отправляет один запрос и получает потоковый ответ. Клиент делает POST, сервер стримит токены через SSE, соединение закрывается.
 
 **WebSocket** нужен для полноценного чата: клиент отправляет сообщения и получает ответы через одно постоянное соединение, без пересоздания HTTP-запросов. Жизненный цикл WebSocket:
 
@@ -172,9 +171,7 @@ config_user_2 = {"configurable": {"thread_id": "user-2-session"}}
 3. **Message exchange** — JSON-сообщения в обе стороны
 4. **Close** — любая сторона инициирует закрытие, отправляя close-фрейм
 
-FastAPI имеет встроенную поддержку WebSocket через Starlette. Декоратор `@router.websocket("/path")` создаёт endpoint, который принимает `WebSocket` объект с методами `accept()`, `receive_json()`, `send_json()` и `close()`.
-
-Для нашего проекта WebSocket даёт два преимущества: (1) двунаправленность — студент и AI-ассессор обмениваются сообщениями в реальном времени; (2) стриминг — ответ LLM приходит токен за токеном через то же соединение.
+WebSocket даёт два преимущества для чат-приложений: (1) двунаправленность — пользователь и AI обмениваются сообщениями в реальном времени; (2) стриминг — ответ LLM приходит токен за токеном через то же соединение.
 
 ---
 
@@ -374,7 +371,7 @@ from langgraph.checkpoint.memory import MemorySaver
 | `put(config, checkpoint, metadata, new_versions)` | Сохранить checkpoint |
 | `list(config)` | Список всех checkpoints для thread_id |
 
-**Ограничения:** данные живут только пока жив процесс. Перезапуск сервера = потеря всех разговоров. Для production используйте `SqliteSaver`, `PostgresSaver` или `AsyncPostgresSaver`.
+**Ограничения:** данные живут только пока жив процесс. Перезапуск = потеря всех разговоров. Для production используйте `SqliteSaver`, `PostgresSaver` или `AsyncPostgresSaver`.
 
 **Пример:**
 
@@ -387,57 +384,6 @@ graph = workflow.compile(checkpointer=checkpointer)
 config = {"configurable": {"thread_id": "session-42"}}
 result1 = await graph.ainvoke({"messages": [HumanMessage(content="Hi")]}, config)
 result2 = await graph.ainvoke({"messages": [HumanMessage(content="What did I say?")]}, config)
-```
-
----
-
-### WebSocket (FastAPI)
-
-**Описание:** класс WebSocket из Starlette/FastAPI для двунаправленной real-time коммуникации. Используется в endpoint с декоратором `@router.websocket("/path")`.
-
-**Импорт:**
-
-```python
-from fastapi import WebSocket, WebSocketDisconnect
-```
-
-**Основные методы:**
-
-| Метод | Сигнатура | Описание |
-|-------|-----------|----------|
-| `accept` | `async accept()` | Принять WebSocket-соединение (обязательно вызвать первым) |
-| `receive_json` | `async receive_json() -> Any` | Получить JSON-сообщение от клиента |
-| `receive_text` | `async receive_text() -> str` | Получить текстовое сообщение |
-| `send_json` | `async send_json(data: Any)` | Отправить JSON клиенту |
-| `send_text` | `async send_text(data: str)` | Отправить текст клиенту |
-| `close` | `async close(code: int = 1000, reason: str \| None = None)` | Закрыть соединение |
-
-**Коды закрытия WebSocket:**
-
-| Код | Значение |
-|-----|----------|
-| 1000 | Нормальное закрытие |
-| 1001 | Уход (going away) |
-| 1008 | Нарушение политики |
-| 1011 | Внутренняя ошибка сервера |
-
-**Пример:**
-
-```python
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-
-router = APIRouter()
-
-@router.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_json()
-            response = f"Echo: {data['message']}"
-            await websocket.send_json({"reply": response})
-    except WebSocketDisconnect:
-        pass
 ```
 
 ---
@@ -481,64 +427,226 @@ HumanMessage("Why did I lose points on evidence?")
 
 ---
 
-## Практика: роутер `/api/v1/chat`
+## Практика
 
-В этой практике мы создадим полноценный conversational AI backend: граф для диалога с checkpointing, REST-эндпоинты для управления разговорами и WebSocket для стриминга. Все компоненты используют LangGraph `MemorySaver` для автоматического сохранения истории по `thread_id`.
+### Пример 1: Многоходовой диалог (buffer memory)
 
-### Шаг 1: Схемы данных
-
-Определим Pydantic-модели для request/response чата. `ChatMessage` — унифицированный формат сообщения с ролью. `AssessmentChatRequest` поддерживает два режима: первый вызов с `student_work` запускает оценку, последующие — обсуждение.
-
-**Файл: `app/schemas/chat.py`**
+Простейший подход — накапливаем все сообщения в списке и отправляем полную историю при каждом вызове LLM.
 
 ```python
-from pydantic import BaseModel, Field
-
-
-class ChatMessageRequest(BaseModel):
-    message: str = Field(description="User message text")
-
-
-class ChatMessage(BaseModel):
-    role: str = Field(description="Message role: human, ai, or system")
-    content: str = Field(description="Message content")
-
-
-class ChatMessageResponse(BaseModel):
-    reply: str = Field(description="AI response text")
-    history: list[ChatMessage] = Field(description="Full conversation history")
-
-
-class AssessmentChatRequest(BaseModel):
-    message: str = Field(description="User message text")
-    student_work: str | None = Field(
-        default=None,
-        description="Student work to assess (only first message)",
-    )
-    rubric_id: str | None = Field(default="essay_default")
-
-
-class AssessmentChatResponse(BaseModel):
-    reply: str = Field(description="AI response text")
-    history: list[ChatMessage] = Field(description="Full conversation history")
-    has_assessment: bool = Field(description="Whether assessment has been completed")
-```
-
-**Связь с теорией:** `ChatMessage` с полем `role` отражает структуру типизированных сообщений LangChain (раздел 2). Клиент получает историю в унифицированном формате, который легко отобразить в UI.
-
----
-
-### Шаг 2: Граф разговора
-
-Создадим два графа: `build_conversation_graph` — для общего чата, `build_assessment_conversation_graph` — для обсуждения оценки с условной маршрутизацией. Оба используют `MemorySaver` для персистентности.
-
-**Файл: `app/graph/conversation_graph.py`**
-
-```python
-from typing import Annotated, TypedDict
+import os
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
+
+messages = [
+    SystemMessage(content="You are a helpful academic assistant. Answer concisely."),
+]
+
+user_inputs = [
+    "What makes a strong thesis statement?",
+    "Can you give me an example about climate change?",
+    "How would you improve that example?",
+]
+
+for user_text in user_inputs:
+    messages.append(HumanMessage(content=user_text))
+    response = llm.invoke(messages)
+    messages.append(response)
+    print(f"Human: {user_text}")
+    print(f"AI: {response.content}\n")
+
+print(f"Всего сообщений в истории: {len(messages)}")
+print(f"Токенов в последнем ответе: {response.usage_metadata}")
+```
+
+---
+
+### Пример 2: Window memory — скользящее окно
+
+Хранить все сообщения, но отправлять в LLM только последние N. Ранний контекст теряется — зато стоимость и размер контекста фиксированы.
+
+```python
+import os
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
+
+SYSTEM = SystemMessage(content="You are a helpful assistant. Answer concisely.")
+WINDOW_SIZE = 4
+
+messages: list = []
+
+user_inputs = [
+    "My name is Alex.",
+    "I study computer science.",
+    "My favorite language is Python.",
+    "I want to learn about LLMs.",
+    "What should I start with?",
+    "Do you remember my name?",
+]
+
+for user_text in user_inputs:
+    messages.append(HumanMessage(content=user_text))
+
+    window = messages[-WINDOW_SIZE:]
+    to_send = [SYSTEM] + window
+
+    response = llm.invoke(to_send)
+    messages.append(response)
+
+    print(f"Human: {user_text}")
+    print(f"AI: {response.content}")
+    print(f"  (окно: {len(window)} из {len(messages)} сообщений)\n")
+```
+
+---
+
+### Пример 3: Summary memory — сжатие через LLM
+
+Когда сообщений становится слишком много, старые сжимаются в краткое резюме. Контекст = системное сообщение + резюме + последние N сообщений.
+
+```python
+import os
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
+
+SYSTEM = SystemMessage(content="You are a helpful academic assistant.")
+SUMMARIZE_THRESHOLD = 6
+KEEP_RECENT = 2
+
+
+def summarize_messages(msgs: list) -> str:
+    text = "\n".join(f"{m.type}: {m.content}" for m in msgs)
+    summary_response = llm.invoke([
+        SystemMessage(
+            content="Summarize this conversation in 2-3 sentences, "
+            "preserving key facts and decisions."
+        ),
+        HumanMessage(content=text),
+    ])
+    return summary_response.content
+
+
+messages: list = []
+summary: str | None = None
+
+user_inputs = [
+    "Hi, I'm working on an essay about renewable energy.",
+    "My thesis is that solar power will dominate by 2040.",
+    "I have three supporting arguments.",
+    "First, the cost of solar panels dropped 90% since 2010.",
+    "Can you assess my thesis so far?",
+    "How can I strengthen my first argument?",
+]
+
+for user_text in user_inputs:
+    messages.append(HumanMessage(content=user_text))
+
+    if len(messages) > SUMMARIZE_THRESHOLD:
+        old = messages[:-KEEP_RECENT]
+        summary = summarize_messages(old)
+        messages = messages[-KEEP_RECENT:]
+        print(f"  [Суммаризовано {len(old)} сообщений → {len(summary)} символов]\n")
+
+    to_send = [SYSTEM]
+    if summary:
+        to_send.append(SystemMessage(content=f"Previous conversation summary:\n{summary}"))
+    to_send.extend(messages)
+
+    response = llm.invoke(to_send)
+    messages.append(response)
+
+    print(f"Human: {user_text}")
+    print(f"AI: {response.content[:120]}...\n")
+```
+
+---
+
+### Пример 4: MessagesPlaceholder в ChatPromptTemplate
+
+`MessagesPlaceholder` вставляет типизированную историю в промпт, сохраняя роли. Это правильный способ передать историю — вместо склейки в строку.
+
+```python
+import os
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an expert assessor. Assessment context:\n{context}"),
+    MessagesPlaceholder("chat_history", optional=True),
+    ("human", "{input}"),
+])
+
+chain = prompt | llm
+
+context = "Rubric: Essay (clarity 30%, evidence 40%, structure 30%)"
+
+result1 = chain.invoke({
+    "context": context,
+    "chat_history": [],
+    "input": "Assess this thesis: Solar power will dominate energy by 2040.",
+})
+print(f"Ход 1: {result1.content[:150]}...\n")
+
+history = [
+    HumanMessage(content="Assess this thesis: Solar power will dominate energy by 2040."),
+    result1,
+]
+
+result2 = chain.invoke({
+    "context": context,
+    "chat_history": history,
+    "input": "Why did I lose points on evidence?",
+})
+print(f"Ход 2: {result2.content[:150]}...\n")
+
+formatted = prompt.invoke({
+    "context": context,
+    "chat_history": history,
+    "input": "How can I improve?",
+})
+print("Итоговые сообщения:")
+for msg in formatted.messages:
+    print(f"  {msg.__class__.__name__}: {msg.content[:80]}...")
+```
+
+---
+
+### Пример 5: LangGraph — stateful диалог с checkpointing
+
+LangGraph + `MemorySaver` автоматически сохраняет и восстанавливает историю по `thread_id`. Не нужно вручную управлять списком сообщений — checkpointer делает это за вас.
+
+```python
+import asyncio
+import os
+from typing import Annotated, TypedDict
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -548,26 +656,88 @@ class ConversationState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-class AssessmentConversationState(TypedDict):
-    messages: Annotated[list, add_messages]
-    student_work: str
-    assessment: str
-
-
-CONVERSATION_SYSTEM = (
-    "You are a helpful academic assistant. "
-    "Answer questions clearly and concisely in the same language the student uses."
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
 )
+
+
+async def respond(state: ConversationState):
+    all_messages = [
+        SystemMessage(content="You are a helpful academic assistant. Answer concisely.")
+    ] + state["messages"]
+    response = await llm.ainvoke(all_messages)
+    return {"messages": [response]}
+
+
+graph = StateGraph(ConversationState)
+graph.add_node("respond", respond)
+graph.add_edge(START, "respond")
+graph.add_edge("respond", END)
+
+app = graph.compile(checkpointer=MemorySaver())
+
+
+async def main():
+    config_alice = {"configurable": {"thread_id": "alice-session"}}
+    config_bob = {"configurable": {"thread_id": "bob-session"}}
+
+    r1 = await app.ainvoke(
+        {"messages": [HumanMessage(content="Hi, I'm Alice. What makes a good thesis?")]},
+        config=config_alice,
+    )
+    print(f"Alice ход 1: {r1['messages'][-1].content[:100]}...\n")
+
+    r2 = await app.ainvoke(
+        {"messages": [HumanMessage(content="Hi, I'm Bob. Explain window memory.")]},
+        config=config_bob,
+    )
+    print(f"Bob ход 1: {r2['messages'][-1].content[:100]}...\n")
+
+    r3 = await app.ainvoke(
+        {"messages": [HumanMessage(content="Can you give me an example?")]},
+        config=config_alice,
+    )
+    print(f"Alice ход 2: {r3['messages'][-1].content[:100]}...\n")
+
+    state = await app.aget_state(config_alice)
+    print(f"Alice — история: {len(state.values['messages'])} сообщений")
+    for m in state.values["messages"]:
+        print(f"  {m.__class__.__name__}: {m.content[:60]}...")
+
+    state_bob = await app.aget_state(config_bob)
+    print(f"\nBob — история: {len(state_bob.values['messages'])} сообщений")
+
+
+asyncio.run(main())
+```
+
+---
+
+### Пример 6: LangGraph — условная маршрутизация в диалоге
+
+Граф с двумя путями: при первом вызове (оценка ещё не проведена) — узел `assess`; при последующих — узел `discuss`. `MemorySaver` запоминает, что оценка уже была.
+
+```python
+import asyncio
+import os
+from typing import Annotated, TypedDict
+
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
 
 ASSESSMENT_SYSTEM = """\
 You are an expert academic assessor. Evaluate the student work below \
-thoroughly, providing scores and specific feedback for each criterion.
+thoroughly, providing scores and specific feedback.
 
 ## Student Work
 {student_work}"""
 
 DISCUSSION_SYSTEM = """\
-You are an expert academic assessor discussing a student's work and assessment.
+You are an expert academic assessor discussing a student's work.
 
 ## Student Work
 {student_work}
@@ -575,337 +745,86 @@ You are an expert academic assessor discussing a student's work and assessment.
 ## Completed Assessment
 {assessment}
 
-Answer questions about the assessment. Reference specific parts of the work \
-when explaining scores. Be constructive and specific."""
+Answer questions about the assessment. Be constructive and specific."""
 
 
-def build_conversation_graph(llm: ChatAnthropic):
-    async def respond(state: ConversationState):
-        all_messages = [SystemMessage(content=CONVERSATION_SYSTEM)] + state["messages"]
-        response = await llm.ainvoke(all_messages)
-        return {"messages": [response]}
-
-    graph = StateGraph(ConversationState)
-    graph.add_node("respond", respond)
-    graph.add_edge(START, "respond")
-    graph.add_edge("respond", END)
-
-    return graph.compile(checkpointer=MemorySaver())
+class AssessmentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    student_work: str
+    assessment: str
 
 
-def build_assessment_conversation_graph(llm: ChatAnthropic):
-    async def assess(state: AssessmentConversationState):
-        system_text = ASSESSMENT_SYSTEM.format(student_work=state["student_work"])
-        all_messages = [SystemMessage(content=system_text)] + state["messages"]
-        response = await llm.ainvoke(all_messages)
-        return {"messages": [response], "assessment": response.content}
+llm = ChatAnthropic(
+    model="claude-sonnet-4-20250514",
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+)
 
-    async def discuss(state: AssessmentConversationState):
-        system_text = DISCUSSION_SYSTEM.format(
+
+async def assess(state: AssessmentState):
+    system = SystemMessage(
+        content=ASSESSMENT_SYSTEM.format(student_work=state["student_work"])
+    )
+    response = await llm.ainvoke([system] + state["messages"])
+    return {"messages": [response], "assessment": response.content}
+
+
+async def discuss(state: AssessmentState):
+    system = SystemMessage(
+        content=DISCUSSION_SYSTEM.format(
             student_work=state["student_work"],
             assessment=state["assessment"],
         )
-        all_messages = [SystemMessage(content=system_text)] + state["messages"]
-        response = await llm.ainvoke(all_messages)
-        return {"messages": [response]}
-
-    def route(state: AssessmentConversationState) -> str:
-        if not state.get("assessment"):
-            return "assess"
-        return "discuss"
-
-    graph = StateGraph(AssessmentConversationState)
-    graph.add_node("assess", assess)
-    graph.add_node("discuss", discuss)
-    graph.add_conditional_edges(START, route)
-    graph.add_edge("assess", END)
-    graph.add_edge("discuss", END)
-
-    return graph.compile(checkpointer=MemorySaver())
-```
-
-**Связь с теорией:** `ConversationState` использует `Annotated[list, add_messages]` — паттерн reducer из раздела 5. `AssessmentConversationState` добавляет `student_work` и `assessment` — обычные строки без reducer, они замещаются при обновлении. Функция `route` реализует условную маршрутизацию: при первом вызове (assessment пуст) — оценка, далее — обсуждение. `MemorySaver` в `compile()` обеспечивает автоматическую персистентность по `thread_id`.
-
----
-
-### Шаг 3: Роутер
-
-Создадим роутер с пятью endpoints: отправка сообщения, получение истории, очистка, оценка с обсуждением, WebSocket со стримингом.
-
-**Файл: `app/api/v1/chat.py`**
-
-```python
-from functools import lru_cache
-
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-from app.dependencies import LLMDep, RubricStoreDep, get_llm
-from app.graph.conversation_graph import (
-    build_assessment_conversation_graph,
-    build_conversation_graph,
-)
-from app.schemas.chat import (
-    AssessmentChatRequest,
-    AssessmentChatResponse,
-    ChatMessage,
-    ChatMessageRequest,
-    ChatMessageResponse,
-)
-
-router = APIRouter(prefix="/chat", tags=["lesson-7-chat"])
-
-_thread_versions: dict[str, int] = {}
+    )
+    response = await llm.ainvoke([system] + state["messages"])
+    return {"messages": [response]}
 
 
-@lru_cache
-def _get_graph():
-    return build_conversation_graph(get_llm())
+def route(state: AssessmentState) -> str:
+    if not state.get("assessment"):
+        return "assess"
+    return "discuss"
 
 
-@lru_cache
-def _get_assess_graph():
-    return build_assessment_conversation_graph(get_llm())
+graph = StateGraph(AssessmentState)
+graph.add_node("assess", assess)
+graph.add_node("discuss", discuss)
+graph.add_conditional_edges(START, route)
+graph.add_edge("assess", END)
+graph.add_edge("discuss", END)
+
+app = graph.compile(checkpointer=MemorySaver())
 
 
-def _effective_config(thread_id: str) -> dict:
-    version = _thread_versions.get(thread_id, 0)
-    effective_id = f"{thread_id}__v{version}" if version else thread_id
-    return {"configurable": {"thread_id": effective_id}}
+async def main():
+    config = {"configurable": {"thread_id": "assessment-session-1"}}
 
-
-def _format_history(messages: list) -> list[ChatMessage]:
-    result = []
-    for m in messages:
-        if isinstance(m, HumanMessage):
-            role = "human"
-        elif isinstance(m, AIMessage):
-            role = "ai"
-        elif isinstance(m, SystemMessage):
-            continue
-        else:
-            role = "unknown"
-        result.append(ChatMessage(role=role, content=m.content))
-    return result
-
-
-@router.post("/{thread_id}/message")
-async def send_message(thread_id: str, request: ChatMessageRequest) -> ChatMessageResponse:
-    graph = _get_graph()
-    config = _effective_config(thread_id)
-
-    result = await graph.ainvoke(
-        {"messages": [HumanMessage(content=request.message)]},
+    r1 = await app.ainvoke(
+        {
+            "messages": [HumanMessage(content="Please assess my essay.")],
+            "student_work": (
+                "Climate change is the defining challenge of our generation. "
+                "Rising temperatures threaten ecosystems and economies. "
+                "According to the IPCC 2023 report, we must reduce emissions "
+                "by 45% by 2030."
+            ),
+            "assessment": "",
+        },
         config=config,
     )
+    print(f"Оценка: {r1['messages'][-1].content[:200]}...\n")
 
-    messages = result["messages"]
-    reply = messages[-1].content if messages else ""
-
-    return ChatMessageResponse(
-        reply=reply,
-        history=_format_history(messages),
+    r2 = await app.ainvoke(
+        {"messages": [HumanMessage(content="Why did I lose points? How can I improve?")]},
+        config=config,
     )
+    print(f"Обсуждение: {r2['messages'][-1].content[:200]}...\n")
+
+    state = await app.aget_state(config)
+    print(f"Есть оценка: {bool(state.values.get('assessment'))}")
+    print(f"Всего сообщений: {len(state.values['messages'])}")
 
 
-@router.get("/{thread_id}/history")
-async def get_history(thread_id: str) -> ChatMessageResponse:
-    graph = _get_graph()
-    config = _effective_config(thread_id)
-
-    state = await graph.aget_state(config)
-    messages = state.values.get("messages", [])
-
-    if not messages:
-        raise HTTPException(status_code=404, detail=f"No history for thread '{thread_id}'")
-
-    return ChatMessageResponse(
-        reply=messages[-1].content if messages and isinstance(messages[-1], AIMessage) else "",
-        history=_format_history(messages),
-    )
-
-
-@router.delete("/{thread_id}")
-async def clear_thread(thread_id: str) -> dict[str, str]:
-    _thread_versions[thread_id] = _thread_versions.get(thread_id, 0) + 1
-    return {"status": "cleared", "thread_id": thread_id}
-
-
-@router.post("/{thread_id}/assess")
-async def assess_and_discuss(
-    thread_id: str,
-    request: AssessmentChatRequest,
-    rubrics: RubricStoreDep,
-) -> AssessmentChatResponse:
-    graph = _get_assess_graph()
-    config = _effective_config(thread_id)
-
-    input_data: dict = {"messages": [HumanMessage(content=request.message)]}
-
-    if request.student_work:
-        rubric = rubrics.get(request.rubric_id or "essay_default")
-        work_context = request.student_work
-        if rubric:
-            rubric_lines = [f"Rubric: {rubric.name}"]
-            for c in rubric.criteria:
-                rubric_lines.append(
-                    f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}"
-                )
-            work_context = "\n".join(rubric_lines) + "\n\n" + request.student_work
-
-        input_data["student_work"] = work_context
-        input_data["assessment"] = ""
-
-    result = await graph.ainvoke(input_data, config=config)
-
-    messages = result["messages"]
-    reply = messages[-1].content if messages else ""
-    has_assessment = bool(result.get("assessment"))
-
-    return AssessmentChatResponse(
-        reply=reply,
-        history=_format_history(messages),
-        has_assessment=has_assessment,
-    )
-
-
-@router.websocket("/ws/{thread_id}")
-async def websocket_chat(websocket: WebSocket, thread_id: str):
-    await websocket.accept()
-    graph = _get_graph()
-    config = _effective_config(thread_id)
-
-    try:
-        while True:
-            data = await websocket.receive_json()
-            user_message = data.get("message", "")
-            if not user_message:
-                await websocket.send_json({"type": "error", "data": "Empty message"})
-                continue
-
-            input_data = {"messages": [HumanMessage(content=user_message)]}
-            full_response = ""
-
-            async for event in graph.astream_events(
-                input_data, config=config, version="v2"
-            ):
-                if event["event"] == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
-                    if hasattr(chunk, "content") and chunk.content:
-                        token = chunk.content
-                        full_response += token
-                        await websocket.send_json({"type": "token", "data": token})
-
-            await websocket.send_json({
-                "type": "end",
-                "data": {"message": full_response},
-            })
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        await websocket.send_json({"type": "error", "data": str(exc)})
-        await websocket.close(code=1011)
-```
-
-**Связь с теорией:**
-
-- `_effective_config` реализует thread isolation (раздел 5): каждый `thread_id` получает свою изолированную историю. Версионирование (`_thread_versions`) позволяет "очистить" разговор без удаления данных из MemorySaver — при инкременте версии эффективный `thread_id` меняется, и граф начинает новый разговор.
-- `send_message` показывает stateless API поверх stateful графа (раздел 1): HTTP POST-запрос без состояния, но LangGraph восстанавливает историю из checkpointer автоматически.
-- `websocket_chat` использует `astream_events` для token-by-token стриминга (раздел 6): событие `on_chat_model_stream` генерируется при каждом новом токене от LLM, мы пересылаем его клиенту через WebSocket.
-- `assess_and_discuss` демонстрирует условную маршрутизацию (раздел 5): при первом вызове (`student_work` задан) граф идёт в узел `assess`, при последующих — в `discuss`.
-
----
-
-### Шаг 4: Регистрация роутера
-
-Добавим chat-роутер в главный router приложения.
-
-**Обновление файла `app/api/router.py`:**
-
-```python
-from fastapi import APIRouter
-
-from app.api.v1 import assessment, chat, rubrics
-
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(chat.router)
-```
-
----
-
-### Шаг 5: Тестирование
-
-Запустите сервер:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-**Отправить сообщение в чат:**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chat/thread-1/message \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What makes a strong thesis statement?"}' | python -m json.tool
-```
-
-**Продолжить разговор (история сохраняется автоматически):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chat/thread-1/message \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Can you give me an example?"}' | python -m json.tool
-```
-
-**Получить историю:**
-
-```bash
-curl -s http://localhost:8000/api/v1/chat/thread-1/history | python -m json.tool
-```
-
-**Очистить разговор:**
-
-```bash
-curl -s -X DELETE http://localhost:8000/api/v1/chat/thread-1 | python -m json.tool
-```
-
-**Оценка с обсуждением (первое сообщение с работой):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chat/assess-1/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "Please assess my essay",
-    "student_work": "Climate change is the defining challenge of our generation. Rising global temperatures threaten ecosystems, economies, and human health. According to the IPCC 2023 report, we must reduce emissions by 45% by 2030 to limit warming to 1.5°C.",
-    "rubric_id": "essay_default"
-  }' | python -m json.tool
-```
-
-**Обсудить оценку (последующие сообщения без student_work):**
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/chat/assess-1/assess \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Why did I lose points? How can I improve?"}' | python -m json.tool
-```
-
-**WebSocket чат (установите `wscat`: `npm i -g wscat`):**
-
-```bash
-wscat -c ws://localhost:8000/api/v1/chat/ws/ws-thread-1
-```
-
-После подключения отправляйте JSON-сообщения:
-
-```
-> {"message": "What is prompt engineering?"}
-< {"type":"token","data":"Prompt"}
-< {"type":"token","data":" engineering"}
-< {"type":"token","data":" is"}
-...
-< {"type":"end","data":{"message":"Prompt engineering is..."}}
+asyncio.run(main())
 ```
 
 ---
@@ -918,7 +837,6 @@ wscat -c ws://localhost:8000/api/v1/chat/ws/ws-thread-1
 - [ ] Зачем `MessagesPlaceholder` вместо f-string конкатенации истории в промпт?
 - [ ] Что делает `Annotated[list, add_messages]`? Чем отличается от `Annotated[list, operator.add]`?
 - [ ] Как `thread_id` изолирует разговоры в LangGraph с MemorySaver?
-- [ ] WebSocket vs SSE: когда какой протокол выбрать для LLM-приложения?
 - [ ] Что произойдёт, если checkpointer не указан при `compile()`? Будет ли сохраняться история между вызовами?
 
 ---
@@ -992,16 +910,6 @@ async def respond(state):
     return {"messages": [response]}
 ```
 
-### 5. Блокирующие вызовы в WebSocket handler
-
-```python
-@router.websocket("/ws/{thread_id}")
-async def ws_chat(websocket: WebSocket, thread_id: str):
-    result = graph.invoke(input, config)
-```
-
-`invoke` (не `ainvoke`) блокирует event loop. Все остальные WebSocket-соединения "замерзают" на время вызова LLM (2-30 секунд). Всегда используйте async-варианты: `ainvoke`, `astream`, `astream_events`.
-
 ---
 
 ## Что читать дальше
@@ -1009,7 +917,6 @@ async def ws_chat(websocket: WebSocket, thread_id: str):
 - [LangGraph Persistence](https://langchain-ai.github.io/langgraph/concepts/persistence/) — checkpointing и state management
 - [LangGraph Message Handling](https://langchain-ai.github.io/langgraph/how-tos/manage-conversation-history/) — управление историей в графе
 - [Chat History](https://python.langchain.com/docs/how_to/message_history/) — управление историей в LangChain
-- [FastAPI WebSocket](https://fastapi.tiangolo.com/advanced/websockets/) — WebSocket в FastAPI
 - [add_messages reducer](https://langchain-ai.github.io/langgraph/concepts/low_level/#reducers) — документация reducers в LangGraph
 
 **Следующая тема:** [Тема 8: Observability](topic_08_observability.md) — как наблюдать за LLM в production.

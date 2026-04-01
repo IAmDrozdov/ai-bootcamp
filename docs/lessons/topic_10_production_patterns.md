@@ -1,8 +1,7 @@
 # Тема 10: Production-паттерны
 
 > **Пререквизиты:** все предыдущие темы, особенно [Тема 2 (LCEL)](topic_02_langchain_lcel.md), [Тема 3 (Structured Output)](topic_03_structured_output.md), [Тема 8 (Observability)](topic_08_observability.md), [Тема 9 (Evaluation)](topic_09_evaluation.md)  
-> **Что добавляем в проект:** роутер `app/api/v1/production.py`, сервисы `app/services/model_router.py`, `app/services/guardrails.py`, `app/services/semantic_cache.py`, схемы `app/schemas/production.py`  
-> **Зависимости:** `langchain-openai` (для embeddings в semantic cache), `numpy` (для cosine similarity), `redis`, `langchain-redis` (опционально, для production cache)
+> **Зависимости:** `langchain-openai` (для embeddings в semantic cache), `numpy` (для cosine similarity), `langchain-anthropic`
 
 ---
 
@@ -402,104 +401,20 @@ class AssessmentGuard(BaseModel):
 
 ---
 
-## Практика: роутер `/api/v1/production`
+## Практика
 
-Создаём production-ready API с четырьмя паттернами: model routing, guardrails, semantic cache, cost analysis. Каждый эндпоинт демонстрирует один паттерн из теории.
+Пять самостоятельных примеров — по одному на каждый production-паттерн из теории. Каждый пример можно запустить в Jupyter-ноутбуке как есть.
 
-Архитектура:
+### Пример 1: Model routing — выбор модели по сложности
 
-```
-POST /api/v1/production/routed-assess   →  routing по сложности
-POST /api/v1/production/guarded-assess  →  assessment + валидация + retry
-POST /api/v1/production/cached-assess   →  semantic cache + assessment
-POST /api/v1/production/cost-analysis   →  расчёт стоимости конфигураций
-```
-
-### Шаг 1: Схемы (`app/schemas/production.py`)
-
-Каждый эндпоинт имеет собственную пару Request/Response. Response-модели расширяют `AssessmentResponse` метаданными: routing info, validation attempts, cache status.
-
-```python
-from pydantic import BaseModel, Field
-
-from app.schemas.assessment import AssessmentResponse
-
-
-class RoutedAssessRequest(BaseModel):
-    student_work: str
-    rubric_id: str = "essay_default"
-
-
-class RoutingMetadata(BaseModel):
-    complexity: str = Field(description="simple or complex")
-    model_used: str
-    estimated_cost: float
-
-
-class RoutedAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    routing: RoutingMetadata
-
-
-class GuardedAssessRequest(BaseModel):
-    student_work: str
-    rubric_id: str = "essay_default"
-
-
-class GuardedAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    validation_attempts: int
-
-
-class CachedAssessRequest(BaseModel):
-    student_work: str
-    rubric_id: str = "essay_default"
-
-
-class CachedAssessResponse(BaseModel):
-    assessment: AssessmentResponse
-    cache_hit: bool
-    similarity_score: float
-
-
-class CostConfig(BaseModel):
-    model: str
-    max_tokens: int
-    prompt_length: int
-
-
-class CostEstimate(BaseModel):
-    model: str
-    max_tokens: int
-    prompt_length: int
-    estimated_input_cost: float
-    estimated_output_cost: float
-    total_cost_per_assessment: float
-
-
-class CostAnalysisRequest(BaseModel):
-    configurations: list[CostConfig]
-
-
-class CostAnalysisResponse(BaseModel):
-    estimates: list[CostEstimate]
-```
-
-Связь с теорией: `RoutingMetadata` содержит данные для мониторинга routing-решений (раздел 1). `CachedAssessResponse.cache_hit` и `similarity_score` — метрики semantic cache (раздел 2). `GuardedAssessResponse.validation_attempts` показывает, сколько retry потребовалось guardrails (раздел 3).
-
-### Шаг 2: Сервис model routing (`app/services/model_router.py`)
-
-Rule-based routing: анализируем характеристики текста и рубрики, присваиваем complexity score, выбираем модель. Также включает estimate стоимости вызова.
+Rule-based routing: анализируем характеристики текста, считаем complexity score, выбираем дешёвую или дорогую модель.
 
 ```python
 import re
 
 from langchain_anthropic import ChatAnthropic
-
-from app.chains.assessment_chain import build_assessment_chain
-from app.config import Settings
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.rubric import Rubric
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
 MODEL_PRICING = {
     "claude-haiku-4-20250414": {"input_per_m": 0.80, "output_per_m": 4.00},
@@ -507,18 +422,21 @@ MODEL_PRICING = {
 }
 
 
-def format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
+class AssessmentResult(BaseModel):
+    score: int = Field(description="Overall score 0-100")
+    feedback: str = Field(description="Brief feedback")
 
 
-def classify_complexity(student_work: str, rubric: Rubric) -> str:
-    word_count = len(student_work.split())
-    paragraph_count = len([p for p in student_work.split("\n\n") if p.strip()])
-    has_citations = bool(re.search(r"\(\w+,?\s*\d{4}\)|\[\d+\]|et al\.", student_work))
-    criteria_count = len(rubric.criteria)
+def classify_complexity(text: str) -> tuple[str, dict]:
+    word_count = len(text.split())
+    paragraph_count = len([p for p in text.split("\n\n") if p.strip()])
+    has_citations = bool(re.search(r"\(\w+,?\s*\d{4}\)|\[\d+\]|et al\.", text))
+
+    signals = {
+        "word_count": word_count,
+        "paragraphs": paragraph_count,
+        "has_citations": has_citations,
+    }
 
     complexity_score = 0
     if word_count >= 300:
@@ -527,20 +445,8 @@ def classify_complexity(student_work: str, rubric: Rubric) -> str:
         complexity_score += 1
     if has_citations:
         complexity_score += 1
-    if criteria_count > 3:
-        complexity_score += 1
 
-    return "complex" if complexity_score >= 2 else "simple"
-
-
-def create_routed_llm(complexity: str, config: Settings) -> ChatAnthropic:
-    model = "claude-haiku-4-20250414" if complexity == "simple" else config.model_name
-    return ChatAnthropic(
-        model=model,
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        api_key=config.anthropic_api_key,
-    )
+    return ("complex" if complexity_score >= 2 else "simple"), signals
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -548,174 +454,79 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     return (input_tokens * pricing["input_per_m"] + output_tokens * pricing["output_per_m"]) / 1_000_000
 
 
-async def route_and_assess(
-    student_work: str,
-    rubric: Rubric,
-    config: Settings,
-) -> tuple[AssessmentResponse, str, str, float]:
-    complexity = classify_complexity(student_work, rubric)
-    llm = create_routed_llm(complexity, config)
-    chain = build_assessment_chain(llm)
+simple_essay = "Social media is bad for society. It makes people sad."
 
-    rubric_text = format_rubric(rubric)
-    result = await chain.ainvoke({"student_work": student_work, "rubric": rubric_text})
+complex_essay = """The proliferation of artificial intelligence in educational settings
+presents both transformative opportunities and significant ethical challenges.
 
-    approx_input_tokens = len(student_work.split()) * 2 + 500
-    approx_output_tokens = 500
-    cost = estimate_cost(llm.model, approx_input_tokens, approx_output_tokens)
+Recent research by Smith et al. (2024) demonstrates that AI-powered tutoring
+systems can improve student outcomes by 15-20% in standardized assessments.
+The meta-analysis conducted by Johnson and Lee (2023) across 47 institutions
+corroborates these findings.
 
-    return result, complexity, llm.model, cost
+However, the implementation of such systems raises concerns about data privacy,
+algorithmic bias, and the potential erosion of critical thinking skills.
+
+This essay argues that a balanced framework incorporating AI tools while
+preserving human pedagogical judgment offers the most promising path forward."""
+
+for label, essay in [("Simple", simple_essay), ("Complex", complex_essay)]:
+    complexity, signals = classify_complexity(essay)
+    model = "claude-haiku-4-20250414" if complexity == "simple" else "claude-sonnet-4-20250514"
+
+    approx_input = len(essay.split()) * 2 + 300
+    cost = estimate_cost(model, approx_input, 200)
+
+    print(f"\n{'='*50}")
+    print(f"{label} essay:")
+    print(f"  Signals: {signals}")
+    print(f"  Complexity: {complexity}")
+    print(f"  Model: {model}")
+    print(f"  Estimated cost: ${cost:.6f}")
+
+    llm = ChatAnthropic(model=model, max_tokens=1024)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an essay assessor. Provide a score 0-100 and brief feedback."),
+        ("human", "Assess this essay:\n\n{text}"),
+    ])
+
+    chain = prompt | llm.with_structured_output(AssessmentResult)
+    result = chain.invoke({"text": essay})
+    print(f"  Score: {result.score}, Feedback: {result.feedback[:80]}...")
 ```
 
-Связь с теорией: `classify_complexity` реализует rule-based routing (раздел 1) — считает complexity_score по четырём сигналам. `estimate_cost` использует формулу из раздела 6 (cost optimization). `route_and_assess` возвращает routing metadata для мониторинга.
+### Пример 2: Semantic caching с embeddings
 
-### Шаг 3: Сервис guardrails (`app/services/guardrails.py`)
-
-Валидация LLM output + retry с correction context. `validate_assessment` проверяет все constraints из раздела 3 теории. `assess_with_guardrails` — retry-цикл: при невалидном результате добавляет описание ошибок в промпт и повторяет (до 3 раз).
-
-```python
-from langchain_anthropic import ChatAnthropic
-from langchain_core.prompts import ChatPromptTemplate
-
-from app.prompts.templates import (
-    ASSESSMENT_SYSTEM_PROMPT,
-    FEW_SHOT_BAD_EXAMPLE,
-    FEW_SHOT_GOOD_EXAMPLE,
-)
-from app.schemas.assessment import AssessmentResponse
-from app.schemas.rubric import Rubric
-
-
-class GuardrailError(Exception):
-    def __init__(self, errors: list[str], attempts: int):
-        self.errors = errors
-        self.attempts = attempts
-        super().__init__(f"Validation failed after {attempts} attempts: {errors}")
-
-
-def format_rubric(rubric: Rubric) -> str:
-    lines = [f"Rubric: {rubric.name}\n"]
-    for c in rubric.criteria:
-        lines.append(f"- {c.name} (max {c.max_score}, weight {c.weight}): {c.description}")
-    return "\n".join(lines)
-
-
-def validate_assessment(result: AssessmentResponse, rubric: Rubric) -> list[str]:
-    errors = []
-
-    total = sum(cs.score for cs in result.criterion_scores)
-    if result.overall_score != total:
-        errors.append(
-            f"overall_score ({result.overall_score}) != sum of criterion scores ({total})"
-        )
-
-    max_total = sum(cs.max_score for cs in result.criterion_scores)
-    if result.max_overall_score != max_total:
-        errors.append(
-            f"max_overall_score ({result.max_overall_score}) != sum of max_scores ({max_total})"
-        )
-
-    for cs in result.criterion_scores:
-        if cs.score < 0:
-            errors.append(f"{cs.criterion_name}: score ({cs.score}) is negative")
-        if cs.score > cs.max_score:
-            errors.append(f"{cs.criterion_name}: score ({cs.score}) exceeds max ({cs.max_score})")
-        if not cs.feedback.strip():
-            errors.append(f"{cs.criterion_name}: empty feedback")
-
-    if not result.summary.strip():
-        errors.append("empty summary")
-    if not result.strengths:
-        errors.append("no strengths listed")
-    if not result.improvements:
-        errors.append("no improvements listed")
-
-    return errors
-
-
-async def assess_with_guardrails(
-    student_work: str,
-    rubric: Rubric,
-    llm: ChatAnthropic,
-    max_retries: int = 3,
-) -> tuple[AssessmentResponse, int]:
-    structured_llm = llm.with_structured_output(AssessmentResponse)
-    rubric_text = format_rubric(rubric)
-    correction = ""
-
-    for attempt in range(1, max_retries + 1):
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", ASSESSMENT_SYSTEM_PROMPT),
-            (
-                "human",
-                "Please assess the following student work:\n\n"
-                "{student_work}\n\n{correction}",
-            ),
-        ]).partial(
-            few_shot_good=FEW_SHOT_GOOD_EXAMPLE,
-            few_shot_bad=FEW_SHOT_BAD_EXAMPLE,
-        )
-        chain = prompt | structured_llm
-
-        result = await chain.ainvoke({
-            "student_work": student_work,
-            "rubric": rubric_text,
-            "correction": correction,
-        })
-
-        errors = validate_assessment(result, rubric)
-        if not errors:
-            return result, attempt
-
-        correction = (
-            f"IMPORTANT: Your previous assessment had validation errors: "
-            f"{'; '.join(errors)}. "
-            f"Ensure overall_score equals the sum of criterion scores, "
-            f"all scores are within [0, max_score], and all fields are non-empty."
-        )
-
-    raise GuardrailError(errors, max_retries)
-```
-
-Связь с теорией: `validate_assessment` реализует все четыре уровня валидации из раздела 3 (структурный, полнота, согласованность). Retry с correction context — ключевой паттерн: модель получает описание своих ошибок и исправляет их. `{correction}` — пустая строка при первой попытке, описание ошибок при повторных.
-
-### Шаг 4: Сервис semantic cache (`app/services/semantic_cache.py`)
-
-In-memory semantic cache с embedding-based similarity search. Использует OpenAI embeddings для vectorизации и numpy cosine similarity для поиска. Ключ кэша = `rubric_id:student_work` — одно эссе с разными рубриками кэшируется отдельно.
-
-Для production замените in-memory на Redis + HNSW index. Для обучения in-memory достаточно.
+In-memory semantic cache: embedding запроса → cosine similarity с кэшированными → threshold check. Похожие запросы возвращают кэшированный результат без повторного вызова LLM.
 
 ```python
 import numpy as np
 from langchain_openai import OpenAIEmbeddings
 
-from app.schemas.assessment import AssessmentResponse
-
 
 class SemanticCache:
-    def __init__(self, similarity_threshold: float = 0.95):
+    def __init__(self, threshold: float = 0.95):
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.threshold = similarity_threshold
-        self._cache: list[tuple[list[float], AssessmentResponse]] = []
+        self.threshold = threshold
+        self._cache: list[tuple[str, list[float], str]] = []
 
-    async def get(
-        self, student_work: str, rubric_id: str,
-    ) -> tuple[AssessmentResponse | None, float]:
+    def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        a_arr, b_arr = np.array(a), np.array(b)
+        norm = np.linalg.norm(a_arr) * np.linalg.norm(b_arr)
+        if norm == 0:
+            return 0.0
+        return float(np.dot(a_arr, b_arr) / norm)
+
+    def get(self, key: str) -> tuple[str | None, float]:
         if not self._cache:
             return None, 0.0
 
-        cache_key = f"{rubric_id}:{student_work}"
-        query_vec = np.array(await self.embeddings.aembed_query(cache_key))
-
+        query_vec = self.embeddings.embed_query(key)
         best_score = 0.0
         best_result = None
 
-        for cached_vec_list, cached_result in self._cache:
-            cached_vec = np.array(cached_vec_list)
-            norm_product = np.linalg.norm(query_vec) * np.linalg.norm(cached_vec)
-            if norm_product == 0:
-                continue
-            similarity = float(np.dot(query_vec, cached_vec) / norm_product)
+        for cached_key, cached_vec, cached_result in self._cache:
+            similarity = self._cosine_similarity(query_vec, cached_vec)
             if similarity > best_score:
                 best_score = similarity
                 best_result = cached_result
@@ -724,268 +535,272 @@ class SemanticCache:
             return best_result, best_score
         return None, best_score
 
-    async def set(
-        self, student_work: str, rubric_id: str, result: AssessmentResponse,
-    ) -> None:
-        cache_key = f"{rubric_id}:{student_work}"
-        embedding = await self.embeddings.aembed_query(cache_key)
-        self._cache.append((embedding, result))
+    def set(self, key: str, value: str) -> None:
+        vec = self.embeddings.embed_query(key)
+        self._cache.append((key, vec, value))
 
 
-_cache_instance: SemanticCache | None = None
+cache = SemanticCache(threshold=0.95)
 
+rubric_id = "essay_v1"
+text_1 = "Evaluate this essay about climate change and its impact on polar bears"
+text_2 = "Assess this essay on climate change effects on polar bear populations"
+text_3 = "Review this paper about machine learning in healthcare"
 
-def get_semantic_cache() -> SemanticCache:
-    global _cache_instance
-    if _cache_instance is None:
-        _cache_instance = SemanticCache()
-    return _cache_instance
+cache.set(f"{rubric_id}:{text_1}", "Score: 75, Good analysis of climate impact")
+
+for label, query in [("Similar query", text_2), ("Different query", text_3)]:
+    result, similarity = cache.get(f"{rubric_id}:{query}")
+    print(f"\n{label}:")
+    print(f"  Similarity: {similarity:.4f}")
+    print(f"  Cache hit: {result is not None}")
+    if result:
+        print(f"  Cached result: {result}")
+
+cache.set(f"other_rubric:{text_1}", "Score: 60, Different rubric criteria")
+result_same, _ = cache.get(f"{rubric_id}:{text_1}")
+result_other, _ = cache.get(f"other_rubric:{text_1}")
+print(f"\nSame text, different rubrics:")
+print(f"  Rubric '{rubric_id}': {result_same}")
+print(f"  Rubric 'other_rubric': {result_other}")
 ```
 
-Связь с теорией: реализует полный цикл semantic caching из раздела 2 — embedding → similarity search → threshold check. `rubric_id` в ключе кэша предотвращает ошибку "cache без учёта рубрики". Singleton-паттерн (`get_semantic_cache`) гарантирует единый кэш для всего приложения.
+### Пример 3: Guardrails — валидация LLM output с retry
 
-### Шаг 5: Роутер (`app/api/v1/production.py`)
-
-Роутер связывает HTTP-эндпоинты с тремя сервисами. Каждый эндпоинт демонстрирует один production-паттерн. Dependency injection через `Depends()` — тот же паттерн, что и в основном assessment-роутере.
+Валидация structured output и retry с correction context. При невалидном результате описание ошибок добавляется в промпт — модель исправляет себя.
 
 ```python
-from fastapi import APIRouter, HTTPException
-
-from app.dependencies import LLMDep, RubricStoreDep, SettingsDep
-from app.schemas.production import (
-    CachedAssessRequest,
-    CachedAssessResponse,
-    CostAnalysisRequest,
-    CostAnalysisResponse,
-    CostEstimate,
-    GuardedAssessRequest,
-    GuardedAssessResponse,
-    RoutedAssessRequest,
-    RoutedAssessResponse,
-    RoutingMetadata,
-)
-from app.services.guardrails import GuardrailError, assess_with_guardrails
-from app.services.model_router import (
-    MODEL_PRICING,
-    route_and_assess,
-)
-from app.services.semantic_cache import get_semantic_cache
-
-router = APIRouter(prefix="/production", tags=["lesson-10-production"])
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-@router.post("/routed-assess")
-async def routed_assessment(
-    request: RoutedAssessRequest,
-    rubrics: RubricStoreDep,
-    settings: SettingsDep,
-) -> RoutedAssessResponse:
-    rubric = rubrics.get(request.rubric_id)
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
+class CriterionScore(BaseModel):
+    name: str
+    score: int
+    max_score: int
+    feedback: str
 
-    result, complexity, model, cost = await route_and_assess(
-        request.student_work, rubric, settings,
-    )
-
-    return RoutedAssessResponse(
-        assessment=result,
-        routing=RoutingMetadata(
-            complexity=complexity,
-            model_used=model,
-            estimated_cost=round(cost, 6),
-        ),
-    )
+    @field_validator("score")
+    @classmethod
+    def score_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("score must be >= 0")
+        return v
 
 
-@router.post("/guarded-assess")
-async def guarded_assessment(
-    request: GuardedAssessRequest,
-    rubrics: RubricStoreDep,
-    llm: LLMDep,
-) -> GuardedAssessResponse:
-    rubric = rubrics.get(request.rubric_id)
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
+class Assessment(BaseModel):
+    criterion_scores: list[CriterionScore]
+    overall_score: int
+    summary: str
+    strengths: list[str]
+    improvements: list[str]
 
-    try:
-        result, attempts = await assess_with_guardrails(
-            request.student_work, rubric, llm,
-        )
-    except GuardrailError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Validation failed after {e.attempts} attempts: {e.errors}",
-        )
-
-    return GuardedAssessResponse(assessment=result, validation_attempts=attempts)
+    @model_validator(mode="after")
+    def check_score_sum(self) -> "Assessment":
+        total = sum(cs.score for cs in self.criterion_scores)
+        if self.overall_score != total:
+            raise ValueError(
+                f"overall_score ({self.overall_score}) != sum ({total})"
+            )
+        return self
 
 
-@router.post("/cached-assess")
-async def cached_assessment(
-    request: CachedAssessRequest,
-    rubrics: RubricStoreDep,
-    llm: LLMDep,
-) -> CachedAssessResponse:
-    rubric = rubrics.get(request.rubric_id)
-    if not rubric:
-        raise HTTPException(status_code=404, detail=f"Rubric '{request.rubric_id}' not found")
+def validate_assessment(result: Assessment, max_scores: dict[str, int]) -> list[str]:
+    errors = []
+    for cs in result.criterion_scores:
+        if cs.name in max_scores and cs.score > max_scores[cs.name]:
+            errors.append(f"{cs.name}: score {cs.score} exceeds max {max_scores[cs.name]}")
+        if not cs.feedback.strip():
+            errors.append(f"{cs.name}: empty feedback")
+    if not result.summary.strip():
+        errors.append("empty summary")
+    if not result.strengths:
+        errors.append("no strengths listed")
+    if not result.improvements:
+        errors.append("no improvements listed")
+    total = sum(cs.score for cs in result.criterion_scores)
+    if result.overall_score != total:
+        errors.append(f"overall_score ({result.overall_score}) != sum ({total})")
+    return errors
 
-    cache = get_semantic_cache()
-    cached, similarity = await cache.get(request.student_work, request.rubric_id)
 
-    if cached:
-        return CachedAssessResponse(
-            assessment=cached,
-            cache_hit=True,
-            similarity_score=round(similarity, 4),
-        )
+llm = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=2048)
 
-    from app.chains.assessment_chain import build_assessment_chain
-    from app.services.model_router import format_rubric
+rubric = "Criteria: Content (max 40), Structure (max 30), Language (max 30)"
+max_scores = {"Content": 40, "Structure": 30, "Language": 30}
+student_work = "Climate change is a pressing global issue affecting every continent."
 
-    chain = build_assessment_chain(llm)
-    rubric_text = format_rubric(rubric)
-    result = await chain.ainvoke({
-        "student_work": request.student_work,
-        "rubric": rubric_text,
+correction = ""
+max_retries = 3
+
+for attempt in range(1, max_retries + 1):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an essay assessor. Use EXACTLY these criteria with their max scores. "
+                   "overall_score MUST equal the sum of criterion scores.\n\n{rubric}"),
+        ("human", "Assess this work:\n\n{student_work}\n\n{correction}"),
+    ])
+
+    chain = prompt | llm.with_structured_output(Assessment)
+
+    result = chain.invoke({
+        "student_work": student_work,
+        "rubric": rubric,
+        "correction": correction,
     })
 
-    await cache.set(request.student_work, request.rubric_id, result)
+    errors = validate_assessment(result, max_scores)
 
-    return CachedAssessResponse(
-        assessment=result,
-        cache_hit=False,
-        similarity_score=round(similarity, 4),
+    print(f"\nAttempt {attempt}:")
+    print(f"  Overall: {result.overall_score}")
+    print(f"  Criteria: {[(cs.name, cs.score) for cs in result.criterion_scores]}")
+
+    if not errors:
+        print(f"  ✓ Validation passed on attempt {attempt}")
+        break
+
+    print(f"  Errors: {errors}")
+    correction = (
+        f"IMPORTANT: Fix these validation errors: {'; '.join(errors)}. "
+        f"overall_score must equal sum of criterion scores. "
+        f"All scores must be within [0, max_score]."
     )
-
-
-@router.post("/cost-analysis")
-async def cost_analysis(request: CostAnalysisRequest) -> CostAnalysisResponse:
-    estimates = []
-    for config in request.configurations:
-        pricing = MODEL_PRICING.get(config.model, MODEL_PRICING["claude-sonnet-4-20250514"])
-        input_tokens = config.prompt_length + 500
-        output_tokens = min(config.max_tokens, 1500)
-
-        input_cost = input_tokens * pricing["input_per_m"] / 1_000_000
-        output_cost = output_tokens * pricing["output_per_m"] / 1_000_000
-
-        estimates.append(CostEstimate(
-            model=config.model,
-            max_tokens=config.max_tokens,
-            prompt_length=config.prompt_length,
-            estimated_input_cost=round(input_cost, 6),
-            estimated_output_cost=round(output_cost, 6),
-            total_cost_per_assessment=round(input_cost + output_cost, 6),
-        ))
-
-    return CostAnalysisResponse(estimates=estimates)
+else:
+    print(f"\n✗ Validation failed after {max_retries} attempts")
 ```
 
-### Шаг 6: Регистрация в `app/api/router.py`
+### Пример 4: Rate limiting и retry-стратегии
 
-Добавляем production-роутер:
+Exponential backoff с jitter, fallback на альтернативную модель, `.with_retry()` и `.with_fallbacks()` из LangChain.
 
 ```python
-from fastapi import APIRouter
+import random
+import time
 
-from app.api.v1 import assessment, eval, production, rubrics
+from anthropic import RateLimitError, APIStatusError
+from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
-api_router = APIRouter(prefix="/api/v1")
-api_router.include_router(assessment.router)
-api_router.include_router(rubrics.router)
-api_router.include_router(eval.router)
-api_router.include_router(production.router)
+
+class SimpleScore(BaseModel):
+    score: int = Field(ge=0, le=100)
+    feedback: str
+
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Score the essay 0-100 with brief feedback."),
+    ("human", "{text}"),
+])
+
+
+sonnet = ChatAnthropic(model="claude-sonnet-4-20250514", max_tokens=1024)
+haiku = ChatAnthropic(model="claude-haiku-4-20250414", max_tokens=1024)
+
+primary = prompt | sonnet.with_structured_output(SimpleScore)
+fallback = prompt | haiku.with_structured_output(SimpleScore)
+
+chain_with_retry = primary.with_retry(
+    stop_after_attempt=3,
+    wait_exponential_jitter=True,
+    retry_if_exception_type=(RateLimitError, APIStatusError),
+)
+print("✓ Chain with retry (3 attempts, exponential backoff + jitter)")
+
+chain_with_fallback = primary.with_fallbacks(
+    fallbacks=[fallback],
+    exceptions_to_handle=(RateLimitError,),
+)
+print("✓ Chain with fallback (Sonnet → Haiku)")
+
+robust_chain = (
+    primary
+    .with_retry(stop_after_attempt=2, wait_exponential_jitter=True)
+    .with_fallbacks(fallbacks=[fallback])
+)
+print("✓ Robust chain (retry 2x → fallback to Haiku)")
+
+result = robust_chain.invoke({"text": "Social media affects modern communication patterns."})
+print(f"\nResult: score={result.score}, feedback={result.feedback[:80]}...")
+
+
+print("\n--- Manual backoff demo ---")
+def call_with_backoff(func, max_attempts=3, base_delay=1.0):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, base_delay * attempt)
+            print(f"  Attempt {attempt} failed: {type(e).__name__}. Retry in {delay:.1f}s")
+            time.sleep(delay)
+
+
+print("Exponential backoff pattern:")
+print("  Attempt 1 fail → wait ~1.0 + random(0, 1.0)s")
+print("  Attempt 2 fail → wait ~2.0 + random(0, 2.0)s")
+print("  Attempt 3 fail → wait ~4.0 + random(0, 3.0)s")
 ```
 
-### Шаг 7: Тестирование
+### Пример 5: Cost optimization — расчёт и сравнение стоимости
 
-```bash
-uvicorn app.main:app --reload
+Расчёт стоимости для разных конфигураций: модель, длина промпта, max_tokens. Оценка экономии от routing и caching.
+
+```python
+MODEL_PRICING = {
+    "claude-haiku-4-20250414": {"input_per_m": 0.80, "output_per_m": 4.00},
+    "claude-sonnet-4-20250514": {"input_per_m": 3.00, "output_per_m": 15.00},
+}
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> dict:
+    pricing = MODEL_PRICING[model]
+    input_cost = input_tokens * pricing["input_per_m"] / 1_000_000
+    output_cost = output_tokens * pricing["output_per_m"] / 1_000_000
+    return {
+        "model": model.split("-")[1].capitalize(),
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "total": input_cost + output_cost,
+    }
+
+
+configs = [
+    ("claude-sonnet-4-20250514", 2000, 500),
+    ("claude-sonnet-4-20250514", 2000, 1500),
+    ("claude-haiku-4-20250414", 2000, 500),
+    ("claude-haiku-4-20250414", 2000, 1500),
+]
+
+print("Per-assessment cost comparison:")
+print(f"{'Model':<10} {'Input tok':>10} {'Output tok':>10} {'Cost':>12}")
+print("-" * 45)
+
+for model, inp, out in configs:
+    est = estimate_cost(model, inp, out)
+    print(f"{est['model']:<10} {inp:>10} {out:>10} ${est['total']:>10.6f}")
+
+
+daily_assessments = 1000
+haiku_ratio = 0.6
+
+sonnet_cost = estimate_cost("claude-sonnet-4-20250514", 2000, 500)["total"]
+haiku_cost = estimate_cost("claude-haiku-4-20250414", 2000, 500)["total"]
+
+all_sonnet_daily = sonnet_cost * daily_assessments
+routed_daily = (haiku_cost * daily_assessments * haiku_ratio +
+                sonnet_cost * daily_assessments * (1 - haiku_ratio))
+
+cache_hit_rate = 0.30
+routed_cached_daily = routed_daily * (1 - cache_hit_rate)
+
+print(f"\n--- Daily cost ({daily_assessments} assessments/day) ---")
+print(f"All Sonnet:              ${all_sonnet_daily:.2f}/day = ${all_sonnet_daily * 30:.0f}/month")
+print(f"Routing (60% Haiku):     ${routed_daily:.2f}/day = ${routed_daily * 30:.0f}/month")
+print(f"Routing + Cache (30%):   ${routed_cached_daily:.2f}/day = ${routed_cached_daily * 30:.0f}/month")
+print(f"\nSavings with all optimizations: {(1 - routed_cached_daily / all_sonnet_daily) * 100:.0f}%")
 ```
-
-**1. Model routing:**
-
-Короткое эссе → ожидаем routing на Haiku:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/routed-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Social media is bad for society. Everyone knows this. It makes people sad and distracted. We should use it less.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Длинное эссе с цитатами → ожидаем routing на Sonnet:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/routed-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The proliferation of artificial intelligence in educational settings presents both transformative opportunities and significant ethical challenges that demand careful examination.\n\nRecent research by Smith et al. (2024) demonstrates that AI-powered tutoring systems can improve student outcomes by 15-20% in standardized assessments. The meta-analysis conducted by Johnson and Lee (2023) across 47 institutions corroborates these findings, noting particular effectiveness in STEM disciplines.\n\nHowever, the implementation of such systems raises concerns about data privacy, algorithmic bias, and the potential erosion of critical thinking skills. As Nguyen (2024) argues, over-reliance on AI feedback may create a generation of students who cannot self-assess their work.\n\nThis essay argues that a balanced framework incorporating AI tools while preserving human pedagogical judgment offers the most promising path forward. Drawing on case studies from three universities that have successfully integrated AI assessment tools, I will demonstrate that the key lies not in choosing between human and artificial intelligence, but in designing systems where each complements the other.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Проверьте поле `routing` в ответе — `complexity` и `model_used` должны отличаться.
-
-**2. Guardrails:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/guarded-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Climate change is real. We need to act now. The polar ice caps are melting and sea levels are rising. Scientists agree that human activity is the main cause.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Обратите внимание на `validation_attempts` в ответе. Значение 1 — модель дала валидный ответ с первой попытки. Значение 2–3 — были retry с correction context.
-
-**3. Semantic cache:**
-
-Первый запрос — cache miss:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/cached-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of renewable energy on global economics is significant. Solar and wind power have become increasingly cost-competitive with fossil fuels.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Повторный запрос (идентичный или почти идентичный) — cache hit:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/cached-assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "The impact of renewable energy on global economics is significant. Solar and wind power have become increasingly cost-competitive with fossil fuels.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-Проверьте `cache_hit: true` и `similarity_score` ≈ 1.0 во втором ответе.
-
-**4. Cost analysis:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/production/cost-analysis \
-  -H "Content-Type: application/json" \
-  -d '{
-    "configurations": [
-      {"model": "claude-sonnet-4-20250514", "max_tokens": 4096, "prompt_length": 2000},
-      {"model": "claude-sonnet-4-20250514", "max_tokens": 2048, "prompt_length": 2000},
-      {"model": "claude-haiku-4-20250414", "max_tokens": 4096, "prompt_length": 2000},
-      {"model": "claude-haiku-4-20250414", "max_tokens": 2048, "prompt_length": 1000}
-    ]
-  }'
-```
-
-Ответ содержит estimated cost для каждой конфигурации — используйте для выбора оптимального баланса цена/качество.
 
 ---
 

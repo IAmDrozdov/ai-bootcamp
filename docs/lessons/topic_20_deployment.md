@@ -1,7 +1,6 @@
 # Тема 20: Deployment — деплой LLM-приложений
 
 > **Пререквизиты:** [Тема 10: Production-паттерны](topic_10_production_patterns.md), знакомство с Docker
-> **Что добавляем в проект:** `Dockerfile`, `docker-compose.yml`, `app/api/v1/health.py`, `langserve_app.py`, `scripts/deploy.sh`
 > **Зависимости:** `docker`, `langserve[all]`, `uvicorn`, `gunicorn`
 
 ---
@@ -20,7 +19,7 @@
 
 **Стоимость.** LLM API стоит денег. Claude Sonnet: $3/M input, $15/M output tokens. Один assessment запрос — $0.01-0.02. Тысяча оценок в день — $10-20. Звучит немного, но баг в коде (бесконечный цикл retry, дублированные запросы) может привести к счёту в тысячи долларов за ночь. Мониторинг расходов — не опция, а необходимость.
 
-**Stateless vs Stateful.** Наш assessment API — stateless: получил запрос, оценил, вернул результат. Это идеально для горизонтального масштабирования. Но conversation-based приложения (чат-бот, tutor) требуют хранения истории диалога — они stateful и нуждаются в session affinity или внешнем хранилище сессий (Redis).
+**Stateless vs Stateful.** Типичный LLM API — stateless: получил запрос, обработал, вернул результат. Это идеально для горизонтального масштабирования. Но conversation-based приложения (чат-бот, tutor) требуют хранения истории диалога — они stateful и нуждаются в session affinity или внешнем хранилище сессий (Redis).
 
 Чеклист перед деплоем LLM-приложения:
 
@@ -442,7 +441,7 @@ add_routes(
 - Высоконагруженный production с кастомным rate limiting и circuit breaking
 - Нужен контроль над форматом ответа (свой error handling, envelope)
 
-В нашем проекте LangServe удобен для отдельного сервиса-песочницы, где можно тестировать chains. Основной assessment API мы по-прежнему пишем вручную через FastAPI — это даёт полный контроль.
+LangServe удобен как отдельный сервис-песочница, где можно тестировать chains. Для production API с кастомной логикой часто пишут вручную через FastAPI или другой фреймворк — это даёт полный контроль.
 
 ### 7. Environment Management и Secrets
 
@@ -546,7 +545,7 @@ def log_llm_call(model: str, input_tokens: int, output_tokens: int, latency_ms: 
 Client → Nginx (LB) → [App-1, App-2, App-3] → LLM API
 ```
 
-Наш assessment API stateless — любая реплика может обработать любой запрос. Docker Compose:
+Stateless LLM API — любая реплика может обработать любой запрос. Docker Compose:
 
 ```yaml
 services:
@@ -561,14 +560,14 @@ Kubernetes:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: assessment-api
+  name: llm-app
 spec:
   replicas: 3
   template:
     spec:
       containers:
         - name: app
-          image: assessment-api:latest
+          image: llm-app:latest
           resources:
             requests:
               memory: "512Mi"
@@ -830,19 +829,17 @@ class Settings(BaseSettings):
 
 ## Практика
 
-### Шаг 1. Health Checks — `app/api/v1/health.py`
+### Шаг 1. Health Checks
 
-Создаём полноценный health check роутер с проверкой всех компонентов системы. Каждый компонент проверяется отдельно, результаты агрегируются.
+Автономный модуль проверки компонентов с кэшированием результатов. Его можно подключить к любому ASGI-фреймворку (FastAPI, Starlette, LangServe).
 
 Зачем три разных эндпоинта: Docker и Kubernetes используют разные типы проб. Liveness — перезапустить зависший контейнер. Readiness — убрать из балансировки, пока зависимость недоступна. Startup — дождаться первичной инициализации.
 
 ```python
+import os
 from datetime import datetime, timedelta
 
 import httpx
-from fastapi import APIRouter
-
-router = APIRouter(prefix="/health", tags=["health"])
 
 _health_cache: dict[str, tuple[dict, datetime]] = {}
 CACHE_TTL = timedelta(seconds=30)
@@ -861,12 +858,10 @@ def _set_cache(component: str, result: dict):
     _health_cache[component] = (result, datetime.now())
 
 
-@router.get("/live")
 async def liveness() -> dict:
     return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
 
-@router.get("/ready")
 async def readiness() -> dict:
     components = {}
 
@@ -883,12 +878,8 @@ async def readiness() -> dict:
     }
 
 
-@router.get("/startup")
 async def startup_check() -> dict:
-    return {
-        "status": "started",
-        "timestamp": datetime.now().isoformat(),
-    }
+    return {"status": "started", "timestamp": datetime.now().isoformat()}
 
 
 async def _check_llm_api() -> dict:
@@ -898,7 +889,7 @@ async def _check_llm_api() -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
+            await client.get(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": "test", "anthropic-version": "2023-06-01"},
             )
@@ -915,7 +906,6 @@ async def _check_chromadb() -> dict:
     if cached:
         return cached
 
-    import os
     host = os.getenv("CHROMA_HOST", "localhost")
     port = os.getenv("CHROMA_PORT", "8100")
 
@@ -936,7 +926,6 @@ async def _check_redis() -> dict:
     if cached:
         return cached
 
-    import os
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     try:
@@ -952,17 +941,32 @@ async def _check_redis() -> dict:
     return result
 ```
 
-Регистрация роутера в основном приложении:
+Пример подключения к ASGI-приложению:
 
 ```python
-from app.api.v1.health import router as health_router
+from fastapi import FastAPI
 
-app.include_router(health_router)
+app = FastAPI()
+
+
+@app.get("/health/live")
+async def health_live():
+    return await liveness()
+
+
+@app.get("/health/ready")
+async def health_ready():
+    return await readiness()
+
+
+@app.get("/health/startup")
+async def health_startup():
+    return await startup_check()
 ```
 
 ### Шаг 2. Dockerfile
 
-Полный production-ready Dockerfile. Multi-stage build, non-root user, оптимизированное кэширование слоёв.
+Production-ready Dockerfile для Python LLM-приложения. Multi-stage build, non-root user, оптимизированное кэширование слоёв.
 
 ```dockerfile
 FROM python:3.12-slim AS builder
@@ -992,11 +996,10 @@ RUN useradd --create-home appuser
 
 WORKDIR /home/appuser/app
 
-COPY app/ ./app/
-COPY scripts/ ./scripts/
-COPY langserve_app.py ./
+COPY src/ ./src/
+COPY entrypoint.sh ./
 
-RUN chmod +x scripts/*.sh
+RUN chmod +x entrypoint.sh
 
 USER appuser
 
@@ -1005,7 +1008,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health/live || exit 1
 
-CMD ["gunicorn", "app.main:app", \
+CMD ["gunicorn", "src.main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "2", \
      "--bind", "0.0.0.0:8000", \
@@ -1043,15 +1046,15 @@ docker-compose*.yml
 Сборка и проверка размера:
 
 ```bash
-docker build -t assessment-api:latest .
-docker images assessment-api
+docker build -t llm-app:latest .
+docker images llm-app
 ```
 
 Ожидаемый размер: 200-350MB в зависимости от зависимостей.
 
 ### Шаг 3. docker-compose.yml
 
-Полный стек для локальной разработки и staging. Включает все компоненты assessment-системы.
+Полный стек для LLM-приложения: основной сервис, vector store, кэш, observability.
 
 ```yaml
 services:
@@ -1191,84 +1194,74 @@ docker compose ps
 docker compose logs -f app
 ```
 
-### Шаг 4. LangServe — `langserve_app.py`
+### Шаг 4. LangServe
 
-Отдельное приложение, которое экспонирует assessment chain через LangServe. Запускается как отдельный сервис или для demo/playground.
+Автономное LangServe-приложение, которое экспонирует LLM-chain как REST API с playground. Не зависит от конкретного проекта — достаточно установить зависимости и задать переменные окружения.
 
 ```python
+import os
+
 from fastapi import FastAPI
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 from langserve import add_routes
 from pydantic import BaseModel, Field
 
-from app.config import get_settings
-
-settings = get_settings()
-
 app = FastAPI(
-    title="Assessment LangServe",
-    description="LangServe playground for assessment chains",
+    title="LLM LangServe Demo",
+    description="LangServe playground for LLM chains",
     version="0.1.0",
 )
 
 
-class AssessInput(BaseModel):
-    student_work: str = Field(description="The student's work to assess")
-    rubric: str = Field(
-        default="Evaluate clarity, argumentation, grammar. Score 0-100.",
-        description="Assessment rubric",
+class SummarizeInput(BaseModel):
+    text: str = Field(description="Text to summarize")
+    max_length: str = Field(
+        default="2-3 sentences",
+        description="Desired summary length",
     )
 
 
-class CriterionResult(BaseModel):
-    name: str = Field(description="Criterion name")
-    score: int = Field(description="Score for this criterion (0-100)")
-    comment: str = Field(description="Feedback for this criterion")
-
-
-class AssessOutput(BaseModel):
-    overall_score: int = Field(description="Overall score (0-100)")
-    summary: str = Field(description="Brief overall assessment")
-    criteria: list[CriterionResult] = Field(description="Per-criterion results")
+class SummarizeOutput(BaseModel):
+    summary: str = Field(description="Summarized text")
+    key_points: list[str] = Field(description="Key points extracted")
 
 
 llm = ChatAnthropic(
-    model=settings.model_name,
-    api_key=settings.anthropic_api_key,
-    temperature=settings.temperature,
-    max_tokens=settings.max_tokens,
+    model=os.getenv("MODEL_NAME", "claude-sonnet-4-20250514"),
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    temperature=float(os.getenv("TEMPERATURE", "0.3")),
+    max_tokens=int(os.getenv("MAX_TOKENS", "2048")),
 )
 
-assessment_prompt = ChatPromptTemplate.from_messages([
+summarize_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are an expert academic assessor. "
-        "Evaluate the student's work according to the provided rubric. "
-        "Be specific and constructive in your feedback.",
+        "You are an expert summarizer. "
+        "Summarize the given text concisely, extracting key points.",
     ),
     (
         "human",
-        "Rubric:\n{rubric}\n\nStudent work:\n{student_work}",
+        "Desired length: {max_length}\n\nText:\n{text}",
     ),
 ])
 
-assessment_chain = assessment_prompt | llm.with_structured_output(AssessOutput)
+structured_chain = summarize_prompt | llm.with_structured_output(SummarizeOutput)
 
 add_routes(
     app,
-    assessment_chain,
-    path="/assess",
-    input_type=AssessInput,
-    output_type=AssessOutput,
+    structured_chain,
+    path="/summarize",
+    input_type=SummarizeInput,
+    output_type=SummarizeOutput,
 )
 
-simple_chain = assessment_prompt | llm
+plain_chain = summarize_prompt | llm
 
 add_routes(
     app,
-    simple_chain,
-    path="/assess-text",
+    plain_chain,
+    path="/summarize-text",
 )
 
 
@@ -1277,23 +1270,23 @@ async def health() -> dict:
     return {"status": "ok"}
 ```
 
-Запуск и тестирование:
+Запуск:
 
 ```bash
 uvicorn langserve_app:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-Открыть в браузере: `http://localhost:8001/assess/playground`
+Открыть playground в браузере: `http://localhost:8001/summarize/playground`
 
 Тест через curl:
 
 ```bash
-curl -X POST http://localhost:8001/assess/invoke \
+curl -X POST http://localhost:8001/summarize/invoke \
   -H "Content-Type: application/json" \
   -d '{
     "input": {
-      "student_work": "The mitochondria is the powerhouse of the cell.",
-      "rubric": "Evaluate scientific accuracy and depth. Score 0-100."
+      "text": "Docker is a platform for developing, shipping, and running applications in containers. Containers package code and dependencies together, ensuring consistent behavior across environments.",
+      "max_length": "1 sentence"
     }
   }'
 ```
@@ -1301,18 +1294,51 @@ curl -X POST http://localhost:8001/assess/invoke \
 Получить JSON Schema входных данных:
 
 ```bash
-curl http://localhost:8001/assess/input_schema
+curl http://localhost:8001/summarize/input_schema
 ```
 
-### Шаг 5. entrypoint.sh — `scripts/entrypoint.sh`
+### Шаг 5. Environment Configuration и Entrypoint
 
-Production startup script. Конфигурируется через переменные окружения, поддерживает graceful shutdown.
+Конфигурация через Pydantic Settings — единый способ управления переменными окружения для любого Python LLM-приложения:
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    anthropic_api_key: str
+    openai_api_key: str = ""
+    model_name: str = "claude-sonnet-4-20250514"
+    temperature: float = 0.3
+    max_tokens: int = 4096
+
+    chroma_host: str = "localhost"
+    chroma_port: int = 8100
+    redis_url: str = "redis://localhost:6379/0"
+
+    log_level: str = "info"
+    environment: str = "development"
+    workers: int = 2
+    timeout: int = 120
+
+
+settings = Settings()
+print(f"Model: {settings.model_name}, Environment: {settings.environment}")
+```
+
+Production entrypoint-скрипт. Конфигурируется через переменные окружения, поддерживает graceful shutdown:
 
 ```bash
 #!/bin/bash
 set -e
 
-echo "=== Assessment API Starting ==="
+echo "=== LLM Application Starting ==="
 echo "Environment: ${ENVIRONMENT:-development}"
 echo "Workers: ${WORKERS:-2}"
 echo "Timeout: ${TIMEOUT:-120}s"
@@ -1320,7 +1346,7 @@ echo "Bind: ${BIND:-0.0.0.0:8000}"
 
 if [ "${ENVIRONMENT}" = "development" ]; then
     echo "Starting in development mode with auto-reload..."
-    exec uvicorn app.main:app \
+    exec uvicorn src.main:app \
         --host 0.0.0.0 \
         --port "${PORT:-8000}" \
         --reload \
@@ -1328,7 +1354,7 @@ if [ "${ENVIRONMENT}" = "development" ]; then
 fi
 
 echo "Starting in production mode with gunicorn..."
-exec gunicorn app.main:app \
+exec gunicorn src.main:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers "${WORKERS:-2}" \
     --bind "${BIND:-0.0.0.0:8000}" \
@@ -1342,16 +1368,18 @@ exec gunicorn app.main:app \
     --error-logfile -
 ```
 
+`exec` заменяет shell-процесс на gunicorn — контейнер получает PID 1 для gunicorn, что важно для корректной обработки SIGTERM при остановке контейнера.
+
 Обновление Dockerfile для использования entrypoint:
 
 ```dockerfile
-COPY scripts/ ./scripts/
-RUN chmod +x scripts/*.sh
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-ENTRYPOINT ["./scripts/entrypoint.sh"]
+ENTRYPOINT ["./entrypoint.sh"]
 ```
 
-### Шаг 6. Testing
+### Шаг 6. Проверка
 
 После создания всех файлов — проверяем работоспособность.
 
@@ -1393,36 +1421,23 @@ curl http://localhost:8000/health/ready
 }
 ```
 
-**6.3. Assessment через Docker:**
-
-```bash
-curl -X POST http://localhost:8000/api/v1/assess \
-  -H "Content-Type: application/json" \
-  -d '{
-    "student_work": "Photosynthesis is the process by which plants convert sunlight into energy.",
-    "rubric_id": "essay_default"
-  }'
-```
-
-**6.4. LangServe playground (если запущен с профилем dev):**
+**6.3. LangServe playground (если запущен с профилем dev):**
 
 ```bash
 docker compose --profile dev up -d
-
-open http://localhost:8001/assess/playground
 ```
 
-**6.5. Логи и дебаг:**
+Открыть в браузере: `http://localhost:8001/summarize/playground`
+
+**6.4. Логи и дебаг:**
 
 ```bash
 docker compose logs -f app
 
 docker compose logs --tail=50 chromadb
-
-docker compose exec app curl http://localhost:8000/health/ready
 ```
 
-**6.6. Остановка и очистка:**
+**6.5. Остановка и очистка:**
 
 ```bash
 docker compose down
@@ -1438,20 +1453,20 @@ docker compose down -v
 |---|---|---|
 | Шаг 1. Health Checks | §5 Health Checks | Liveness, readiness, startup probes; кэширование проверок |
 | Шаг 2. Dockerfile | §2 Docker | Multi-stage build, non-root user, layer caching |
-| Шаг 3. docker-compose.yml | §3 Docker Compose | Полный стек, networking, volumes, health checks, profiles |
+| Шаг 3. Docker Compose | §3 Docker Compose | Полный стек, networking, volumes, health checks, profiles |
 | Шаг 4. LangServe | §6 LangServe | Chain как REST API с playground |
-| Шаг 5. entrypoint.sh | §4 ASGI Server | Gunicorn + uvicorn workers, production config |
-| Шаг 6. Testing | §1 Особенности LLM | Проверка таймаутов, health checks, end-to-end |
+| Шаг 5. Entrypoint | §4 ASGI Server, §7 Secrets | Gunicorn + uvicorn workers, Pydantic Settings |
+| Шаг 6. Проверка | §1 Особенности LLM | Проверка таймаутов, health checks |
 
 ---
 
 ## Чеклист самопроверки
 
-1. **Dockerfile собирается без ошибок:** `docker build -t assessment-api .` завершается успешно, образ меньше 400MB.
+1. **Dockerfile собирается без ошибок:** `docker build -t llm-app .` завершается успешно, образ меньше 400MB.
 
-2. **Multi-stage build работает:** в финальном образе нет `build-essential`, `gcc`, pip cache. Проверить: `docker run --rm assessment-api pip list` показывает только runtime-зависимости.
+2. **Multi-stage build работает:** в финальном образе нет `build-essential`, `gcc`, pip cache. Проверить: `docker run --rm llm-app pip list` показывает только runtime-зависимости.
 
-3. **Non-root user:** `docker run --rm assessment-api whoami` возвращает `appuser`, а не `root`.
+3. **Non-root user:** `docker run --rm llm-app whoami` возвращает `appuser`, а не `root`.
 
 4. **docker-compose up поднимает все сервисы:** после `docker compose up -d` команда `docker compose ps` показывает все контейнеры в статусе `healthy` или `running`.
 
@@ -1461,9 +1476,9 @@ docker compose down -v
 
 7. **Gunicorn с правильным timeout:** `docker compose logs app | grep timeout` или `docker exec <container> ps aux` — видно `--timeout 120`.
 
-8. **LangServe playground доступен:** `http://localhost:8001/assess/playground` открывается в браузере и показывает интерфейс тестирования.
+8. **LangServe playground доступен:** `http://localhost:8001/summarize/playground` открывается в браузере и показывает интерфейс тестирования.
 
-9. **Assessment работает через Docker:** POST на `/api/v1/assess` через curl возвращает результат оценки (нужен валидный API-ключ в `.env`).
+9. **LLM-вызов работает через Docker:** POST на LangServe endpoint через curl возвращает результат (нужен валидный API-ключ в `.env`).
 
 10. **Graceful shutdown:** `docker compose stop` не обрывает текущие запросы — gunicorn ждёт `graceful-timeout` секунд.
 
@@ -1488,7 +1503,7 @@ LLM-запрос с большим контекстом легко занима�
 Решение:
 
 ```bash
-gunicorn app.main:app --timeout 120 --graceful-timeout 60
+gunicorn src.main:app --timeout 120 --graceful-timeout 60
 ```
 
 ```nginx
@@ -1518,8 +1533,7 @@ COPY . .
 И копировать только нужные файлы:
 
 ```dockerfile
-COPY app/ ./app/
-COPY scripts/ ./scripts/
+COPY src/ ./src/
 COPY requirements.txt .
 ```
 
@@ -1528,7 +1542,7 @@ COPY requirements.txt .
 ```dockerfile
 FROM python:3.12-slim
 COPY . .
-CMD ["uvicorn", "app.main:app"]
+CMD ["uvicorn", "src.main:app"]
 ```
 
 Контейнер работает под root. RCE-уязвимость = root-доступ.
@@ -1570,7 +1584,7 @@ services:
 ### 5. Один worker для LLM API → все запросы sequential
 
 ```bash
-uvicorn app.main:app --workers 1
+uvicorn src.main:app --workers 1
 ```
 
 Один worker с одним event loop. Хотя `asyncio` позволяет конкурентные I/O-операции, один worker имеет ограничения по throughput. Если worker занят CPU-операцией (парсинг большого PDF, сериализация), все остальные запросы ждут.
@@ -1578,7 +1592,7 @@ uvicorn app.main:app --workers 1
 Решение:
 
 ```bash
-gunicorn app.main:app \
+gunicorn src.main:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers 2
 ```
