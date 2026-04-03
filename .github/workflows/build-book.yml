@@ -1,0 +1,58 @@
+name: Build Book PDF
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/lessons/**"
+      - "docs/build_book.py"
+      - "docs/CURRICULUM.md"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WeasyPrint system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            libgdk-pixbuf-2.0-0 \
+            libcairo2 \
+            libffi-dev \
+            libglib2.0-0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build PDF
+        run: uv run python docs/build_book.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-bootcamp-book
+          path: docs/ai-bootcamp-book.pdf
+
+      - name: Update latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "AI Bootcamp Book (latest)"
+          body: "Auto-built PDF of the AI Engineering Bootcamp book."
+          files: docs/ai-bootcamp-book.pdf
+          make_latest: true
