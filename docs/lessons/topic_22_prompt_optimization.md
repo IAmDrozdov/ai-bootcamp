@@ -819,3 +819,4 @@ Feedback должен быть привязан к конкретному infere
 - [TensorZero GitHub](https://github.com/tensorzero/tensorzero) — исходный код и примеры
 
 **Предыдущая тема:** [Тема 21: AI Testing & QA](topic_21_testing_qa.md) — тестирование AI-систем.
+**Следующая тема:** [Тема 23: Databricks](topic_23_databricks.md) — MLflow, Model Serving, Vector Search.

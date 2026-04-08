@@ -6,7 +6,7 @@
 
 ```
 docs/
-  CURRICULUM.md          — учебный план (22 темы)
+  CURRICULUM.md          — учебный план (27 тем)
   GENAI_STACK.md         — справочник GenAI библиотек
   LEARNING_LOG.md        — заметки по сессиям
   build_book.py          — скрипт сборки PDF-книги
@@ -62,3 +62,8 @@ uv run python docs/build_book.py
 | 20 | Deployment |
 | 21 | AI Testing & QA |
 | 22 | Prompt Optimization (GEPA, TensorZero) |
+| 23 | Databricks (MLflow, Model Serving, Vector Search) |
+| 24 | PydanticAI |
+| 25 | DSPy |
+| 26 | LiteLLM |
+| 27 | CrewAI |
