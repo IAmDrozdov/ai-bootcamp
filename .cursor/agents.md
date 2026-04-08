@@ -6,10 +6,10 @@ AI Engineering Bootcamp — учебный курс по AI Engineering (LangCha
 
 ## Документация
 - `PROGRESS.md` — компактный мониторинг прогресса (таблица тем, текущий фокус, история сессий)
-- `docs/CURRICULUM.md` — полный учебный план (22 темы, концепции, практические задания)
+- `docs/CURRICULUM.md` — полный учебный план (27 тем, концепции, практические задания)
 - `docs/LEARNING_LOG.md` — подробные заметки по сессиям
 - `docs/GENAI_STACK.md` — справочник GenAI библиотек
-- `docs/lessons/` — уроки (topic_01 — topic_22)
+- `docs/lessons/` — уроки (topic_01 — topic_27)
 
 ## Философия
 **Меньше кода — больше знаний.**
@@ -45,6 +45,11 @@ AI Engineering Bootcamp — учебный курс по AI Engineering (LangCha
 - Langfuse / LangSmith
 - GEPA / TensorZero
 - DSPy
+- Databricks (MLflow, Model Serving, Vector Search)
+- PydanticAI
+- DSPy
+- LiteLLM
+- CrewAI
 - Anthropic Claude как основная модель
 
 ## При генерации контента

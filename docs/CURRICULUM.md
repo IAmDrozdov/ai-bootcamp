@@ -33,6 +33,11 @@
 | 20 | [Deployment](#тема-20-deployment--деплой-llm-приложений) — Docker, LangServe, масштабирование | [Урок](lessons/topic_20_deployment.md) |
 | 21 | [AI Testing & QA](#тема-21-ai-testing--qa) — тестирование, консистентность, бенчмарки | [Урок](lessons/topic_21_testing_qa.md) |
 | 22 | [Prompt Optimization](#тема-22-автоматическая-оптимизация-промптов) — GEPA, TensorZero, DSPy | [Урок](lessons/topic_22_prompt_optimization.md) |
+| 23 | [Databricks](#тема-23-databricks-для-ai-engineering) — MLflow, Model Serving, Vector Search | [Урок](lessons/topic_23_databricks.md) |
+| 24 | [PydanticAI](#тема-24-pydanticai) — type-safe агенты на Pydantic | [Урок](lessons/topic_24_pydantic_ai.md) |
+| 25 | [DSPy](#тема-25-dspy) — программирование LLM вместо промптинга | [Урок](lessons/topic_25_dspy.md) |
+| 26 | [LiteLLM](#тема-26-litellm) — единый API для 100+ LLM-провайдеров | [Урок](lessons/topic_26_litellm.md) |
+| 27 | [CrewAI](#тема-27-crewai) — мульти-агентные системы с ролями | [Урок](lessons/topic_27_crewai.md) |
 
 ---
 
@@ -489,36 +494,228 @@
 
 ---
 
+## Тема 23: Databricks для AI Engineering
+
+### Что изучить
+- Databricks как unified data + AI платформа — зачем AI-инженеру
+- Foundation Model APIs — managed LLM endpoints (DBRX, Llama, Mixtral)
+- External Models — прокси к OpenAI/Anthropic через Databricks с governance
+- Model Serving — деплой custom моделей и LangChain chains
+- MLflow для LLM — трекинг экспериментов, evaluate, deployment
+- Databricks Vector Search — managed vector DB с Delta Lake sync
+- Unity Catalog — governance для моделей, данных и AI-артефактов
+- UC Functions — Python UDF как LLM tools
+- Mosaic AI Agent Framework — разработка, evaluation и деплой AI-агентов
+- Databricks Workflows — оркестрация AI-пайплайнов
+
+### Ключевые концепции
+- External Model endpoint — единая точка доступа к внешним LLM с аудитом и cost tracking
+- Delta Sync Index — автоматическая синхронизация embeddings при изменении данных
+- MLflow evaluate с LLM-judges — groundedness, relevance, safety, chunk_relevance
+- UCFunctionToolkit — UC функции как инструменты для LangChain-агентов
+- Review App — UI для тестирования агентов и сбора feedback от стейкхолдеров
+
+### Практические задания
+1. **Foundation Model API.** Подключиться к Databricks endpoint через `ChatDatabricks`, оценить 5 эссе.
+2. **Vector Search RAG.** Создать Delta-таблицу с эссе, настроить Vector Search Index, построить RAG chain.
+3. **MLflow эксперименты.** Сравнить два промпта через MLflow: логировать метрики, визуализировать в UI.
+4. **UC Functions tools.** Создать 2-3 функции в Unity Catalog, использовать как tools для ReAct-агента.
+5. **Agent deployment.** Залогировать агента в MLflow, развернуть как serving endpoint, протестировать через Review App.
+
+---
+
+## Тема 24: PydanticAI
+
+### Что изучить
+- PydanticAI — философия "FastAPI для AI": type safety, DI, минимализм
+- Agent — центральная абстракция: model, result_type, system_prompt, tools
+- Dependency injection через `deps_type` — типизированные зависимости
+- Tools — `@agent.tool` и `@agent.tool_plain`, автоматическая JSON Schema
+- Result validators — проверка и retry через `ModelRetry`
+- Structured streaming — поток частично заполненного Pydantic-объекта
+- Multi-agent workflows — композиция агентов через Python
+- Logfire — нативная observability
+
+### Ключевые концепции
+- `RunContext[D]` — типизированный доступ к зависимостям в system prompt и tools
+- `ModelRetry` — инструкция для LLM "попробуй ещё раз" с фидбеком
+- `UsageLimits` — контроль расходов: max_tokens, max_requests
+- `end_strategy` — "early" (первый валидный result) vs "exhaustive" (все tools)
+
+### Практические задания
+1. **Базовый агент.** Создать агента с `result_type=AssessmentResult`, оценить 5 эссе.
+2. **DI.** Добавить `deps_type` с HTTP-клиентом для загрузки рубрик. Протестировать с mock.
+3. **Tools.** Создать 3 инструмента (word count, citations, structure). Агент сам решает, что вызвать.
+4. **Result validation.** Добавить validator: score в пределах, feedback не пустой, согласованность.
+5. **Streaming.** Реализовать structured streaming для UI — обновление по мере заполнения полей.
+
+---
+
+## Тема 25: DSPy
+
+### Что изучить
+- Парадигма DSPy: программы вместо промптов, компиляция вместо ручной оптимизации
+- Signatures — декларативные контракты (инлайн и класс)
+- Modules: Predict, ChainOfThought, ReAct, ProgramOfThought
+- Programs — композиция модулей в `dspy.Module`
+- Optimizers: BootstrapFewShot, MIPROv2, GEPA — автоматическая оптимизация
+- Metrics — как измерять качество, `trace is not None` паттерн
+- Assertions — `dspy.Assert` и `dspy.Suggest` для runtime constraints
+- Retrieval — встроенная поддержка RAG
+
+### Ключевые концепции
+- Signature = "что делать", Module = "как делать", Optimizer = "как улучшить"
+- `.with_inputs()` — разделение входов и labels в Example
+- `auto="light"/"medium"/"heavy"` — бюджет оптимизации
+- `save()`/`load()` — сериализация оптимизированной программы
+
+### Практические задания
+1. **Predict vs CoT.** Сравнить Predict и ChainOfThought на 5 эссе.
+2. **Multi-step.** Создать программу analyze → score с двумя модулями.
+3. **MIPROv2.** Оптимизировать программу на 10+ примерах. Сравнить baseline и optimized.
+4. **Assertions.** Добавить Assert (score 1-10) и Suggest (feedback > 100 chars).
+5. **ReAct.** Агент с tools через dspy.ReAct.
+
+---
+
+## Тема 26: LiteLLM
+
+### Что изучить
+- Проблема зоопарка API — зачем единый интерфейс для 100+ провайдеров
+- Python SDK — `litellm.completion()`, async, streaming
+- Router — fallbacks, load balancing, routing strategies
+- Cost tracking — автоматический подсчёт стоимости, бюджеты
+- LiteLLM Proxy — OpenAI-совместимый сервер с конфигурацией
+- Виртуальные ключи — rate limits и бюджеты per-user/per-team
+- Интеграция с LangChain — proxy как OpenAI endpoint
+- Callbacks — Langfuse, Helicone и custom observability
+
+### Ключевые концепции
+- `model="provider/model-name"` — формат имени модели
+- Router `model_list` — одно имя для нескольких провайдеров
+- `routing_strategy` — simple-shuffle, least-busy, latency-based, cost-based
+- `master_key` — защита proxy от неавторизованного доступа
+
+### Практические задания
+1. **Multi-provider.** Один и тот же запрос через 3 провайдера. Сравнить quality, latency, cost.
+2. **Router.** Настроить Router с fallback: Claude → GPT-4o → Llama (Groq).
+3. **Cost dashboard.** Оценить 20 эссе, посчитать стоимость по каждой модели.
+4. **Proxy.** Развернуть LiteLLM Proxy, подключить LangChain через `base_url`.
+5. **Langfuse.** Подключить Langfuse callback, увидеть трейсы всех провайдеров в одном дашборде.
+
+---
+
+## Тема 27: CrewAI
+
+### Что изучить
+- CrewAI — высокоуровневый фреймворк для мульти-агентных систем
+- Agent — роль, цель, backstory, tools, delegation
+- Task — описание, expected_output, context, structured output
+- Crew — команда агентов с процессом (sequential, hierarchical)
+- Tools — встроенные (`crewai-tools`) и custom (`@tool`)
+- Delegation — агенты делегируют задачи друг другу
+- Memory — short-term, long-term, entity memory
+- Structured output — Pydantic models для typed результатов
+
+### Ключевые концепции
+- `Process.sequential` — фиксированный порядок задач
+- `Process.hierarchical` — менеджер-агент распределяет работу
+- `context` — явные зависимости между задачами
+- `async_execution` — параллельное выполнение независимых задач
+
+### Практические задания
+1. **Базовая crew.** Два агента (analyzer + scorer), sequential процесс.
+2. **Tools.** Добавить инструменты аналитику (word count, citations). Три агента.
+3. **Hierarchical.** Менеджер координирует команду из 3 агентов.
+4. **Structured output.** Получить Pydantic-модель из финального task.
+5. **Batch.** Оценить набор из 5 эссе с memory для калибровки.
+
+---
+
 ## Порядок прохождения
 
-```
-Тема 1 → Тема 2 → Тема 3 → Тема 4      (Фаза 1: основы LangChain)
-                                  ↓
-                              Тема 5      (Фаза 2: RAG)
-                                  ↓
-                          Тема 6 → Тема 7    (Фаза 3: агенты и диалоги)
-                                       ↓
-                          Тема 8 → Тема 9 → Тема 10    (Фаза 4: production)
-                                                  ↓
-                          Тема 11 → Тема 12       (Фаза 5: tools и мультимодальность)
-                                       ↓
-                          Тема 13 → Тема 14       (Фаза 6: продвинутые агенты)
-                                       ↓
-                                  Тема 15         (Фаза 7: стандарты интеграции)
+```mermaid
+flowchart TD
+    subgraph phase1["Фаза 1: Основы LangChain"]
+        T1["1. Промпт-инжиниринг"] --> T2["2. LangChain + LCEL"]
+        T2 --> T3["3. Structured Output"]
+        T3 --> T4["4. Streaming"]
+    end
 
-              ─── Инструменты (можно проходить параллельно с основными темами) ───
+    subgraph phase2["Фаза 2: RAG"]
+        T5["5. RAG"]
+    end
 
-              Тема 16 (Langfuse)     — после темы 8
-              Тема 17 (LangSmith)    — после темы 8
-              Тема 18 (Ollama)       — после темы 2
-              Тема 19 (Vector DBs)   — после темы 5
-              Тема 20 (Deployment)   — после темы 10
-              Тема 21 (AI Testing)   — после темы 9 и 10
-              Тема 22 (GEPA/TensorZero) — после темы 1 и 9
+    subgraph phase3["Фаза 3: Агенты и диалоги"]
+        T6["6. LangGraph + Agents"] --> T7["7. Conversational AI"]
+    end
+
+    subgraph phase4["Фаза 4: Production"]
+        T8["8. Observability"] --> T9["9. Evaluation"]
+        T9 --> T10["10. Production-паттерны"]
+    end
+
+    subgraph phase5["Фаза 5: Tools и мультимодальность"]
+        T11["11. Tool Use"]
+        T12["12. Multimodal AI"]
+    end
+
+    subgraph phase6["Фаза 6: Продвинутые агенты"]
+        T13["13. Agentic Patterns"] --> T14["14. Multi-Agent"]
+    end
+
+    subgraph phase7["Фаза 7: Стандарты интеграции"]
+        T15["15. MCP"]
+    end
+
+    T4 --> T5
+    T5 --> T6
+    T7 --> T8
+    T10 --> T11
+    T10 --> T12
+    T11 --> T13
+    T12 --> T13
+    T14 --> T15
+
+    subgraph tools["Инструменты — параллельно с основным курсом"]
+        T16["16. Langfuse Deep Dive"]
+        T17["17. LangSmith"]
+        T18["18. Ollama"]
+        T19["19. Vector Databases"]
+        T20["20. Deployment"]
+        T21["21. AI Testing & QA"]
+        T22["22. Prompt Optimization"]
+        T23["23. Databricks"]
+        T24["24. PydanticAI"]
+        T25["25. DSPy"]
+        T26["26. LiteLLM"]
+        T27["27. CrewAI"]
+    end
+
+    T8 -.-> T16
+    T8 -.-> T17
+    T2 -.-> T18
+    T5 -.-> T19
+    T10 -.-> T20
+    T9 -.-> T21
+    T10 -.-> T21
+    T1 -.-> T22
+    T9 -.-> T22
+    T5 -.-> T23
+    T8 -.-> T23
+    T20 -.-> T23
+    T3 -.-> T24
+    T11 -.-> T24
+    T1 -.-> T25
+    T9 -.-> T25
+    T2 -.-> T26
+    T10 -.-> T26
+    T6 -.-> T27
+    T14 -.-> T27
 ```
 
 Темы 1-4 проходятся последовательно — каждая опирается на предыдущую.
 Дальше можно параллелить: RAG (5) не зависит от agents (6).
 Observability (8) стоит подключить как можно раньше — трейсинг помогает учиться.
 Темы 11-15 — продвинутый блок: tool use (11) и multimodal (12) независимы друг от друга, но оба нужны для agentic patterns (13) и multi-agent (14). MCP (15) — финальная тема, объединяющая всё.
-Темы 16-22 — инструменты. Их можно проходить параллельно с основным курсом: Langfuse/LangSmith подключай сразу после observability (8), Ollama — как только освоишь LCEL (2), Vector DBs — после RAG (5), Deployment — после production-паттернов (10), AI Testing — после evaluation (9) и production-паттернов (10), GEPA/TensorZero — после prompt engineering (1) и evaluation (9).
+Темы 16-27 — инструменты и фреймворки. Их можно проходить параллельно с основным курсом: Langfuse/LangSmith подключай сразу после observability (8), Ollama — как только освоишь LCEL (2), Vector DBs — после RAG (5), Deployment — после production-паттернов (10), AI Testing — после evaluation (9) и production-паттернов (10), GEPA/TensorZero — после prompt engineering (1) и evaluation (9), Databricks — после RAG (5), observability (8) и deployment (20), PydanticAI — после structured output (3) и tool use (11), DSPy — после prompt engineering (1) и evaluation (9), LiteLLM — после LCEL (2) и production-паттернов (10), CrewAI — после agents (6) и multi-agent (14).
