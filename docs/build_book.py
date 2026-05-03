@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Convert all lesson markdown files into a single styled PDF book."""
+"""Convert all lesson markdown files into a single styled PDF and EPUB book."""
 
 import subprocess
 import sys
 from pathlib import Path
 
 import re
+import uuid
 
 import markdown
+from ebooklib import epub
 from pygments.formatters import HtmlFormatter
 
 DOCS_DIR = Path(__file__).parent
 LESSONS_DIR = DOCS_DIR / "lessons"
 OUTPUT_PDF = DOCS_DIR / "ai-bootcamp-book.pdf"
+OUTPUT_EPUB = DOCS_DIR / "ai-bootcamp-book.epub"
 TMP_HTML = DOCS_DIR / "_book.html"
 
 PYGMENTS_CSS = HtmlFormatter(style="monokai").get_style_defs(".codehilite")
@@ -334,6 +337,102 @@ def html_to_pdf(html_path: Path, pdf_path: Path) -> None:
         sys.exit(1)
 
 
+EPUB_CSS = """
+body {
+    font-family: Georgia, "Palatino Linotype", serif;
+    font-size: 1em;
+    line-height: 1.6;
+    color: #1a1a1a;
+    margin: 1em 1.5em;
+}
+h1 { font-size: 1.8em; font-weight: 700; border-bottom: 1px solid #333; padding-bottom: 0.3em; }
+h2 { font-size: 1.4em; font-weight: 600; margin-top: 1.4em; }
+h3 { font-size: 1.2em; font-weight: 600; margin-top: 1.1em; }
+h4 { font-size: 1em; font-weight: 600; }
+p  { margin: 0.6em 0; }
+a  { color: #2563eb; text-decoration: none; }
+code {
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    font-size: 0.88em;
+    background: #f3f4f6;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+}
+pre {
+    font-family: Menlo, Monaco, "Courier New", monospace;
+    font-size: 0.82em;
+    background: #272822;
+    color: #f8f8f2;
+    padding: 0.8em 1em;
+    border-radius: 4px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+pre code { background: none; padding: 0; color: inherit; }
+blockquote {
+    border-left: 3px solid #6b7280;
+    margin: 1em 0;
+    padding: 0.4em 1em;
+    color: #4b5563;
+    background: #f9fafb;
+}
+table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.9em; }
+th, td { border: 1px solid #d1d5db; padding: 0.4em 0.7em; text-align: left; }
+th { background: #f3f4f6; font-weight: 600; }
+tr:nth-child(even) { background: #f9fafb; }
+ul, ol { margin: 0.5em 0; padding-left: 1.5em; }
+li { margin: 0.3em 0; }
+hr { border: none; border-top: 1px solid #d1d5db; margin: 1.5em 0; }
+"""
+
+
+def build_epub(lessons: list[Path]) -> None:
+    book = epub.EpubBook()
+    book.set_identifier(str(uuid.uuid4()))
+    book.set_title("AI Engineering Bootcamp")
+    book.set_language("ru")
+
+    style = epub.EpubItem(
+        uid="style",
+        file_name="style/main.css",
+        media_type="text/css",
+        content=EPUB_CSS,
+    )
+    book.add_item(style)
+
+    chapters: list[epub.EpubHtml] = []
+    toc_entries: list[epub.Link] = []
+
+    for i, path in enumerate(lessons):
+        md_text = path.read_text(encoding="utf-8")
+        title = extract_title(md_text)
+        html_body = md_to_html(md_text)
+
+        chapter = epub.EpubHtml(
+            title=title,
+            file_name=f"lesson_{i:02d}.xhtml",
+            lang="ru",
+        )
+        chapter.content = (
+            f'<html xmlns="http://www.w3.org/1999/xhtml">'
+            f"<head><title>{title}</title>"
+            f'<link rel="stylesheet" href="../style/main.css" type="text/css"/>'
+            f"</head><body>{html_body}</body></html>"
+        )
+        chapter.add_item(style)
+        book.add_item(chapter)
+        chapters.append(chapter)
+        toc_entries.append(epub.Link(f"lesson_{i:02d}.xhtml", title, f"lesson_{i}"))
+
+    book.toc = toc_entries
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", *chapters]
+
+    epub.write_epub(str(OUTPUT_EPUB), book)
+
+
 def main() -> None:
     lessons = collect_lessons()
     print(f"Found {len(lessons)} lessons")
@@ -346,7 +445,12 @@ def main() -> None:
     TMP_HTML.unlink(missing_ok=True)
 
     size_mb = OUTPUT_PDF.stat().st_size / (1024 * 1024)
-    print(f"Done: {OUTPUT_PDF} ({size_mb:.1f} MB)")
+    print(f"Done PDF: {OUTPUT_PDF} ({size_mb:.1f} MB)")
+
+    print("Building EPUB...")
+    build_epub(lessons)
+    epub_mb = OUTPUT_EPUB.stat().st_size / (1024 * 1024)
+    print(f"Done EPUB: {OUTPUT_EPUB} ({epub_mb:.1f} MB)")
 
 
 if __name__ == "__main__":

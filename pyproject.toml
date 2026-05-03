@@ -5,6 +5,7 @@ description = "AI Engineering Bootcamp — учебный курс с приме
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "ebooklib>=0.18",
     "markdown>=3.10.2",
     "pygments>=2.19.2",
     "weasyprint>=63.1",

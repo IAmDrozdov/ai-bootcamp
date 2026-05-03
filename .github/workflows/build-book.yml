@@ -1,4 +1,4 @@
-name: Build Book PDF
+name: Build Book PDF & EPUB
 
 on:
   push:
@@ -40,19 +40,23 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Build PDF
+      - name: Build PDF and EPUB
         run: uv run python docs/build_book.py
 
       - uses: actions/upload-artifact@v4
         with:
           name: ai-bootcamp-book
-          path: docs/ai-bootcamp-book.pdf
+          path: |
+            docs/ai-bootcamp-book.pdf
+            docs/ai-bootcamp-book.epub
 
       - name: Update latest release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: "AI Bootcamp Book (latest)"
-          body: "Auto-built PDF of the AI Engineering Bootcamp book."
-          files: docs/ai-bootcamp-book.pdf
+          body: "Auto-built PDF and EPUB of the AI Engineering Bootcamp book."
+          files: |
+            docs/ai-bootcamp-book.pdf
+            docs/ai-bootcamp-book.epub
           make_latest: true
